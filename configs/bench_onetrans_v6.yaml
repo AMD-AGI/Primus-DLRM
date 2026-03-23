@@ -1,0 +1,46 @@
+data:
+  dataset_size: "50m"
+  history_length: 20
+  history_mode: "last_l"
+  num_workers: 4
+  enable_counters: true
+  counter_windows_days: [7, 30]
+  data_dir: "data"
+
+model:
+  model_type: "onetrans"
+  embedding_dim: 64
+  audio_embed_dim: 128
+  embedding_init: "uniform"
+  onetrans:
+    d_model: 256
+    n_heads: 8
+    n_layers: 4
+    ffn_mult: 4
+    n_ns_tokens: 8
+    use_pyramid: true
+    dropout: 0.1
+    pos_embed: true
+
+train:
+  batch_size: 32768
+  lr: 0.0003
+  weight_decay: 0.00001
+  epochs: 1
+  warmup_steps: 2000
+  bf16: true
+  grad_clip: 1.0
+  log_interval: 10
+  eval_interval: 1
+  checkpoint_dir: "results"
+  seed: 42
+  loss_weights:
+    listen_plus: 1.0
+  contrastive_weight: 0.0
+  contrastive_temperature: 0.1
+
+distributed:
+  enabled: true
+  dense_strategy: "ddp"
+  num_nodes: 1
+  gpus_per_node: 8

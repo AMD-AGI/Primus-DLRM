@@ -1,0 +1,16 @@
+{
+    "name": "MI355X",
+    "freq_mhz": 2400,
+    "mem_bw_gbps": 8000,
+    "l1_bw_gbps": 32000,
+    "num_cus": 256,
+    "gemm_units_per_cu": 4,
+    "max_achievable_tflops": {
+        "matrix": {
+            "fp32": 157.3,
+            "fp16": 2516.6,
+            "bf16": 2516.6,
+            "int8": 5033.2
+        }
+    }
+}

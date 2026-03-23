@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "primus-dlrm"
+version = "0.1.0"
+description = "AMD MI350+ TorchRec RecSys Benchmark Suite"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets",
+    "pyarrow",
+    "polars",
+    "pyyaml",
+    "tqdm",
+    "tensorboard",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-timeout",
+]
+
+[tool.setuptools.packages.find]
+include = ["primus_dlrm*"]
