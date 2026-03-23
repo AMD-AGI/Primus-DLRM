@@ -69,6 +69,8 @@ def main():
     args = parser.parse_args()
 
     config = Config.load(args.config)
+    from primus_dlrm.training.precision import configure_precision
+    configure_precision(config.train)
     if args.epochs is not None:
         config.train.epochs = args.epochs
     device = torch.device(args.device)

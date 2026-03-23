@@ -47,6 +47,8 @@ def main():
     args = parser.parse_args()
 
     config = Config.load(args.config)
+    from primus_dlrm.training.precision import configure_precision
+    configure_precision(config.train)
     device = torch.device(args.device)
     processed_dir = Path(args.processed_dir)
 
