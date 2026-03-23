@@ -93,6 +93,8 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
 
     config = Config.load(args.config)
+    from primus_dlrm.training.precision import configure_precision
+    configure_precision(config.train)
     torch.manual_seed(config.train.seed + rank)
 
     processed_dir = Path(args.processed_dir)
