@@ -22,6 +22,7 @@ from primus_dlrm.data.dataset import (
 from primus_dlrm.evaluation.metrics import evaluate_ranking, evaluate_ranking_peruser
 from primus_dlrm.models.dlrm import DLRMBaseline
 from primus_dlrm.training.losses import InBatchBPRLoss, MultiTaskLoss
+from primus_dlrm.training.runtime import configure_runtime
 
 def build_model(config, num_users, num_items, num_artists, num_albums, audio_input_dim, device, tasks):
     num_counter_windows = len(config.data.counter_windows_days) if config.data.enable_counters else 0
@@ -69,8 +70,7 @@ def main():
     args = parser.parse_args()
 
     config = Config.load(args.config)
-    from primus_dlrm.training.precision import configure_precision
-    configure_precision(config.train)
+    configure_runtime(config.train)
     if args.epochs is not None:
         config.train.epochs = args.epochs
     device = torch.device(args.device)

@@ -88,6 +88,7 @@ class DistributedTrainer:
         max_steps: int = 0,
         log_interval: int = 1000,
         trace: bool = False,
+        trace_steps: list[int] | None = None,
         trace_warmup: int = 5,
         trace_active: int = 10,
     ):
@@ -101,7 +102,12 @@ class DistributedTrainer:
         self.tracer: Tracer | None = None
         if trace and is_main_process():
             trace_dir = Path(config.train.checkpoint_dir) / "trace"
-            self.tracer = Tracer(trace_dir, warmup=trace_warmup, active=trace_active)
+            self.tracer = Tracer(
+                trace_dir,
+                trace_steps=trace_steps,
+                warmup=trace_warmup,
+                active=trace_active,
+            )
 
         tc = config.train
 
@@ -151,122 +157,74 @@ class DistributedTrainer:
         if is_main_process():
             self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    def train(self) -> None:
-        tc = self.config.train
-        active_tasks = [k for k, v in tc.loss_weights.items() if v > 0]
-        per_gpu_batch = tc.batch_size // get_world_size()
+    # -- Step generators ------------------------------------------------------
+    # Each generator yields (loss_val: float, task_losses: dict) per step,
+    # abstracting away the difference between manual fwd/bwd/optim and
+    # TorchRec's pipelined progress().
 
-        for epoch in range(tc.epochs):
-            sampler = self.train_loader.sampler
-            if isinstance(sampler, DistributedSampler):
-                sampler.set_epoch(epoch)
+    def _sequential_steps(self, tc, active_tasks):
+        """Manual forward/backward/optimizer loop over the dataloader."""
+        amp_dtype = torch.bfloat16 if self.use_amp else torch.float32
 
-            self.model.train()
-            epoch_loss = 0.0
-            epoch_start = time.time()
-            num_batches = 0
+        for batch in self.train_loader:
+            batch = {
+                k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
 
-            for batch in self.train_loader:
-                batch = {
-                    k: v.to(self.device) if isinstance(v, torch.Tensor) else v
-                    for k, v in batch.items()
-                }
-
-                self.optimizer.zero_grad()
-                amp_dtype = torch.bfloat16 if self.use_amp else torch.float32
-                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=self.use_amp):
-                    if self.use_contrastive:
-                        inner = self.model.module if hasattr(self.model, "module") else self.model
-                        preds, cross_scores = inner.forward_with_cross_scores(
-                            batch, cross_task="listen_plus",
-                        )
-                    else:
-                        preds = self.model(batch)
-                    labels = {t: batch[t] for t in active_tasks}
-                    total_loss, task_losses = self.loss_fn(preds, labels)
-
-                    if self.use_contrastive:
-                        bpr_loss = self.contrastive_loss_fn(
-                            cross_scores, batch["listen_plus"],
-                        )
-                        total_loss = total_loss + tc.contrastive_weight * bpr_loss
-                        task_losses["bpr"] = bpr_loss
-
-                self.scaler.scale(total_loss).backward()
-
-                if tc.grad_clip > 0:
-                    self.scaler.unscale_(self.optimizer)
-                    params_to_clip = (
-                        [p for g in self.optimizer.param_groups for p in g["params"]]
+            self.optimizer.zero_grad()
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=self.use_amp):
+                if self.use_contrastive:
+                    inner = self.model.module if hasattr(self.model, "module") else self.model
+                    preds, cross_scores = inner.forward_with_cross_scores(
+                        batch, cross_task="listen_plus",
                     )
-                    nn.utils.clip_grad_norm_(params_to_clip, tc.grad_clip)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                self.scheduler.step()
+                else:
+                    preds = self.model(batch)
+                labels = {t: batch[t] for t in active_tasks}
+                total_loss, task_losses = self.loss_fn(preds, labels)
 
-                if self.tracer:
-                    self.tracer.step()
-
-                loss_val = total_loss.item()
-                epoch_loss += loss_val
-                num_batches += 1
-
-                if self.global_step % self.log_interval == 0 and is_main_process():
-                    lr = self.optimizer.param_groups[0]["lr"]
-                    elapsed = time.time() - epoch_start
-                    throughput = num_batches * per_gpu_batch * get_world_size() / elapsed
-                    logger.info(
-                        f"epoch={epoch} step={self.global_step} | "
-                        f"loss={loss_val:.4f} | lr={lr:.6f} | "
-                        f"throughput={throughput:.0f} samples/s | "
-                        + " | ".join(
-                            f"{k}={v:.4f}"
-                            for k, v in task_losses.items()
-                            if hasattr(v, "__float__")
-                        )
+                if self.use_contrastive:
+                    bpr_loss = self.contrastive_loss_fn(
+                        cross_scores, batch["listen_plus"],
                     )
+                    total_loss = total_loss + tc.contrastive_weight * bpr_loss
+                    task_losses["bpr"] = bpr_loss
 
-                self.global_step += 1
+            self.scaler.scale(total_loss).backward()
 
-                if self.max_steps > 0 and self.global_step >= self.max_steps:
-                    break
-
-            epoch_time = time.time() - epoch_start
-            avg_loss = epoch_loss / max(num_batches, 1)
-            throughput = num_batches * per_gpu_batch * get_world_size() / epoch_time
-
-            if is_main_process():
-                logger.info(
-                    f"=== Epoch {epoch} done === "
-                    f"avg_loss={avg_loss:.4f} | time={epoch_time:.1f}s | "
-                    f"throughput={throughput:.0f} samples/s"
+            if tc.grad_clip > 0:
+                self.scaler.unscale_(self.optimizer)
+                params_to_clip = (
+                    [p for g in self.optimizer.param_groups for p in g["params"]]
                 )
+                nn.utils.clip_grad_norm_(params_to_clip, tc.grad_clip)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
-            barrier()
+            yield total_loss.item(), task_losses
 
-            self._save_checkpoint(epoch)
-
-            if self.eval_fn is not None:
-                self._run_eval()
-
-            barrier()
-
-            if self.max_steps > 0 and self.global_step >= self.max_steps:
+    def _pipelined_steps(self, pipeline, dataloader_iter):
+        """Yield steps from TorchRec TrainPipelineSparseDist.progress()."""
+        while True:
+            try:
+                task_losses = pipeline.progress(dataloader_iter)
+            except StopIteration:
                 break
 
-        if self.tracer:
-            self.tracer.stop()
-            files = self.tracer.trace_files
-            logger.info(f"Trace dumped: {self.tracer.trace_dir}/ ({len(files)} files)")
+            if isinstance(task_losses, dict) and task_losses:
+                loss_val = sum(
+                    v.item() if isinstance(v, torch.Tensor) else v
+                    for v in task_losses.values()
+                )
+            else:
+                loss_val = 0.0
+            yield loss_val, task_losses if isinstance(task_losses, dict) else {}
 
-    def train_pipelined(self) -> None:
-        """3-stage pipelined training using TorchRec TrainPipelineSparseDist.
+    def _setup_pipeline(self, tc, active_tasks):
+        """One-time setup for TorchRec 3-stage pipelined training.
 
-        Overlaps H2D transfer (memcpy stream), sparse data distribution /
-        embedding all-to-all (data_dist stream), and dense forward+backward
-        (default stream) across consecutive batches.
-
-        Requires: model wrapped with DMP (DistributedModelParallel).
+        Returns the constructed TrainPipelineSparseDist object.
         """
         from torchrec.distributed.train_pipeline import TrainPipelineSparseDist
         from torchrec.distributed.train_pipeline.tracing import (
@@ -283,8 +241,6 @@ class DistributedTrainer:
         _orig_is_leaf = _TorchRecTracer.is_leaf_module
 
         def _patched_is_leaf(self, m, module_qualified_name):
-            # If a parent qualified name is already a leaf, treat all
-            # descendants (children, grandchildren, …) as leaves too.
             for leaf in self._leaf_modules:
                 if module_qualified_name.startswith(leaf + "."):
                     return True
@@ -292,17 +248,8 @@ class DistributedTrainer:
 
         _TorchRecTracer.is_leaf_module = _patched_is_leaf
 
-        tc = self.config.train
-        active_tasks = [k for k, v in tc.loss_weights.items() if v > 0]
-        per_gpu_batch = tc.batch_size // get_world_size()
-
         amp_dtype = torch.bfloat16 if self.use_amp else torch.float32
 
-        # -- Wrap model + loss into a single callable for the pipeline --------
-        # TrainPipelineSparseDist invokes `custom_model_fwd(batch)` on the
-        # default CUDA stream after embeddings are ready.  PipelineModelWrapper
-        # bundles forward + loss computation so the pipeline gets back the loss
-        # (needed for backward) and per-task loss dict (for logging).
         wrapped_model = PipelineModelWrapper(
             model=self.model,
             loss_fn=self.loss_fn,
@@ -313,12 +260,10 @@ class DistributedTrainer:
             use_amp=self.use_amp,
         )
 
-        # -- Gradient clipping via backward hook ------------------------------
         # In non-pipelined training we clip between backward() and step().
         # The pipeline calls backward+step atomically inside progress(), so we
-        # cannot inject code between them.  A full-backward hook fires right
-        # after autograd finishes, before the optimizer step, giving us the
-        # same clipping semantics.
+        # register a full-backward hook that fires right after autograd
+        # finishes, before the optimizer step.
         if tc.grad_clip > 0:
             _clip_value = tc.grad_clip
             _optimizer = self.optimizer
@@ -331,24 +276,13 @@ class DistributedTrainer:
                 lambda _m, _gi, _go: _post_backward_grad_clip()
             )
 
-        # -- Toggle the model's embedding path for FX tracing ----------------
-        # When _pipeline_mode=True the model's forward reads embeddings from
-        # the pre-built KJT (batch.unpooled_kjt → EmbeddingCollection) instead
-        # of calling _build_unpooled_kjt at runtime.  This gives FX a clean
-        # static graph it can trace: DlrmBatch["unpooled_kjt"] → ec(kjt).
+        # When _pipeline_mode=True the model reads embeddings from the
+        # pre-built KJT instead of calling _build_unpooled_kjt at runtime,
+        # giving FX a clean static graph to trace.
         inner = self.model.module if hasattr(self.model, "module") else self.model
         inner._pipeline_mode = True
 
-        # -- Construct the 3-stage pipeline -----------------------------------
-        # Stage 0 (memcpy stream):    H2D transfer of next batch
-        # Stage 1 (data_dist stream): KJT redistribution + embedding all-to-all
-        # Stage 2 (default stream):   dense fwd/bwd/optim on current batch
-        #
-        # execute_all_batches=True ensures the pipeline drains completely at
-        # epoch end instead of dropping the last 2 in-flight batches.
-        # custom_model_fwd overrides the default `model(batch)` call with our
-        # wrapper that also computes the loss.
-        pipeline = TrainPipelineSparseDist(
+        return TrainPipelineSparseDist(
             model=self.model,
             optimizer=self.optimizer,
             device=self.device,
@@ -356,68 +290,72 @@ class DistributedTrainer:
             custom_model_fwd=wrapped_model,
         )
 
+    # -- Unified training loop ------------------------------------------------
+
+    def train(self, pipeline: bool = False) -> None:
+        """Run training, either sequential or pipelined.
+
+        Args:
+            pipeline: If True, use TorchRec TrainPipelineSparseDist which
+                overlaps H2D, embedding all-to-all, and dense fwd/bwd across
+                3 CUDA streams.  Requires model wrapped with DMP.
+        """
+        tc = self.config.train
+        active_tasks = [k for k, v in tc.loss_weights.items() if v > 0]
+        per_gpu_batch = tc.batch_size // get_world_size()
+
+        mode = "pipelined (TrainPipelineSparseDist)" if pipeline else "sequential"
+        logger.info(f"Training mode: {mode}")
+
+        pipeline_obj = None
+        if pipeline:
+            pipeline_obj = self._setup_pipeline(tc, active_tasks)
+
         for epoch in range(tc.epochs):
             sampler = self.train_loader.sampler
             if isinstance(sampler, DistributedSampler):
-                # Each epoch must reshuffle with a different seed so ranks
-                # see different data orderings across epochs.
                 sampler.set_epoch(epoch)
 
             self.model.train()
             epoch_loss = 0.0
-            epoch_start = time.time()
+            current_time = time.time()
+            epoch_start = current_time
+            window_start = current_time
             num_batches = 0
 
-            # Fresh iterator each epoch; the pipeline pulls batches lazily via
-            # next(dataloader_iter) inside progress().
-            dataloader_iter = iter(self.train_loader)
-            while True:
-                try:
-                    # progress() advances the 3-stage pipeline by one step:
-                    #   - Kicks off H2D for batch N+2
-                    #   - Kicks off data_dist (all-to-all) for batch N+1
-                    #   - Runs fwd/bwd/optim for batch N on the default stream
-                    # Returns the output of custom_model_fwd for batch N,
-                    # which is the per-task loss dict from PipelineModelWrapper.
-                    task_losses = pipeline.progress(dataloader_iter)
-                except StopIteration:
-                    break
+            if pipeline:
+                steps = self._pipelined_steps(pipeline_obj, iter(self.train_loader))
+            else:
+                steps = self._sequential_steps(tc, active_tasks)
 
-                # The pipeline handles optimizer.step() internally, but the LR
-                # scheduler is our responsibility — step it after each batch.
+            for loss_val, task_losses in steps:
                 self.scheduler.step()
 
                 if self.tracer:
                     self.tracer.step()
 
+                epoch_loss += loss_val
                 num_batches += 1
 
-                # task_losses is a dict like {"listen_plus": 0.42, "like": 0.31, ...}.
-                # During pipeline warmup (first 2 calls) it may be empty/None
-                # because no batch has completed the full 3-stage journey yet.
-                if isinstance(task_losses, dict) and task_losses:
-                    loss_val = sum(
-                        v.item() if isinstance(v, torch.Tensor) else v
-                        for v in task_losses.values()
-                    )
-                else:
-                    loss_val = 0.0
-                epoch_loss += loss_val
-
                 if self.global_step % self.log_interval == 0 and is_main_process():
+                    current_time = time.time()
                     lr = self.optimizer.param_groups[0]["lr"]
-                    elapsed = time.time() - epoch_start
+                    elapsed = current_time - epoch_start
                     throughput = num_batches * per_gpu_batch * get_world_size() / elapsed
+                    window_elapsed = current_time - window_start
+                    window_throughput = self.log_interval * per_gpu_batch * get_world_size() / window_elapsed if window_elapsed > 0 else 0
                     logger.info(
                         f"epoch={epoch} step={self.global_step} | "
                         f"loss={loss_val:.4f} | lr={lr:.6f} | "
-                        f"throughput={throughput:.0f} samples/s | "
+                        f"global_throughput={throughput:.0f} samples/s | "
+                        f"window_throughput={window_throughput:.0f} samples/s (over {self.log_interval} steps) | "
                         + " | ".join(
                             f"{k}={v.item() if isinstance(v, torch.Tensor) else v:.4f}"
                             for k, v in task_losses.items()
                             if hasattr(v, "__float__")
                         )
                     )
+                    window_start = current_time
 
                 self.global_step += 1
                 if self.max_steps > 0 and self.global_step >= self.max_steps:
@@ -431,19 +369,15 @@ class DistributedTrainer:
                 logger.info(
                     f"=== Epoch {epoch} done === "
                     f"avg_loss={avg_loss:.4f} | time={epoch_time:.1f}s | "
-                    f"throughput={throughput:.0f} samples/s"
+                    f"global_throughput={throughput:.0f} samples/s"
                 )
 
-            # All ranks must reach the barrier before checkpointing so that
-            # the gathered state dict is consistent across shards.
             barrier()
             self._save_checkpoint(epoch)
 
             if self.eval_fn is not None:
                 self._run_eval()
 
-            # Second barrier ensures eval/checkpoint I/O is finished on all
-            # ranks before any rank begins the next epoch's data loading.
             barrier()
             if self.max_steps > 0 and self.global_step >= self.max_steps:
                 break

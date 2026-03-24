@@ -39,6 +39,7 @@ from primus_dlrm.distributed.wrapper import wrap_model
 from primus_dlrm.evaluation.metrics import evaluate_ranking, evaluate_ranking_peruser
 from primus_dlrm.models.dlrm import DLRMBaseline
 from primus_dlrm.training.dist_trainer import DistributedTrainer
+from primus_dlrm.training.runtime import configure_runtime
 
 
 def build_model(config, num_users, num_items, num_artists, num_albums,
@@ -82,6 +83,9 @@ def main():
                         help="Skip eval after training (run eval separately)")
     parser.add_argument("--trace", action="store_true",
                         help="Dump per-step phase trace to <run>/trace.jsonl")
+    parser.add_argument("--trace-steps", type=str, default="",
+                        help="Comma-separated steps to capture traces (e.g. '500,1000'). "
+                             "Each step gets its own trace file.")
     parser.add_argument("--pipeline", action="store_true",
                         help="Use TorchRec TrainPipelineSparseDist (3-stage, DMP only)")
     args = parser.parse_args()
@@ -93,8 +97,7 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
 
     config = Config.load(args.config)
-    from primus_dlrm.training.precision import configure_precision
-    configure_precision(config.train)
+    configure_runtime(config.train)
     torch.manual_seed(config.train.seed + rank)
 
     processed_dir = Path(args.processed_dir)
@@ -207,13 +210,11 @@ def main():
         max_steps=args.max_steps,
         log_interval=args.log_interval,
         trace=args.trace,
+        trace_steps=[int(s) for s in args.trace_steps.split(",") if s.strip()] or None,
     )
-    if args.pipeline:
-        if not use_dmp:
-            raise ValueError("--pipeline requires --dense-strategy dmp")
-        trainer.train_pipelined()
-    else:
-        trainer.train()
+    if args.pipeline and not use_dmp:
+        raise ValueError("--pipeline requires --dense-strategy dmp")
+    trainer.train(pipeline=args.pipeline)
 
     cleanup()
     if is_main_process():

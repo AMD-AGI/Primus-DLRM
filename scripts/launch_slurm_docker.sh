@@ -41,9 +41,12 @@ LOG_INTERVAL=1000
 NCCL_IF=""
 SKIP_EVAL=""
 TRACE=""
+TRACE_STEPS=""
 PIPELINE=""
 USE_AINIC=""
-DOCKER_IMAGE="tasimage/primus:pr-609-ainic"
+NODELIST=""
+DEPENDENCY=""
+DOCKER_IMAGE="tasimage/primus:pr-563-ainic"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -61,8 +64,11 @@ while [[ $# -gt 0 ]]; do
         --nccl-if)        NCCL_IF="$2"; shift 2;;
         --skip-eval)      SKIP_EVAL="--skip-eval"; shift;;
         --trace)          TRACE="--trace"; shift;;
+        --trace-steps)    TRACE_STEPS="$2"; shift 2;;
         --pipeline)       PIPELINE="--pipeline"; shift;;
         --ainic)          USE_AINIC=1; shift;;
+        --nodelist)       NODELIST="$2"; shift 2;;
+        --dependency)     DEPENDENCY="$2"; shift 2;;
         --image)          DOCKER_IMAGE="$2"; shift 2;;
         *) echo "Unknown arg: $1"; exit 1;;
     esac
@@ -90,6 +96,8 @@ cat > "$SBATCH_SCRIPT" << SBATCH_EOF
 #SBATCH --output=$LOG_DIR/slurm_%j.out
 #SBATCH --error=$LOG_DIR/slurm_%j.err
 #SBATCH --exclusive
+$([ -n "$NODELIST" ] && echo "#SBATCH --nodelist=$NODELIST")
+$([ -n "$DEPENDENCY" ] && echo "#SBATCH --dependency=$DEPENDENCY")
 
 set -euo pipefail
 
@@ -235,6 +243,7 @@ srun --kill-on-bad-exit=1 --export=ALL bash -c '
                 --log-interval $LOG_INTERVAL \
                 --run-name \"$RUN_NAME\" \
                 --results-dir \"$RESULTS_DIR\" \
+                --trace-steps \"$TRACE_STEPS\" \
                 $SKIP_EVAL $TRACE $PIPELINE
         "
 '
