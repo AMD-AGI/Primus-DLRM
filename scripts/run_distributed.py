@@ -164,6 +164,7 @@ def main():
         logger.info(f"Model: {num_params:,} params (dense), wrapping with {strategy_label} "
                     f"for {world_size} GPUs...")
 
+    logger.info(f"Calling wrap_model with {args.dense_strategy} on rank {rank}")
     model = wrap_model(
         model, device,
         dense_strategy=args.dense_strategy,
@@ -171,6 +172,7 @@ def main():
         embedding_lr=config.train.embedding_lr,
         embedding_weight_decay=config.train.weight_decay,
     )
+    logger.info(f"Model wrapped with {args.dense_strategy} on rank {rank}")
 
     # Eval function (rank 0 only, unless skipped)
     eval_fn = None
