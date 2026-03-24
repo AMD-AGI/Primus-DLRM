@@ -17,6 +17,10 @@
 #   # Custom image
 #   bash scripts/launch_slurm_docker.sh --nnodes 1 --config configs/bench_onetrans_v6.yaml \
 #       --image myregistry/primus:latest
+#
+#   # Multi-node with AINIC (required for multi-node on AINIC clusters)
+#   bash scripts/launch_slurm_docker.sh --nnodes 2 --config configs/bench_onetrans_v6.yaml \
+#       --run-name 2n_dmp --pipeline --ainic
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -38,6 +42,7 @@ NCCL_IF=""
 SKIP_EVAL=""
 TRACE=""
 PIPELINE=""
+USE_AINIC=""
 DOCKER_IMAGE="tasimage/primus:pr-609-ainic"
 
 while [[ $# -gt 0 ]]; do
@@ -57,6 +62,7 @@ while [[ $# -gt 0 ]]; do
         --skip-eval)      SKIP_EVAL="--skip-eval"; shift;;
         --trace)          TRACE="--trace"; shift;;
         --pipeline)       PIPELINE="--pipeline"; shift;;
+        --ainic)          USE_AINIC=1; shift;;
         --image)          DOCKER_IMAGE="$2"; shift 2;;
         *) echo "Unknown arg: $1"; exit 1;;
     esac
@@ -108,28 +114,60 @@ echo "Config:        $CONFIG"
 echo "Strategy:      $DENSE_STRATEGY"
 echo "Run name:      $RUN_NAME"
 echo "Docker image:  $DOCKER_IMAGE"
+echo "AINIC:         ${USE_AINIC:-disabled}"
 echo "============================================"
 
 cd "\$PROJECT_DIR"
 
 # srun launches one task per node; each task starts a Docker container
 # that runs torchrun with the appropriate per-node configuration.
-srun --kill-on-bad-exit=1 bash -c '
+# --export=ALL passes all sbatch env vars (NCCL_*, RCCL_*, etc.) to srun tasks.
+srun --kill-on-bad-exit=1 --export=ALL bash -c '
+    # Docker run flags:
+    #   --network=host       Share host network namespace (required for NCCL/RCCL)
+    #   --ipc=host           Share host IPC namespace (shared memory for GPU comms)
+    #   --device=/dev/kfd    ROCm GPU compute device
+    #   --device=/dev/dri    GPU DRM/display device
+    #   --device=/dev/infiniband  RDMA/InfiniBand devices for inter-node comms
+    #   --privileged         Full host device access (required for RDMA/GDR)
+    #   --cap-add=SYS_PTRACE     Allow ptrace (debugging, profiling)
+    #   --cap-add=CAP_SYS_ADMIN  Allow sysfs access (GPU topology, perf counters)
+    #   --cap-add=IPC_LOCK       Allow memory locking (RDMA pinned memory)
+    #   --security-opt seccomp=unconfined  Disable seccomp (GPU driver syscalls)
+    #   --group-add video    Access to GPU device nodes
+    #
+    # Environment variables:
+    #   HSA_NO_SCRATCH_RECLAIM=1     Prevent GPU scratch memory reclaim (stability)
+    #   HSA_KERNARG_POOL_SIZE=12M    Larger kernel argument pool (prevent OOM)
+    #   GPU_MAX_HW_QUEUES=4          Limit GPU hardware queues (stability)
+    #   NCCL_IB_HCA=ionic_*          Use only AINIC HCAs for inter-node RDMA
+    #   NCCL_IB_GID_INDEX=1          RoCE GID index for AINIC
+    #   NCCL_DMABUF_ENABLE=1         DMA-BUF for intra-node GPU direct (overridden by AINIC)
+    #   NCCL_GDRCOPY_ENABLE=1        GPU Direct RDMA copy
+    #   RCCL_MSCCLPP_ENABLE=1        MSCCL++ protocol for RCCL
+    #   IONIC_LOCKFREE=all           Lock-free mode for ionic AINIC adapters
     docker run --rm \
         --network=host \
         --ipc=host \
         --device=/dev/kfd \
         --device=/dev/dri \
+        --device=/dev/infiniband \
         --group-add video \
+        --privileged \
         --cap-add=SYS_PTRACE \
+        --cap-add=CAP_SYS_ADMIN \
+        --cap-add=IPC_LOCK \
         --security-opt seccomp=unconfined \
         -v "\$PROJECT_DIR":"/workspace/dlrm" \
         -w "/workspace/dlrm" \
         -e MASTER_ADDR="\$MASTER_ADDR" \
         -e MASTER_PORT="\$MASTER_PORT" \
-        -e NCCL_SOCKET_IFNAME='"$NCCL_IF"' \
-        -e GLOO_SOCKET_IFNAME='"$NCCL_IF"' \
+        -e NCCL_SOCKET_IFNAME='$NCCL_IF' \
+        -e GLOO_SOCKET_IFNAME='$NCCL_IF' \
         -e NCCL_DEBUG=WARN \
+        -e HSA_NO_SCRATCH_RECLAIM=1 \
+        -e HSA_KERNARG_POOL_SIZE=12582912 \
+        -e GPU_MAX_HW_QUEUES=4 \
         -e NCCL_IB_HCA=ionic_0:1,ionic_2:1,ionic_3:1,ionic_4:1,ionic_5:1,ionic_7:1,ionic_8:1,ionic_9:1 \
         -e NCCL_IB_GID_INDEX=1 \
         -e NCCL_IB_PCI_RELAXED_ORDERING=1 \
@@ -152,6 +190,36 @@ srun --kill-on-bad-exit=1 bash -c '
         -e SLURM_PROCID="\$SLURM_PROCID" \
         "\$DOCKER_IMAGE" \
         bash -c "
+            # ----------------------------------------------------------
+            # AINIC setup (--ainic flag)
+            # Uses custom RCCL build + AINIC network plugin (librccl-anp.so)
+            # instead of PyTorch bundled RCCL. Required for multi-node on
+            # AINIC clusters — without this, inter-node RCCL collectives
+            # crash with SIGSEGV because the bundled RCCL lacks the AINIC
+            # network transport.
+            #
+            # WARNING: The NCCL/RCCL tuning values below (IB_TC, FIFO_TC,
+            # MAX_P2P_CHANNELS, IB_QPS_PER_CONNECTION, DMABUF_ENABLE) are
+            # specific to the AINIC cluster hardware and network topology.
+            # These may need adjustment for different clusters or AINIC
+            # firmware versions. Refer to Primus/examples/run_pretrain.sh
+            # for the canonical AINIC configuration.
+            # ----------------------------------------------------------
+            if [ '"$USE_AINIC"' = '1' ] && [ -f /opt/amd-anp/build/librccl-anp.so ]; then
+                # Load AINIC network plugin for RCCL
+                export NCCL_NET_PLUGIN=librccl-anp.so
+                # Override LD_LIBRARY_PATH: custom RCCL at /opt/rccl replaces
+                # PyTorch bundled librccl.so; AINIC plugin at /opt/amd-anp
+                export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu/libibverbs:/opt/rccl/build/release:/opt/amd-anp/build:/opt/ompi/lib
+                # AINIC-tuned NCCL parameters (override defaults set above)
+                export NCCL_DMABUF_ENABLE=0          # AINIC does not use DMA-BUF
+                export NCCL_IB_QPS_PER_CONNECTION=1  # fewer queue pairs for AINIC
+                export NCCL_IB_TC=41                 # traffic class for QoS
+                export NCCL_IB_FIFO_TC=185           # FIFO traffic class
+                export NCCL_MAX_P2P_CHANNELS=56      # max peer-to-peer channels
+                echo AINIC_enabled
+            fi
+
             pip install --quiet --no-cache-dir polars pyarrow pyyaml tqdm datasets pytest 2>/dev/null
             export PYTHONPATH=/workspace/dlrm:\${PYTHONPATH:-}
             torchrun \
