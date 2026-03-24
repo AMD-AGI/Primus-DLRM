@@ -154,6 +154,11 @@ class TrainConfig:
     # No effect when bf16=true (autocast overrides all matmuls to BF16).
     allow_tf32: bool = False
 
+    # Enable FBGEMM TBE V2 embedding kernels.
+    # Improves throughput ~14% by better overlapping embedding
+    # computation with NCCL communication in the DMP pipeline.
+    tbe_v2: bool = False
+
     # Max gradient norm for gradient clipping (dense params only;
     # embedding grads are handled by FBGEMM fused optimizer)
     grad_clip: float = 1.0
