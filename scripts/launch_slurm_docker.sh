@@ -127,6 +127,16 @@ echo "============================================"
 
 cd "\$PROJECT_DIR"
 
+# Kill any stale Docker containers on all allocated nodes to free GPU
+# resources and ports (e.g. 29500) left behind by cancelled jobs.
+srun --kill-on-bad-exit=1 --export=ALL bash -c '
+    STALE=\$(docker ps -q 2>/dev/null)
+    if [ -n "\$STALE" ]; then
+        echo "[\$(hostname)] Stopping stale containers: \$STALE"
+        docker kill \$STALE 2>/dev/null || true
+    fi
+'
+
 # srun launches one task per node; each task starts a Docker container
 # that runs torchrun with the appropriate per-node configuration.
 # --export=ALL passes all sbatch env vars (NCCL_*, RCCL_*, etc.) to srun tasks.
