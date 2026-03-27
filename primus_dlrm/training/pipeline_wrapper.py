@@ -94,7 +94,7 @@ class PipelineModelWrapper(nn.Module):
                 # In-batch BPR contrastive loss: encourages the model to rank
                 # positive items higher than negatives sampled from the batch.
                 bpr_loss = self.contrastive_loss_fn(
-                    cross_scores, batch_dict["listen_plus"],
+                    cross_scores, batch_dict[self.active_tasks[0]],
                 )
                 total_loss = total_loss + self.contrastive_weight * bpr_loss
                 task_losses["bpr"] = bpr_loss

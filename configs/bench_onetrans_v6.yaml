@@ -6,6 +6,45 @@ data:
   enable_counters: true
   counter_windows_days: [7, 30]
   data_dir: "data"
+  schema:
+    embedding_tables:
+      - name: item
+        features: [item, hist_lp_item, hist_like_item, hist_skip_item]
+      - name: artist
+        features: [artist, hist_lp_artist, hist_like_artist, hist_skip_artist]
+      - name: album
+        features: [album, hist_lp_album, hist_like_album, hist_skip_album]
+      - name: uid
+        features: [uid]
+    sequence_groups:
+      hist_lp: [hist_lp_item, hist_lp_artist, hist_lp_album]
+      hist_like: [hist_like_item, hist_like_artist, hist_like_album]
+      hist_skip: [hist_skip_item, hist_skip_artist, hist_skip_album]
+    scalar_features: [uid, item, artist, album]
+    batch_to_feature:
+      item_id: item
+      artist_id: artist
+      album_id: album
+      hist_lp_item_ids: hist_lp_item
+      hist_lp_artist_ids: hist_lp_artist
+      hist_lp_album_ids: hist_lp_album
+      hist_like_item_ids: hist_like_item
+      hist_like_artist_ids: hist_like_artist
+      hist_like_album_ids: hist_like_album
+      hist_skip_item_ids: hist_skip_item
+      hist_skip_artist_ids: hist_skip_artist
+      hist_skip_album_ids: hist_skip_album
+    dense_features:
+      - { name: audio_embed, dim: 128, project: true, activation: gelu }
+      - { name: user_counters, dim: 6, project: false }
+      - { name: item_counters, dim: 6, project: false }
+      - { name: cross_counters, dim: 18, project: true, activation: relu }
+    kjt_feature_order:
+      [item, artist, album,
+       hist_lp_item, hist_like_item, hist_skip_item,
+       hist_lp_artist, hist_like_artist, hist_skip_artist,
+       hist_lp_album, hist_like_album, hist_skip_album,
+       uid]
 
 model:
   model_type: "onetrans"

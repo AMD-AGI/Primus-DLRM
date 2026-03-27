@@ -25,11 +25,10 @@ from torchrec.streamable import Pipelineable
 
 from primus_dlrm.data.dataset import ScoringPair
 
-# TODO: This mapping and the DlrmBatch fields below are hardcoded for the
-# Yambda dataset schema.  They should be driven by the training config YAML
-# (e.g. a `features:` section listing embedding tables, history channels,
-# dense inputs, and label names) so that adding/removing features doesn't
-# require editing this file, the collate function, and the model in lockstep.
+# NOTE: This mapping and the DlrmBatch fields below are specific to the
+# Yambda dataset schema (ScoringPair).  For generic/synthetic data, use
+# SyntheticBatch from data/synthetic.py instead.  The model itself is
+# feature-name agnostic — it reads feature names from the FeatureSchema.
 #
 # Maps each raw ID field in the batch to the corresponding feature name in the
 # EmbeddingCollection.  Order must match TorchRecEmbeddings._unpooled_features

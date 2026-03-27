@@ -1,0 +1,268 @@
+"""Synthetic random data generator for benchmarking and NaN reproduction.
+
+Produces batches matching a FeatureSchema without requiring any real dataset.
+Feature names, table sizes, dimensions, and value ranges are all configurable
+via ``SyntheticDataConfig`` in the YAML.
+
+Three usage patterns:
+
+1. ``SyntheticDataset`` — standard ``Dataset`` returning per-sample dicts,
+   compatible with DataLoader + collate.  Good for realistic DataLoader
+   behavior with multiple workers.
+
+2. ``generate_batch`` — bulk tensor generation (one call → full batch).
+   Bypasses per-sample overhead for maximum throughput benchmarking.
+
+3. ``SyntheticDataPipe`` — infinite iterator cycling through pre-generated
+   batches (like the MI350X NaN reproducer's DataPipe).
+"""
+from __future__ import annotations
+
+import copy
+import logging
+from dataclasses import dataclass, fields
+from typing import Any, Optional
+
+import torch
+from torch.utils.data import Dataset
+from torchrec import KeyedJaggedTensor
+from torchrec.streamable import Pipelineable
+
+from primus_dlrm.config import SyntheticDataConfig
+from primus_dlrm.schema import FeatureSchema
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Per-sample dataset
+# ---------------------------------------------------------------------------
+
+class SyntheticDataset(Dataset):
+    """Generates random samples matching a FeatureSchema."""
+
+    def __init__(self, schema: FeatureSchema, config: SyntheticDataConfig):
+        self.schema = schema
+        self.config = config
+        self._table_sizes: dict[str, int] = {}
+        for table in schema.embedding_tables:
+            for feat in table.feature_names:
+                self._table_sizes[feat] = table.num_embeddings
+
+    def __len__(self) -> int:
+        return self.config.num_samples
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        rng = torch.Generator().manual_seed(self.config.seed + idx)
+        schema = self.schema
+        feat_to_key = schema.feature_to_batch_key()
+        sample: dict[str, torch.Tensor] = {}
+
+        # Scalar sparse features: [1] each
+        for feat in schema.scalar_features:
+            vocab = self._table_sizes[feat]
+            key = feat_to_key.get(feat, feat)
+            sample[key] = torch.randint(0, vocab, (1,), generator=rng).squeeze(0)
+
+        # Sequence sparse features: [L] each
+        for group_feats in schema.sequence_groups.values():
+            for feat in group_feats:
+                vocab = self._table_sizes[feat]
+                key = feat_to_key.get(feat, feat)
+                sample[key] = torch.randint(
+                    0, vocab, (schema.sequence_length,), generator=rng,
+                )
+
+        # Dense features
+        for df in schema.dense_features:
+            lo, hi = df.value_range_min, df.value_range_max
+            sample[df.name] = torch.empty(df.dim).uniform_(lo, hi)
+
+        # Labels
+        for task in schema.task_names:
+            sample[task] = torch.tensor(
+                1.0 if torch.rand(1, generator=rng).item() < self.config.label_positive_rate else 0.0,
+            )
+
+        return sample
+
+
+def collate_synthetic(
+    batch: list[dict[str, torch.Tensor]],
+) -> dict[str, torch.Tensor]:
+    """Stack per-sample dicts into batched tensors."""
+    keys = batch[0].keys()
+    result: dict[str, torch.Tensor] = {}
+    for k in keys:
+        vals = [b[k] for b in batch]
+        if vals[0].dim() == 0:
+            result[k] = torch.stack(vals)
+        else:
+            result[k] = torch.stack(vals)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Pipelineable batch for TorchRec pipeline mode
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SyntheticBatch(Pipelineable):
+    """Generic batch for pipeline mode, wrapping a tensor dict + optional KJT."""
+    tensors: dict[str, torch.Tensor]
+    unpooled_kjt: Optional[KeyedJaggedTensor] = None
+
+    def to(self, device: torch.device, non_blocking: bool = False) -> "SyntheticBatch":
+        moved = {
+            k: v.to(device=device, non_blocking=non_blocking)
+            for k, v in self.tensors.items()
+        }
+        kjt = self.unpooled_kjt
+        if kjt is not None:
+            kjt = kjt.to(device=device, non_blocking=non_blocking)
+        return SyntheticBatch(tensors=moved, unpooled_kjt=kjt)
+
+    def record_stream(self, stream: torch.Stream) -> None:
+        for v in self.tensors.values():
+            if v.is_cuda:
+                v.record_stream(stream)
+        if self.unpooled_kjt is not None:
+            self.unpooled_kjt.record_stream(stream)
+
+    def pin_memory(self) -> "SyntheticBatch":
+        pinned = {k: v.pin_memory() for k, v in self.tensors.items()}
+        kjt = self.unpooled_kjt
+        if kjt is not None:
+            kjt = kjt.pin_memory()
+        return SyntheticBatch(tensors=pinned, unpooled_kjt=kjt)
+
+    def __getitem__(self, key: str) -> Any:
+        if key == "unpooled_kjt":
+            return self.unpooled_kjt
+        return self.tensors[key]
+
+    def to_dict(self) -> dict[str, Any]:
+        d = dict(self.tensors)
+        if self.unpooled_kjt is not None:
+            d["unpooled_kjt"] = self.unpooled_kjt
+        return d
+
+
+def _build_synthetic_kjt(
+    tensors: dict[str, torch.Tensor],
+    schema: FeatureSchema,
+) -> KeyedJaggedTensor:
+    """Build KJT from all EC features in the schema.
+
+    Uses ``schema.kjt_feature_order`` when set, so the KJT key order matches
+    exactly what the pipeline / EmbeddingCollection expects.
+    """
+    feat_order = schema.kjt_feature_order or schema.all_ec_feature_names()
+    feat_to_key = schema.feature_to_batch_key()
+    keys, all_values, all_lengths = [], [], []
+    for feat in feat_order:
+        batch_key = feat_to_key.get(feat, feat)
+        if batch_key not in tensors:
+            continue
+        ids = tensors[batch_key]
+        B = ids.shape[0]
+        flat = ids.reshape(-1)
+        keys.append(feat)
+        all_values.append(flat)
+        all_lengths.append(
+            torch.full((B,), flat.shape[0] // B, dtype=torch.int32, device=ids.device),
+        )
+    return KeyedJaggedTensor.from_lengths_sync(
+        keys=keys,
+        values=torch.cat(all_values) if all_values else torch.empty(0, dtype=torch.long),
+        lengths=torch.cat(all_lengths) if all_lengths else torch.empty(0, dtype=torch.int32),
+    )
+
+
+def collate_synthetic_pipeline(
+    batch: list[dict[str, torch.Tensor]],
+    schema: FeatureSchema,
+) -> SyntheticBatch:
+    """Collate into a SyntheticBatch with pre-built KJT for pipeline mode."""
+    tensors = collate_synthetic(batch)
+    kjt = _build_synthetic_kjt(tensors, schema)
+    return SyntheticBatch(tensors=tensors, unpooled_kjt=kjt)
+
+
+# ---------------------------------------------------------------------------
+# Bulk batch generation (reproducer-style)
+# ---------------------------------------------------------------------------
+
+def generate_batch(
+    schema: FeatureSchema,
+    batch_size: int,
+    seed: int = 42,
+    label_positive_rate: float = 0.3,
+) -> dict[str, torch.Tensor]:
+    """Generate a full random batch directly as tensors (no per-sample overhead)."""
+    rng = torch.Generator().manual_seed(seed)
+    table_sizes: dict[str, int] = {}
+    for table in schema.embedding_tables:
+        for feat in table.feature_names:
+            table_sizes[feat] = table.num_embeddings
+
+    feat_to_key = schema.feature_to_batch_key()
+    batch: dict[str, torch.Tensor] = {}
+    B = batch_size
+    L = schema.sequence_length
+
+    for feat in schema.scalar_features:
+        vocab = table_sizes[feat]
+        key = feat_to_key.get(feat, feat)
+        batch[key] = torch.randint(0, vocab, (B,), generator=rng)
+
+    for group_feats in schema.sequence_groups.values():
+        for feat in group_feats:
+            vocab = table_sizes[feat]
+            key = feat_to_key.get(feat, feat)
+            batch[key] = torch.randint(0, vocab, (B, L), generator=rng)
+
+    for df in schema.dense_features:
+        lo, hi = df.value_range_min, df.value_range_max
+        batch[df.name] = torch.empty(B, df.dim).uniform_(lo, hi)
+
+    for task in schema.task_names:
+        batch[task] = (torch.rand(B, generator=rng) < label_positive_rate).float()
+
+    return batch
+
+
+# ---------------------------------------------------------------------------
+# Infinite data pipe (reproducer-style)
+# ---------------------------------------------------------------------------
+
+class SyntheticDataPipe:
+    """Infinite iterator cycling through pre-generated batches.
+
+    Mimics the MI350X NaN reproducer's DataPipe: generates N batches up front,
+    then cycles through them with ``deepcopy`` to avoid mutation.
+    """
+
+    def __init__(
+        self,
+        schema: FeatureSchema,
+        batch_size: int,
+        num_prebatched: int = 16,
+        seed: int = 42,
+        label_positive_rate: float = 0.3,
+    ):
+        logger.info(f"Pre-generating {num_prebatched} synthetic batches (B={batch_size})...")
+        self._batches = [
+            generate_batch(schema, batch_size, seed=seed + i,
+                           label_positive_rate=label_positive_rate)
+            for i in range(num_prebatched)
+        ]
+        self._idx = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> dict[str, torch.Tensor]:
+        batch = self._batches[self._idx % len(self._batches)]
+        self._idx += 1
+        return copy.deepcopy(batch)

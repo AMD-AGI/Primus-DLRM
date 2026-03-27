@@ -108,6 +108,7 @@ class TorchRecEmbeddings(nn.Module):
         table_specs: list[TableSpec],
         device: torch.device | None = None,
         embedding_init: str = "uniform",
+        scalar_feature_names: set[str] | None = None,
     ):
         super().__init__()
         if device is None:
@@ -120,9 +121,12 @@ class TorchRecEmbeddings(nn.Module):
         self._pooled_set = set(self._pooled_features)
         self._unpooled_set = set(self._unpooled_features)
         # Scalar (1D) vs sequence (2D) — avoids dim() checks that break FX tracing.
-        self._scalar_features: set[str] = {
-            f for f in self._unpooled_features if not f.startswith("hist_")
-        }
+        if scalar_feature_names is not None:
+            self._scalar_features: set[str] = scalar_feature_names & self._unpooled_set
+        else:
+            self._scalar_features: set[str] = {
+                f for f in self._unpooled_features if not f.startswith("hist_")
+            }
 
         self.ebc: EmbeddingBagCollection | None = None
         self.ec: EmbeddingCollection | None = None

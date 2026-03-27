@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from primus_dlrm.config import Config
 from primus_dlrm.data.dataset import YambdaTrainDataset, YambdaEvalDataset, collate_scoring_pairs
 from primus_dlrm.evaluation.metrics import evaluate_ranking
+from primus_dlrm.schema import build_schema_from_config
 from primus_dlrm.training.runtime import configure_runtime
 from primus_dlrm.training.trainer import Trainer
 
@@ -23,20 +24,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def build_model(config, num_users, num_items, num_artists, num_albums, audio_input_dim, device):
+def build_model(config, schema, device):
     if config.model.model_type == "onetrans":
         from primus_dlrm.models.onetrans import OneTransModel
-        return OneTransModel(
-            config=config.model, num_users=num_users, num_items=num_items,
-            num_artists=num_artists, num_albums=num_albums,
-            audio_input_dim=audio_input_dim, device=device,
-        )
+        return OneTransModel(config=config.model, schema=schema, device=device)
     else:
         from primus_dlrm.models.dlrm import DLRMBaseline
+        tables = schema.embedding_tables
         return DLRMBaseline(
-            config=config.model, num_users=num_users, num_items=num_items,
-            num_artists=num_artists, num_albums=num_albums,
-            audio_input_dim=audio_input_dim, device=device,
+            config=config.model,
+            num_users=tables[3].num_embeddings if len(tables) > 3 else 0,
+            num_items=tables[0].num_embeddings if len(tables) > 0 else 0,
+            num_artists=tables[1].num_embeddings if len(tables) > 1 else 0,
+            num_albums=tables[2].num_embeddings if len(tables) > 2 else 0,
+            audio_input_dim=next((df.dim for df in schema.dense_features if df.project), 256),
+            device=device,
         )
 
 
@@ -72,14 +74,11 @@ def main():
 
     logger.info(f"Building model (type={config.model.model_type})...")
     num_users = int(train_dataset.store.unique_uids.max()) + 1
-    model = build_model(
-        config, num_users=num_users,
-        num_items=train_dataset.num_items,
-        num_artists=train_dataset.num_artists,
-        num_albums=train_dataset.num_albums,
-        audio_input_dim=train_dataset.audio_dim,
-        device=device,
-    )
+    schema = build_schema_from_config(config, {
+        "item": train_dataset.num_items, "artist": train_dataset.num_artists,
+        "album": train_dataset.num_albums, "uid": num_users,
+    })
+    model = build_model(config, schema=schema, device=device)
     num_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model parameters: {num_params:,}")
 

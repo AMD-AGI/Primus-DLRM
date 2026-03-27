@@ -9,8 +9,7 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
-CLASSIFICATION_TASKS = {"listen_plus", "like", "dislike"}
-REGRESSION_TASKS = {"listen_pct"}
+REGRESSION_TASKS = {"listen_pct", "played_ratio"}
 
 
 class MultiTaskLoss(nn.Module):
@@ -24,7 +23,7 @@ class MultiTaskLoss(nn.Module):
     def __init__(self, weights: dict[str, float] | None = None):
         super().__init__()
         if weights is None:
-            weights = {"listen_plus": 1.0}
+            weights = {"task0": 1.0}
         self.weights = {k: v for k, v in weights.items() if v > 0}
 
     def forward(
@@ -38,12 +37,13 @@ class MultiTaskLoss(nn.Module):
         for task, weight in self.weights.items():
             if task not in predictions or task not in labels:
                 continue
-            if task in CLASSIFICATION_TASKS:
+            if task in REGRESSION_TASKS:
+                task_losses[task] = F.mse_loss(predictions[task], labels[task])
+            else:
+                # BCE for known classification tasks and any generic/synthetic tasks
                 task_losses[task] = F.binary_cross_entropy_with_logits(
                     predictions[task], labels[task]
                 )
-            elif task in REGRESSION_TASKS:
-                task_losses[task] = F.mse_loss(predictions[task], labels[task])
 
         total = sum(self.weights[k] * v for k, v in task_losses.items())
         return total, task_losses

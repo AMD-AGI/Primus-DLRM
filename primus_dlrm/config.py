@@ -50,6 +50,126 @@ class DataConfig:
     use_cache: bool = True
     cache_dir: str = "data/cache"
 
+    # Synthetic data generation (replaces real data when enabled)
+    synthetic: SyntheticDataConfig = field(default_factory=lambda: SyntheticDataConfig())
+
+    # Feature schema definition.  Drives model construction, data generation,
+    # and the pipeline KJT layout.  When empty, uses the default Yambda schema.
+    schema: SchemaConfig = field(default_factory=lambda: SchemaConfig())
+
+
+# ---------------------------------------------------------------------------
+# Feature schema configuration (YAML-driven)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SchemaTableConfig:
+    """One embedding table with its features."""
+    name: str = ""
+    features: list[str] = field(default_factory=list)
+
+@dataclass
+class SchemaConfig:
+    """Full feature schema definition, read from YAML.
+
+    When ``embedding_tables`` is non-empty, the schema is built from these
+    definitions.  The schema must be present — ``build_schema_from_config``
+    reads tables, features, groups, and dense specs from this section.
+
+    Example YAML::
+
+        schema:
+          embedding_tables:
+            - name: item
+              features: [item, hist_lp_item, hist_like_item, hist_skip_item]
+            - name: artist
+              features: [artist, hist_lp_artist, hist_like_artist, hist_skip_artist]
+            - name: album
+              features: [album, hist_lp_album, hist_like_album, hist_skip_album]
+            - name: uid
+              features: [uid]
+          sequence_groups:
+            hist_lp: [hist_lp_item, hist_lp_artist, hist_lp_album]
+            hist_like: [hist_like_item, hist_like_artist, hist_like_album]
+            hist_skip: [hist_skip_item, hist_skip_artist, hist_skip_album]
+          scalar_features: [uid, item, artist, album]
+          batch_to_feature:
+            item_id: item
+            artist_id: artist
+            album_id: album
+            hist_lp_item_ids: hist_lp_item
+            ...
+          dense_features:
+            - {name: audio_embed, dim: 128, project: true, activation: gelu}
+            - {name: user_counters, dim: 6, project: false}
+            ...
+          kjt_feature_order: [item, artist, album, hist_lp_item, ...]
+    """
+    embedding_tables: list[SchemaTableConfig] = field(default_factory=list)
+    sequence_groups: dict[str, list[str]] = field(default_factory=dict)
+    scalar_features: list[str] = field(default_factory=list)
+    batch_to_feature: dict[str, str] = field(default_factory=dict)
+    dense_features: list[DenseFeatureSpec] = field(default_factory=list)
+    kjt_feature_order: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Synthetic data configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DenseFeatureSpec:
+    """One dense (non-embedding) feature.
+
+    When ``project`` is True, the feature is projected to ``embedding_dim``
+    via a learned Linear+GELU before concatenation into NS tokens.  When
+    False, the raw values are concatenated directly (lower parameter count,
+    but contributes ``dim`` instead of ``embedding_dim`` to the NS input).
+    """
+    name: str = ""
+    dim: int = 0
+    value_range_min: float = 0.0
+    value_range_max: float = 1.0
+    project: bool = True
+    activation: str = "gelu"
+
+
+@dataclass
+class SyntheticTableSpec:
+    """One embedding table in a synthetic config."""
+    num_embeddings: int = 10000
+    embedding_dim: int = 64
+
+
+@dataclass
+class SyntheticSparseSpec:
+    """A group of sparse features sharing one table."""
+    table_index: int = 0
+    is_sequence: bool = False
+    sequence_length: int = 20
+    num_features: int = 1
+
+
+@dataclass
+class SyntheticDataConfig:
+    """Synthetic random data generation config.
+
+    When ``enabled=True``, training uses randomly generated data instead of
+    loading the real Yambda dataset.  Embedding table sizes, feature counts,
+    value ranges, and dense feature dimensions are all configurable.  Feature
+    names are auto-generated (``f_t0_0``, ``dense_0``, ``task0``, etc.).
+    """
+    enabled: bool = False
+    seed: int = 42
+    num_samples: int = 100_000
+    num_prebatched: int = 16
+    label_positive_rate: float = 0.3
+
+    embedding_tables: list[SyntheticTableSpec] = field(default_factory=list)
+    sparse_features: list[SyntheticSparseSpec] = field(default_factory=list)
+    dense_features: list[DenseFeatureSpec] = field(default_factory=list)
+    num_tasks: int = 1
+
 
 @dataclass
 class OneTransConfig:
@@ -173,13 +293,11 @@ class TrainConfig:
     # Random seed for reproducibility
     seed: int = 42
 
-    # Per-task loss weights. Supported tasks:
-    #   "listen_plus" (BCE) — primary: listened >= 50% played_ratio
-    #   "like" (BCE) — explicit like event
-    #   "dislike" (BCE) — explicit dislike event
-    #   "played_ratio" (MSE) — continuous playback regression
+    # Per-task loss weights.  Task names are defined by the YAML config
+    # (e.g. "listen_plus", "like", "task0").  BCE loss is used by default;
+    # tasks named "listen_pct" or "played_ratio" use MSE.
     loss_weights: dict[str, float] = field(default_factory=lambda: {
-        "listen_plus": 1.0,
+        "task0": 1.0,
     })
 
     # Dense optimizer: "adamw" or "shampoo"
@@ -261,25 +379,45 @@ class Config:
         return _from_dict(cls, raw)
 
 
+_DC_REGISTRY: dict[str, type] = {}
+
+
 def _from_dict(dc_cls: type, raw: dict[str, Any]) -> Any:
     """Recursively instantiate a dataclass from a nested dict."""
     if raw is None:
         return dc_cls()
+    if not _DC_REGISTRY:
+        for cls in (
+            DataConfig, ModelConfig, TrainConfig, OneTransConfig,
+            DistributedConfig, EmbeddingShardingConfig,
+            SchemaConfig, SchemaTableConfig,
+            SyntheticDataConfig, SyntheticTableSpec, SyntheticSparseSpec,
+            DenseFeatureSpec,
+        ):
+            _DC_REGISTRY[cls.__name__] = cls
     kwargs = {}
     for f in fields(dc_cls):
         if f.name not in raw:
             continue
         val = raw[f.name]
-        _dc_registry = {
-            "DataConfig": DataConfig, "ModelConfig": ModelConfig,
-            "TrainConfig": TrainConfig, "OneTransConfig": OneTransConfig,
-            "DistributedConfig": DistributedConfig,
-            "EmbeddingShardingConfig": EmbeddingShardingConfig,
-        }
         type_name = f.type if isinstance(f.type, str) else getattr(f.type, "__name__", "")
-        if hasattr(f.type, "__dataclass_fields__") or type_name in _dc_registry:
-            sub_cls = _dc_registry.get(type_name)
+        if hasattr(f.type, "__dataclass_fields__") or type_name in _DC_REGISTRY:
+            sub_cls = _DC_REGISTRY.get(type_name)
             if sub_cls and isinstance(val, dict):
                 val = _from_dict(sub_cls, val)
+        elif isinstance(val, list) and val and isinstance(val[0], dict):
+            # Handle list[SomeDataclass] fields by matching the type hint
+            inner_cls = _guess_list_inner_dc(type_name)
+            if inner_cls is not None:
+                val = [_from_dict(inner_cls, v) if isinstance(v, dict) else v for v in val]
         kwargs[f.name] = val
     return dc_cls(**kwargs)
+
+
+def _guess_list_inner_dc(type_hint: str) -> type | None:
+    """Extract the inner dataclass from a 'list[Foo]' type hint string."""
+    import re
+    m = re.search(r"list\[(\w+)\]", type_hint, re.IGNORECASE)
+    if m:
+        return _DC_REGISTRY.get(m.group(1))
+    return None

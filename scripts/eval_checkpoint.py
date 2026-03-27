@@ -22,6 +22,7 @@ from primus_dlrm.data.dataset import YambdaEvalDataset, YambdaTrainDataset
 from primus_dlrm.evaluation.metrics import evaluate_ranking, evaluate_ranking_peruser
 from primus_dlrm.models.dlrm import DLRMBaseline
 from primus_dlrm.models.onetrans import OneTransModel
+from primus_dlrm.schema import build_schema_from_config
 
 # force=True required: imported modules configure the root logger first,
 # making a second basicConfig() a no-op without it.
@@ -53,18 +54,13 @@ def main():
     train_dataset = YambdaTrainDataset(config.data, processed_dir)
     num_users = int(train_dataset.store.unique_uids.max()) + 1
     active_tasks = [k for k, v in config.train.loss_weights.items() if v > 0]
-    num_counter_windows = len(config.data.counter_windows_days) if config.data.enable_counters else 0
+    schema = build_schema_from_config(config, {
+        "item": train_dataset.num_items, "artist": train_dataset.num_artists,
+        "album": train_dataset.num_albums, "uid": num_users,
+    })
 
     if config.model.model_type == "onetrans":
-        model = OneTransModel(
-            config=config.model, num_users=num_users,
-            num_items=train_dataset.num_items,
-            num_artists=train_dataset.num_artists,
-            num_albums=train_dataset.num_albums,
-            audio_input_dim=train_dataset.audio_dim,
-            device=device, tasks=active_tasks,
-            num_counter_windows=num_counter_windows,
-        )
+        model = OneTransModel(config=config.model, schema=schema, device=device)
     else:
         model = DLRMBaseline(
             config=config.model, num_users=num_users,

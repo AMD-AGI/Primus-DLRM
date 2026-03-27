@@ -311,7 +311,7 @@ class DistributedTrainer:
                 if self.use_contrastive:
                     inner = self.model.module if hasattr(self.model, "module") else self.model
                     preds, cross_scores = inner.forward_with_cross_scores(
-                        batch, cross_task="listen_plus",
+                        batch, cross_task=active_tasks[0],
                     )
                 else:
                     preds = self.model(batch)
@@ -320,7 +320,7 @@ class DistributedTrainer:
 
                 if self.use_contrastive:
                     bpr_loss = self.contrastive_loss_fn(
-                        cross_scores, batch["listen_plus"],
+                        cross_scores, batch[active_tasks[0]],
                     )
                     total_loss = total_loss + tc.contrastive_weight * bpr_loss
                     task_losses["bpr"] = bpr_loss

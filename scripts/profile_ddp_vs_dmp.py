@@ -25,22 +25,24 @@ from primus_dlrm.distributed.setup import (
 )
 from primus_dlrm.distributed.wrapper import wrap_model, is_dmp
 from primus_dlrm.models.dlrm import DLRMBaseline
+from primus_dlrm.schema import FeatureSchema, build_schema_from_config
 from primus_dlrm.training.losses import MultiTaskLoss
 
 
-def build_model(config, num_users, num_items, num_artists, num_albums,
-                audio_input_dim, device, tasks, meta_device=False):
-    num_counter_windows = len(config.data.counter_windows_days) if config.data.enable_counters else 0
-    kwargs = dict(
-        config=config.model, num_users=num_users, num_items=num_items,
-        num_artists=num_artists, num_albums=num_albums,
-        audio_input_dim=audio_input_dim, device=device, tasks=tasks,
-        num_counter_windows=num_counter_windows, meta_device=meta_device,
-    )
+def build_model(config, schema, device, meta_device=False):
     if config.model.model_type == "onetrans":
         from primus_dlrm.models.onetrans import OneTransModel
-        return OneTransModel(**kwargs)
-    return DLRMBaseline(**kwargs)
+        return OneTransModel(config=config.model, schema=schema, device=device, meta_device=meta_device)
+    tables = schema.embedding_tables
+    return DLRMBaseline(
+        config=config.model,
+        num_users=tables[3].num_embeddings if len(tables) > 3 else 0,
+        num_items=tables[0].num_embeddings if len(tables) > 0 else 0,
+        num_artists=tables[1].num_embeddings if len(tables) > 1 else 0,
+        num_albums=tables[2].num_embeddings if len(tables) > 2 else 0,
+        audio_input_dim=next((df.dim for df in schema.dense_features if df.project), 256),
+        device=device, tasks=list(schema.task_names), meta_device=meta_device,
+    )
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s [rank %(process)d] %(message)s",
@@ -83,10 +85,11 @@ def main():
     use_dmp = args.strategy == "dmp"
 
     build_device = torch.device("cpu") if use_dmp else device
-    model = build_model(config, num_users, train_dataset.num_items,
-                        train_dataset.num_artists, train_dataset.num_albums,
-                        train_dataset.audio_dim, build_device, active_tasks,
-                        meta_device=use_dmp)
+    schema = build_schema_from_config(config, {
+        "item": train_dataset.num_items, "artist": train_dataset.num_artists,
+        "album": train_dataset.num_albums, "uid": num_users,
+    })
+    model = build_model(config, schema, build_device, meta_device=use_dmp)
 
     model = wrap_model(model, device, dense_strategy=args.strategy,
                        embedding_sharding=args.embedding_sharding,
