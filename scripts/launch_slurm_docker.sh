@@ -238,7 +238,7 @@ srun --kill-on-bad-exit=1 --export=ALL bash -c '
                 echo AINIC_enabled
             fi
 
-            pip install --no-cache-dir polars pyarrow pyyaml tqdm datasets pytest
+            pip install --no-cache-dir polars pyarrow pyyaml tqdm datasets pytest psutil
             # Distributed Shampoo optimizer -- requires Python 3.12+
             # Only installed when config contains dense_optimizer: shampoo
             grep -q shampoo /workspace/dlrm/$CONFIG 2>/dev/null && pip install --no-cache-dir git+https://github.com/facebookresearch/optimizers.git && echo distributed-shampoo_installed

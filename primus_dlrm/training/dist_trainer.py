@@ -66,6 +66,104 @@ def _is_fsdp(model: nn.Module) -> bool:
     return isinstance(model, FSDP)
 
 
+def _get_system_metrics() -> str:
+    """Collect GPU and CPU memory metrics for logging.
+
+    GPU metrics use the same approach as Primus (MemoryStatsExtension):
+      - HIP stats via torch.cuda.mem_get_info() (cheap, always available)
+      - ROCm SMI VRAM stats via rocm-smi subprocess
+    CPU metrics via psutil (optional).
+    """
+    GB = 1024 ** 3
+    parts = []
+
+    # HIP memory stats (same as Primus MemoryStatsExtension)
+    try:
+        hip_free, hip_total = torch.cuda.mem_get_info()
+        hip_used = hip_total - hip_free
+        hip_ratio = hip_used / hip_total * 100
+        parts.append(
+            f"hip mem usage/free/total/usage_ratio: "
+            f"{hip_used / GB:.2f}GB/"
+            f"{hip_free / GB:.2f}GB/"
+            f"{hip_total / GB:.2f}GB/"
+            f"{hip_ratio:.2f}%"
+        )
+    except Exception as e:
+        logger.debug(f"HIP memory stats failed: {e}")
+
+    # ROCm SMI VRAM stats + cross-rank max (same as Primus rocm_mem_info)
+    try:
+        import subprocess
+        device_id = torch.cuda.current_device()
+        out = subprocess.check_output(
+            ["rocm-smi", "--showmeminfo", "vram", f"-d={device_id}"],
+            text=True, timeout=5,
+        )
+        r_total, r_used = None, None
+        for line in out.splitlines():
+            if "Total Memory" in line:
+                r_total = int(line.split(":")[-1].strip())
+            elif "Total Used Memory" in line:
+                r_used = int(line.split(":")[-1].strip())
+        if r_total and r_used:
+            r_free = r_total - r_used
+            r_ratio = r_used / r_total * 100
+            parts.append(
+                f"rocm mem usage/free/total/usage_ratio: "
+                f"{r_used / GB:.2f}GB/"
+                f"{r_free / GB:.2f}GB/"
+                f"{r_total / GB:.2f}GB/"
+                f"{r_ratio:.2f}%"
+            )
+    except Exception as e:
+        logger.debug(f"ROCm SMI stats failed: {e}")
+
+    # CPU memory (psutil, optional)
+    try:
+        import psutil
+        proc = psutil.Process()
+        cpu_mem = proc.memory_info().rss / GB
+        sys_mem = psutil.virtual_memory()
+        parts.append(
+            f"cpu_rss={cpu_mem:.2f}GB "
+            f"sys_mem={sys_mem.used / GB:.2f}/{sys_mem.total / GB:.2f}GB"
+        )
+    except Exception as e:
+        logger.debug(f"CPU memory stats failed: {e}")
+
+    return " | ".join(parts) if parts else "metrics=N/A"
+
+
+def _gather_max_gpu_memory() -> str:
+    """All-gather GPU VRAM usage across ranks and return max usage string.
+
+    Must be called on ALL ranks (not just rank 0) to avoid deadlock.
+    Same approach as Primus MemoryStatsExtension.
+    """
+    try:
+        if not torch.distributed.is_initialized():
+            return ""
+        hip_free, hip_total = torch.cuda.mem_get_info()
+        hip_used = hip_total - hip_free
+        usage_tensor = torch.tensor([hip_used], device="cuda", dtype=torch.float32)
+        world_size = torch.distributed.get_world_size()
+        gathered = [torch.zeros_like(usage_tensor) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered, usage_tensor)
+        usages = [t.item() for t in gathered]
+        max_usage = max(usages)
+        max_rank = usages.index(max_usage)
+        GB = 1024 ** 3
+        return (
+            f"max(rank-{max_rank}) GPU mem usage/usage_ratio: "
+            f"{max_usage / GB:.2f}GB/"
+            f"{max_usage / hip_total * 100:.2f}%"
+        )
+    except Exception as e:
+        logger.debug(f"GPU memory all_gather failed: {e}")
+        return ""
+
+
 def _is_embedding_param(name: str) -> bool:
     """Heuristic to identify embedding parameters managed by DMP."""
     return any(tok in name for tok in ("ebc.", "ec.", "embedding"))
@@ -373,25 +471,32 @@ class DistributedTrainer:
                 epoch_loss += loss_val
                 num_batches += 1
 
-                if self.global_step % self.log_interval == 0 and is_main_process():
-                    current_time = time.time()
-                    lr = self.optimizer.param_groups[0]["lr"]
-                    elapsed = current_time - epoch_start
-                    throughput = num_batches * per_gpu_batch * get_world_size() / elapsed
-                    window_elapsed = current_time - window_start
-                    window_throughput = self.log_interval * per_gpu_batch * get_world_size() / window_elapsed if window_elapsed > 0 else 0
-                    logger.info(
-                        f"epoch={epoch} step={self.global_step} | "
-                        f"loss={loss_val:.4f} | lr={lr:.6f} | "
-                        f"global_throughput={throughput:.0f} samples/s | "
-                        f"window_throughput={window_throughput:.0f} samples/s (over {self.log_interval} steps) | "
-                        + " | ".join(
-                            f"{k}={v.item() if isinstance(v, torch.Tensor) else v:.4f}"
-                            for k, v in task_losses.items()
-                            if hasattr(v, "__float__")
+                if self.global_step % self.log_interval == 0:
+                    # All ranks participate in all_gather for max GPU memory
+                    max_mem_str = _gather_max_gpu_memory()
+
+                    if is_main_process():
+                        current_time = time.time()
+                        lr = self.optimizer.param_groups[0]["lr"]
+                        elapsed = current_time - epoch_start
+                        throughput = num_batches * per_gpu_batch * get_world_size() / elapsed
+                        window_elapsed = current_time - window_start
+                        window_throughput = self.log_interval * per_gpu_batch * get_world_size() / window_elapsed if window_elapsed > 0 else 0
+                        sys_metrics = _get_system_metrics()
+                        logger.info(
+                            f"epoch={epoch} step={self.global_step} | "
+                            f"loss={loss_val:.4f} | lr={lr:.6f} | "
+                            f"global_throughput={throughput:.0f} samples/s | "
+                            f"window_throughput={window_throughput:.0f} samples/s (over {self.log_interval} steps) | "
+                            + " | ".join(
+                                f"{k}={v.item() if isinstance(v, torch.Tensor) else v:.4f}"
+                                for k, v in task_losses.items()
+                                if hasattr(v, "__float__")
+                            )
+                            + f" | {sys_metrics}"
+                            + (f" | {max_mem_str}" if max_mem_str else "")
                         )
-                    )
-                    window_start = current_time
+                        window_start = current_time
 
                 self.global_step += 1
                 if self.max_steps > 0 and self.global_step >= self.max_steps:
