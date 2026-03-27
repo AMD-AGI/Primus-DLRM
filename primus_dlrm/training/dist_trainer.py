@@ -98,7 +98,15 @@ def _create_dense_optimizer(params: list, tc) -> torch.optim.Optimizer:
             grafting_config=AdaGradPreconditionerConfig(epsilon=1e-5),
         )
 
-    return AdamW(params, lr=tc.lr, weight_decay=tc.weight_decay)
+    elif tc.dense_optimizer == "adamw":
+        return AdamW(params, lr=tc.lr, weight_decay=tc.weight_decay)
+    
+    raise ValueError(
+        f"Unknown dense_optimizer='{tc.dense_optimizer}'. "
+        f"Supported: 'adamw', 'shampoo'"
+    )
+
+    
 
 
 class DistributedTrainer:
