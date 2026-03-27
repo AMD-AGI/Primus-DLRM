@@ -238,7 +238,8 @@ srun --kill-on-bad-exit=1 --export=ALL bash -c '
                 echo AINIC_enabled
             fi
 
-            pip install --quiet --no-cache-dir polars pyarrow pyyaml tqdm datasets pytest 2>/dev/null
+            pip install --no-cache-dir polars pyarrow pyyaml tqdm datasets pytest
+            pip install --no-cache-dir git+https://github.com/facebookresearch/optimizers.git
             export PYTHONPATH=/workspace/dlrm:\${PYTHONPATH:-}
             torchrun \
                 --nproc_per_node='$GPUS' \

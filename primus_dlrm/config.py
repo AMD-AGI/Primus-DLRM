@@ -182,6 +182,19 @@ class TrainConfig:
         "listen_plus": 1.0,
     })
 
+    # Dense optimizer: "adamw" or "shampoo"
+    # Shampoo is a 2nd-order optimizer that uses matrix preconditioning
+    # for faster convergence. (https://github.com/facebookresearch/optimizers)
+    dense_optimizer: str = "adamw"
+
+    # Shampoo: how often to recompute preconditioner (eigendecomp).
+    # Higher = less overhead but slower adaptation. Typical: 100-1000.
+    shampoo_precondition_frequency: int = 1000
+
+    # Shampoo: max dimension for preconditioner matrices.
+    # Params with dim > this are blocked into smaller chunks.
+    shampoo_max_preconditioner_dim: int = 4096
+
     # Weight for in-batch BPR contrastive loss (0.0 = disabled)
     contrastive_weight: float = 0.0
 

@@ -71,6 +71,36 @@ def _is_embedding_param(name: str) -> bool:
     return any(tok in name for tok in ("ebc.", "ec.", "embedding"))
 
 
+def _create_dense_optimizer(params: list, tc) -> torch.optim.Optimizer:
+    """Create the dense parameter optimizer based on config.
+
+    Supports:
+      - "adamw": standard AdamW (default)
+      - "shampoo": Distributed Shampoo (2nd-order, requires pip install distributed-shampoo)
+    """
+    if tc.dense_optimizer == "shampoo":
+        from distributed_shampoo import DistributedShampoo
+        from distributed_shampoo.shampoo_types import AdaGradPreconditionerConfig
+
+        logger.info(
+            f"Using Distributed Shampoo (precondition_frequency={tc.shampoo_precondition_frequency}, "
+            f"max_preconditioner_dim={tc.shampoo_max_preconditioner_dim})"
+        )
+        return DistributedShampoo(
+            params,
+            lr=tc.lr,
+            betas=(0.9, 1.0),
+            epsilon=1e-4,
+            weight_decay=tc.weight_decay,
+            max_preconditioner_dim=tc.shampoo_max_preconditioner_dim,
+            precondition_frequency=tc.shampoo_precondition_frequency,
+            start_preconditioning_step=tc.shampoo_precondition_frequency,
+            grafting_config=AdaGradPreconditionerConfig(epsilon=1e-5),
+        )
+
+    return AdamW(params, lr=tc.lr, weight_decay=tc.weight_decay)
+
+
 class DistributedTrainer:
     """Multi-GPU training loop with DistributedSampler + rank-aware logging.
 
@@ -116,20 +146,18 @@ class DistributedTrainer:
                 p for n, p in model.named_parameters()
                 if p.requires_grad and _is_embedding_param(n) is False
             ]
-            self.optimizer = AdamW(
-                dense_params, lr=tc.lr, weight_decay=tc.weight_decay,
-            )
+            self.optimizer = _create_dense_optimizer(dense_params, tc)
             self.fused_optimizer = model.fused_optimizer
             n_dense = sum(p.numel() for p in dense_params)
             n_emb = sum(
                 p.numel() for n, p in model.named_parameters()
                 if p.requires_grad and _is_embedding_param(n)
             )
-            logger.info(f"DMP optimizer split: {n_dense:,} dense params (AdamW), "
+            logger.info(f"DMP optimizer split: {n_dense:,} dense params ({tc.dense_optimizer}), "
                         f"{n_emb:,} embedding params (fused TBE)")
         else:
-            self.optimizer = AdamW(
-                self.model.parameters(), lr=tc.lr, weight_decay=tc.weight_decay,
+            self.optimizer = _create_dense_optimizer(
+                list(self.model.parameters()), tc,
             )
             self.fused_optimizer = None
 
