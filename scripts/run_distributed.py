@@ -194,6 +194,8 @@ def main():
     parser.add_argument("--trace-steps", type=str, default="",
                         help="Comma-separated steps to capture traces (e.g. '500,1000'). "
                              "Each step gets its own trace file.")
+    parser.add_argument("--trace-warmup", type=int, default=5)
+    parser.add_argument("--trace-active", type=int, default=10)
     parser.add_argument("--pipeline", action="store_true",
                         help="Use TorchRec TrainPipelineSparseDist (3-stage, DMP only)")
     args = parser.parse_args()
@@ -306,6 +308,8 @@ def main():
         log_interval=args.log_interval,
         trace=args.trace,
         trace_steps=[int(s) for s in args.trace_steps.split(",") if s.strip()] or None,
+        trace_warmup=args.trace_warmup,
+        trace_active=args.trace_active,
     )
     if args.pipeline and not use_dmp:
         raise ValueError("--pipeline requires --dense-strategy dmp")

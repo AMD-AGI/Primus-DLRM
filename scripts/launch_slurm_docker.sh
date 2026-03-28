@@ -42,6 +42,8 @@ NCCL_IF=""
 SKIP_EVAL=""
 TRACE=""
 TRACE_STEPS=""
+TRACE_WARMUP=5
+TRACE_ACTIVE=10
 PIPELINE=""
 USE_AINIC=""
 NODELIST=""
@@ -65,6 +67,8 @@ while [[ $# -gt 0 ]]; do
         --skip-eval)      SKIP_EVAL="--skip-eval"; shift;;
         --trace)          TRACE="--trace"; shift;;
         --trace-steps)    TRACE_STEPS="$2"; shift 2;;
+        --trace-warmup)   TRACE_WARMUP="$2"; shift 2;;
+        --trace-active)   TRACE_ACTIVE="$2"; shift 2;;
         --pipeline)       PIPELINE="--pipeline"; shift;;
         --ainic)          USE_AINIC=1; shift;;
         --nodelist)       NODELIST="$2"; shift 2;;
@@ -257,6 +261,8 @@ srun --kill-on-bad-exit=1 --export=ALL bash -c '
                 --run-name \"$RUN_NAME\" \
                 --results-dir \"$RESULTS_DIR\" \
                 --trace-steps \"$TRACE_STEPS\" \
+                --trace-warmup $TRACE_WARMUP \
+                --trace-active $TRACE_ACTIVE \
                 $SKIP_EVAL $TRACE $PIPELINE
         "
 '

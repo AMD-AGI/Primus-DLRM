@@ -1,0 +1,80 @@
+data:
+  history_length: 20
+  num_workers: 0
+  synthetic:
+    enabled: true
+    seed: 42
+    num_samples: 100000
+    num_prebatched: 16
+    label_positive_rate: 0.3
+
+    # 4 tables, large vocab sizes for stress testing
+    embedding_tables:
+      - num_embeddings: 5000000
+        embedding_dim: 64
+      - num_embeddings: 200000
+        embedding_dim: 64
+      - num_embeddings: 500000
+        embedding_dim: 64
+      - num_embeddings: 100000
+        embedding_dim: 64
+
+    sparse_features:
+      # 3 sequence groups x 3 features
+      - { table_index: 0, is_sequence: true, sequence_length: 20, num_features: 1 }
+      - { table_index: 1, is_sequence: true, sequence_length: 20, num_features: 1 }
+      - { table_index: 2, is_sequence: true, sequence_length: 20, num_features: 1 }
+      - { table_index: 0, is_sequence: true, sequence_length: 20, num_features: 1 }
+      - { table_index: 1, is_sequence: true, sequence_length: 20, num_features: 1 }
+      - { table_index: 2, is_sequence: true, sequence_length: 20, num_features: 1 }
+      - { table_index: 0, is_sequence: true, sequence_length: 20, num_features: 1 }
+      - { table_index: 1, is_sequence: true, sequence_length: 20, num_features: 1 }
+      - { table_index: 2, is_sequence: true, sequence_length: 20, num_features: 1 }
+      # 4 scalar features
+      - { table_index: 0, is_sequence: false, num_features: 1 }
+      - { table_index: 1, is_sequence: false, num_features: 1 }
+      - { table_index: 2, is_sequence: false, num_features: 1 }
+      - { table_index: 3, is_sequence: false, num_features: 1 }
+
+    dense_features:
+      - { name: "dense_0", dim: 128, value_range_min: -10.0, value_range_max: 10.0 }
+
+    num_tasks: 1
+
+model:
+  model_type: "onetrans"
+  embedding_dim: 64
+  embedding_init: "uniform"
+  onetrans:
+    d_model: 256
+    n_heads: 8
+    n_layers: 4
+    ffn_mult: 4
+    n_ns_tokens: 8
+    use_pyramid: true
+    dropout: 0.1
+    pos_embed: true
+
+train:
+  batch_size: 2048
+  lr: 0.01
+  weight_decay: 0.00001
+  epochs: 1
+  warmup_steps: 200
+  bf16: false
+  allow_tf32: true
+  grad_clip: 1.0
+  log_interval: 10
+  checkpoint_dir: "results"
+  seed: 42
+  loss_weights:
+    task0: 1.0
+  dense_optimizer: "shampoo"
+  shampoo_precondition_frequency: 1000
+  shampoo_max_preconditioner_dim: 4096
+
+distributed:
+  enabled: true
+  dense_strategy: "ddp"
+  num_nodes: 1
+  gpus_per_node: 8
