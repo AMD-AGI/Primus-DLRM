@@ -85,13 +85,19 @@ def build_kjt(
         if batch_key not in tensors:
             continue
         ids = tensors[batch_key]
-        B = ids.shape[0]
-        flat = ids.reshape(-1)
-        keys.append(feat)
-        all_values.append(flat)
-        all_lengths.append(
-            torch.full((B,), flat.shape[0] // B, dtype=torch.int32, device=ids.device),
-        )
+        lengths_key = batch_key + "__lengths"
+        if lengths_key in tensors:
+            keys.append(feat)
+            all_values.append(ids)
+            all_lengths.append(tensors[lengths_key])
+        else:
+            B = ids.shape[0]
+            flat = ids.reshape(-1)
+            keys.append(feat)
+            all_values.append(flat)
+            all_lengths.append(
+                torch.full((B,), flat.shape[0] // B, dtype=torch.int32, device=ids.device),
+            )
     return KeyedJaggedTensor.from_lengths_sync(
         keys=keys,
         values=torch.cat(all_values) if all_values else torch.empty(0, dtype=torch.long),

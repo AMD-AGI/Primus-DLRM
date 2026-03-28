@@ -210,8 +210,18 @@ def generate_batch(
     batch_size: int,
     seed: int = 42,
     label_positive_rate: float = 0.3,
+    sparse_id_min: int = 0,
+    sparse_id_max: int = 0,
+    sparse_len_min: int = 0,
+    sparse_len_max: int = 0,
 ) -> dict[str, torch.Tensor]:
-    """Generate a full random batch directly as tensors (no per-sample overhead)."""
+    """Generate a full random batch directly as tensors (no per-sample overhead).
+
+    Args:
+        sparse_id_max: Upper bound for sparse IDs. 0 = use table num_embeddings.
+        sparse_len_min/max: Variable-length range for sequence features.
+            0/0 = fixed length from schema.sequence_length.
+    """
     rng = torch.Generator().manual_seed(seed)
     table_sizes: dict[str, int] = {}
     for table in schema.embedding_tables:
@@ -222,17 +232,24 @@ def generate_batch(
     batch: dict[str, torch.Tensor] = {}
     B = batch_size
     L = schema.sequence_length
+    use_var_len = sparse_len_min > 0 or sparse_len_max > 0
 
     for feat in schema.scalar_features:
-        vocab = table_sizes[feat]
+        id_max = sparse_id_max if sparse_id_max > 0 else table_sizes[feat]
         key = feat_to_key.get(feat, feat)
-        batch[key] = torch.randint(0, vocab, (B,), generator=rng)
+        batch[key] = torch.randint(sparse_id_min, id_max, (B,), generator=rng)
 
     for group_feats in schema.sequence_groups.values():
         for feat in group_feats:
-            vocab = table_sizes[feat]
+            id_max = sparse_id_max if sparse_id_max > 0 else table_sizes[feat]
             key = feat_to_key.get(feat, feat)
-            batch[key] = torch.randint(0, vocab, (B, L), generator=rng)
+            if use_var_len:
+                lens = torch.randint(sparse_len_min, sparse_len_max + 1, (B,), generator=rng, dtype=torch.int32)
+                vals = torch.randint(sparse_id_min, id_max, (lens.sum().item(),), generator=rng, dtype=torch.int32)
+                batch[key] = vals
+                batch[key + "__lengths"] = lens
+            else:
+                batch[key] = torch.randint(sparse_id_min, id_max, (B, L), generator=rng)
 
     for df in schema.dense_features:
         lo, hi = df.value_range_min, df.value_range_max
@@ -266,23 +283,36 @@ class SyntheticDataPipe:
         num_prebatched: int = 16,
         seed: int = 42,
         label_positive_rate: float = 0.3,
+        sparse_id_min: int = 0,
+        sparse_id_max: int = 0,
+        sparse_len_min: int = 0,
+        sparse_len_max: int = 0,
     ):
         self._schema = schema
         self._batch_size = batch_size
         self._seed = seed
         self._label_positive_rate = label_positive_rate
+        self._sparse_kwargs = dict(
+            sparse_id_min=sparse_id_min, sparse_id_max=sparse_id_max,
+            sparse_len_min=sparse_len_min, sparse_len_max=sparse_len_max,
+        )
         self._idx = 0
+        self.sampler = None
 
         if num_prebatched > 0:
             logger.info(f"Pre-generating {num_prebatched} synthetic batches (B={batch_size})...")
             self._batches = [
                 generate_batch(schema, batch_size, seed=seed + i,
-                               label_positive_rate=label_positive_rate)
+                               label_positive_rate=label_positive_rate,
+                               **self._sparse_kwargs)
                 for i in range(num_prebatched)
             ]
         else:
             logger.info(f"Synthetic data: generating fresh batches on the fly (B={batch_size})")
             self._batches = None
+
+    def __len__(self):
+        return 10_000_000
 
     def __iter__(self):
         return self
@@ -295,4 +325,5 @@ class SyntheticDataPipe:
             self._schema, self._batch_size,
             seed=self._seed + self._idx,
             label_positive_rate=self._label_positive_rate,
+            **self._sparse_kwargs,
         )

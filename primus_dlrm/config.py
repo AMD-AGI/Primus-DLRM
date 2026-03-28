@@ -168,6 +168,16 @@ class SyntheticDataConfig:
     num_prebatched: int = 16
     label_positive_rate: float = 0.3
 
+    # Sparse ID value range: IDs are randint(sparse_id_min, sparse_id_max).
+    # 0 for sparse_id_max means use each table's num_embeddings.
+    sparse_id_min: int = 0
+    sparse_id_max: int = 0
+
+    # Sparse sequence length range: each feature gets randint(len_min, len_max+1) IDs.
+    # 0 for both means use fixed length from schema.sequence_length.
+    sparse_len_min: int = 0
+    sparse_len_max: int = 0
+
     embedding_tables: list[SyntheticTableSpec] = field(default_factory=list)
     sparse_features: list[SyntheticSparseSpec] = field(default_factory=list)
     dense_features: list[DenseFeatureSpec] = field(default_factory=list)

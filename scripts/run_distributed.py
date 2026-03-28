@@ -27,7 +27,12 @@ from primus_dlrm.data.dataset import (
     collate_to_dict,
 )
 from primus_dlrm.data.pipeline_batch import collate_pipeline_batch
-from primus_dlrm.data.synthetic import SyntheticDataset, collate_synthetic
+from primus_dlrm.data.synthetic import (
+    SyntheticDataPipe,
+    SyntheticDataset,
+    collate_synthetic,
+    generate_batch,
+)
 from primus_dlrm.distributed.setup import (
     barrier,
     cleanup,
@@ -116,11 +121,47 @@ def _setup_synthetic(config, world_size, rank, pipeline):
             f"({table_summary})"
         )
 
-    dataset = SyntheticDataset(schema, syn)
     per_gpu_batch = config.train.batch_size // world_size
-    # Disable shuffle for infinite synthetic data — random data doesn't
-    # benefit from shuffling and DistributedSampler shuffling 10M indices
-    # adds unnecessary overhead per epoch.
+
+    if syn.num_prebatched > 0:
+        # Pre-generate batches and cycle.
+        # Eliminates per-step randint overhead — much faster throughput.
+        if is_main_process():
+            logger.info(f"Using SyntheticDataPipe: {syn.num_prebatched} pre-generated batches")
+        pipe = SyntheticDataPipe(
+            schema, per_gpu_batch,
+            num_prebatched=syn.num_prebatched,
+            seed=syn.seed + rank,
+            label_positive_rate=syn.label_positive_rate,
+            sparse_id_min=syn.sparse_id_min,
+            sparse_id_max=syn.sparse_id_max,
+            sparse_len_min=syn.sparse_len_min,
+            sparse_len_max=syn.sparse_len_max,
+        )
+        if pipeline:
+            from primus_dlrm.data.pipeline_batch import build_kjt, PipelineBatch
+
+            class _PipelinedDataPipe:
+                """Wraps SyntheticDataPipe to produce PipelineBatch with KJT."""
+                def __init__(self, pipe, schema):
+                    self.pipe = pipe
+                    self.schema = schema
+                    self.sampler = None
+                def __iter__(self):
+                    for batch_dict in self.pipe:
+                        kjt = build_kjt(batch_dict, self.schema)
+                        clean = {k: v for k, v in batch_dict.items()
+                                 if not k.endswith("__lengths")}
+                        yield PipelineBatch(tensors=clean, unpooled_kjt=kjt)
+                def __len__(self):
+                    return 10_000_000
+
+            loader = _PipelinedDataPipe(pipe, schema)
+        else:
+            loader = pipe
+        return schema, None, loader
+
+    dataset = SyntheticDataset(schema, syn)
     shuffle = config.train.shuffle and not dataset._infinite
     sampler = DistributedSampler(
         dataset, num_replicas=world_size, rank=rank,
@@ -144,7 +185,7 @@ def _setup_synthetic(config, world_size, rank, pipeline):
     if dataset._infinite:
         loader = _InfiniteDataLoader(loader)
 
-    return schema, dataset, loader
+    return schema, None, loader
 
 
 def _setup_real_data(config, processed_dir, world_size, rank, pipeline):
