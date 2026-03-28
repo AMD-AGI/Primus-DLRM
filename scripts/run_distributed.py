@@ -13,6 +13,7 @@ import argparse
 import logging
 import os
 import sys
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -23,14 +24,10 @@ from primus_dlrm.config import Config
 from primus_dlrm.data.dataset import (
     YambdaEvalDataset,
     YambdaTrainDataset,
-    collate_scoring_pairs,
+    collate_to_dict,
 )
 from primus_dlrm.data.pipeline_batch import collate_pipeline_batch
-from primus_dlrm.data.synthetic import (
-    SyntheticDataset,
-    collate_synthetic,
-    collate_synthetic_pipeline,
-)
+from primus_dlrm.data.synthetic import SyntheticDataset, collate_synthetic
 from primus_dlrm.distributed.setup import (
     barrier,
     cleanup,
@@ -64,20 +61,9 @@ def build_model(config, schema: FeatureSchema, device=None, meta_device=False):
             config=config.model, schema=schema,
             device=device, meta_device=meta_device,
         )
-    # DLRMBaseline: extract vocab sizes from schema tables (positional)
-    tables = schema.embedding_tables
-    num_counter_windows = sum(1 for df in schema.dense_features if not df.project)
     return DLRMBaseline(
-        config=config.model,
-        num_users=tables[3].num_embeddings if len(tables) > 3 else 0,
-        num_items=tables[0].num_embeddings if len(tables) > 0 else 0,
-        num_artists=tables[1].num_embeddings if len(tables) > 1 else 0,
-        num_albums=tables[2].num_embeddings if len(tables) > 2 else 0,
-        audio_input_dim=next((df.dim for df in schema.dense_features if df.project), 256),
-        device=device,
-        tasks=list(schema.task_names),
-        num_counter_windows=num_counter_windows,
-        meta_device=meta_device,
+        config=config.model, schema=schema,
+        device=device, meta_device=meta_device,
     )
 
 _rank = os.environ.get("RANK", "?")
@@ -90,34 +76,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class _InfiniteDataLoader:
+    """Wraps a DataLoader to restart automatically when exhausted."""
+
+    def __init__(self, loader):
+        self.loader = loader
+        self.sampler = loader.sampler
+
+    def __len__(self):
+        return len(self.loader)
+
+    def __iter__(self):
+        while True:
+            yield from self.loader
+
+
 def _setup_synthetic(config, world_size, rank, pipeline):
     """Build schema, dataset, and dataloader for synthetic data.
 
-    Uses ``build_schema_from_config`` so that batch keys match the real
-    Yambda schema (``uid``, ``item_id``, ``hist_lp_item_ids``, etc.).
-    This lets the model use the legacy constructor — producing the exact
-    same computation graph as real-data training.
-
-    The synthetic embedding table sizes are mapped positionally:
-      tables[0] → items, tables[1] → artists,
-      tables[2] → albums, tables[3] → users.
+    Vocab sizes come from ``synthetic.embedding_tables`` in positional order,
+    matching the schema tables defined in the YAML.
     """
-    from functools import partial
-
     syn = config.data.synthetic
-    tables = syn.embedding_tables
-    num_items = tables[0].num_embeddings if len(tables) > 0 else 100000
-    num_artists = tables[1].num_embeddings if len(tables) > 1 else 50000
-    num_albums = tables[2].num_embeddings if len(tables) > 2 else 100000
-    num_users = tables[3].num_embeddings if len(tables) > 3 else 10000
-
-    counter_windows = config.data.counter_windows_days if config.data.enable_counters else None
-    active_tasks = [k for k, v in config.train.loss_weights.items() if v > 0]
-
-    schema = build_schema_from_config(config, {
-        "item": num_items, "artist": num_artists,
-        "album": num_albums, "uid": num_users,
-    })
+    vocab_sizes = [t.num_embeddings for t in syn.embedding_tables]
+    schema = build_schema_from_config(config, vocab_sizes)
 
     if is_main_process():
         n_tables = len(schema.embedding_tables)
@@ -125,59 +107,27 @@ def _setup_synthetic(config, world_size, rank, pipeline):
             len(f) for f in schema.sequence_groups.values()
         )
         n_dense = len(schema.dense_features)
+        table_summary = ", ".join(
+            f"{t.name}={t.num_embeddings}" for t in schema.embedding_tables
+        )
         logger.info(
             f"Synthetic data: {n_tables} tables, {n_feats} sparse features, "
             f"{n_dense} dense features, {syn.num_samples} samples "
-            f"(items={num_items}, artists={num_artists}, "
-            f"albums={num_albums}, users={num_users})"
+            f"({table_summary})"
         )
 
     dataset = SyntheticDataset(schema, syn)
     per_gpu_batch = config.train.batch_size // world_size
+    # Disable shuffle for infinite synthetic data — random data doesn't
+    # benefit from shuffling and DistributedSampler shuffling 10M indices
+    # adds unnecessary overhead per epoch.
+    shuffle = config.train.shuffle and not dataset._infinite
     sampler = DistributedSampler(
         dataset, num_replicas=world_size, rank=rank,
-        shuffle=config.train.shuffle,
+        shuffle=shuffle,
     )
-    # Since we use build_schema_from_config, batch keys match real data
-    # (uid, item_id, hist_lp_item_ids, etc.).  For pipeline mode, reuse
-    # the real DlrmBatch collate so KJT construction and key ordering are
-    # identical to real-data training.
     if pipeline:
-        from primus_dlrm.data.pipeline_batch import collate_pipeline_batch as _collate_dlrm
-        from primus_dlrm.data.dataset import ScoringPair
-
-        def _synth_to_pipeline(batch_dicts):
-            pairs = []
-            for d in batch_dicts:
-                kwargs = {}
-                if "user_counters" in d:
-                    kwargs["user_counters"] = d["user_counters"]
-                    kwargs["item_counters"] = d["item_counters"]
-                    kwargs["cross_counters"] = d["cross_counters"]
-                pairs.append(ScoringPair(
-                    hist_lp_item_ids=d["hist_lp_item_ids"],
-                    hist_lp_artist_ids=d["hist_lp_artist_ids"],
-                    hist_lp_album_ids=d["hist_lp_album_ids"],
-                    hist_like_item_ids=d["hist_like_item_ids"],
-                    hist_like_artist_ids=d["hist_like_artist_ids"],
-                    hist_like_album_ids=d["hist_like_album_ids"],
-                    hist_skip_item_ids=d["hist_skip_item_ids"],
-                    hist_skip_artist_ids=d["hist_skip_artist_ids"],
-                    hist_skip_album_ids=d["hist_skip_album_ids"],
-                    uid=d["uid"].item() if d["uid"].dim() == 0 else int(d["uid"]),
-                    item_id=d["item_id"].item() if d["item_id"].dim() == 0 else int(d["item_id"]),
-                    artist_id=d["artist_id"].item() if d["artist_id"].dim() == 0 else int(d["artist_id"]),
-                    album_id=d["album_id"].item() if d["album_id"].dim() == 0 else int(d["album_id"]),
-                    audio_embed=d["audio_embed"],
-                    listen_plus=d.get("listen_plus", d.get("task0", torch.tensor(0.0))).item(),
-                    like=d.get("like", torch.tensor(0.0)).item(),
-                    dislike=d.get("dislike", torch.tensor(0.0)).item(),
-                    listen_pct=d.get("listen_pct", torch.tensor(0.0)).item(),
-                    **kwargs,
-                ))
-            return _collate_dlrm(pairs)
-
-        collate_fn = _synth_to_pipeline
+        collate_fn = partial(collate_pipeline_batch, schema=schema)
     else:
         collate_fn = collate_synthetic
 
@@ -190,20 +140,29 @@ def _setup_synthetic(config, world_size, rank, pipeline):
         pin_memory=True,
         drop_last=True,
     )
+
+    if dataset._infinite:
+        loader = _InfiniteDataLoader(loader)
+
     return schema, dataset, loader
 
 
 def _setup_real_data(config, processed_dir, world_size, rank, pipeline):
-    """Build dataset and dataloader for real Yambda data (legacy path)."""
+    """Build schema, dataset, and dataloader for real Yambda data."""
     if is_main_process():
         logger.info("Loading training dataset...")
     dataset = YambdaTrainDataset(config.data, processed_dir)
+    schema = build_schema_from_config(config, dataset.vocab_sizes)
+
     per_gpu_batch = config.train.batch_size // world_size
     sampler = DistributedSampler(
         dataset, num_replicas=world_size, rank=rank,
         shuffle=config.train.shuffle,
     )
-    collate_fn = collate_pipeline_batch if pipeline else collate_scoring_pairs
+    if pipeline:
+        collate_fn = partial(collate_pipeline_batch, schema=schema)
+    else:
+        collate_fn = collate_to_dict
     loader = DataLoader(
         dataset,
         batch_size=per_gpu_batch,
@@ -213,7 +172,7 @@ def _setup_real_data(config, processed_dir, world_size, rank, pipeline):
         pin_memory=True,
         drop_last=True,
     )
-    return None, dataset, loader
+    return schema, dataset, loader
 
 
 def main():
@@ -260,7 +219,10 @@ def main():
 
     use_synthetic = config.data.synthetic.enabled
     use_dmp = args.dense_strategy == "dmp"
-    build_device = torch.device("cpu") if use_dmp else device
+    # Multi-GPU DMP needs meta device so the planner can materialize shards.
+    # Single-GPU DMP builds directly on GPU (no sharding needed).
+    use_meta = use_dmp and world_size > 1
+    build_device = torch.device("cpu") if use_meta else device
 
     if use_synthetic:
         schema, train_dataset, train_loader = _setup_synthetic(
@@ -276,22 +238,11 @@ def main():
         logger.info("Building model...")
     active_tasks = [k for k, v in config.train.loss_weights.items() if v > 0]
 
-    if use_synthetic:
-        model_schema = schema
-    else:
-        num_users = int(train_dataset.store.unique_uids.max()) + 1
-        model_schema = build_schema_from_config(config, {
-            "item": train_dataset.num_items,
-            "artist": train_dataset.num_artists,
-            "album": train_dataset.num_albums,
-            "uid": num_users,
-        })
-
     model = build_model(
         config=config,
-        schema=model_schema,
+        schema=schema,
         device=build_device,
-        meta_device=use_dmp,
+        meta_device=use_meta,
     )
 
     if use_dmp:
@@ -314,6 +265,8 @@ def main():
         embedding_sharding=args.embedding_sharding,
         embedding_lr=config.train.embedding_lr,
         embedding_weight_decay=config.train.weight_decay,
+        embedding_optimizer=config.train.embedding_optimizer,
+        embedding_eps=config.train.embedding_eps,
     )
     logger.info(f"Model wrapped with {args.dense_strategy} on rank {rank}")
 
@@ -324,14 +277,16 @@ def main():
         pop = eval_dataset.item_popularity
         candidate_items = np.argsort(-pop)[:5000]
 
+        eval_task = active_tasks[0] if active_tasks else "task0"
+
         def _eval(m, dev):
             rg = evaluate_ranking(
                 m, eval_dataset, dev, candidate_item_ids=candidate_items,
-                ks=[10, 50, 100], task="listen_plus",
+                ks=[10, 50, 100], task=eval_task,
             )
             rp = evaluate_ranking_peruser(
                 m, eval_dataset, dev, ks=[10, 50, 100],
-                task="listen_plus", top_n=100,
+                task=eval_task, top_n=100,
             )
             return {"global": rg, "peruser": rp}
 

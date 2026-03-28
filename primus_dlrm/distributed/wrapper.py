@@ -29,6 +29,8 @@ def wrap_model(
     embedding_sharding: str = "auto",
     embedding_lr: float = 1e-2,
     embedding_weight_decay: float = 1e-5,
+    embedding_optimizer: str = "adam",
+    embedding_eps: float = 1e-8,
 ) -> nn.Module:
     """Wrap a model for distributed training.
 
@@ -50,7 +52,7 @@ def wrap_model(
     """
     world_size = get_world_size()
 
-    if world_size <= 1:
+    if world_size <= 1 and dense_strategy != "dmp":
         logger.info("Single-GPU mode, skipping distributed wrapping.")
         return model.to(device)
 
@@ -66,7 +68,8 @@ def wrap_model(
 
     elif dense_strategy == "dmp":
         model = _wrap_dmp(model, device, embedding_sharding,
-                          embedding_lr, embedding_weight_decay)
+                          embedding_lr, embedding_weight_decay,
+                          embedding_optimizer, embedding_eps)
 
     else:
         raise ValueError(f"Unknown dense_strategy: {dense_strategy!r}")
@@ -89,13 +92,14 @@ def _wrap_dmp(
     embedding_sharding: str,
     embedding_lr: float = 1e-2,
     embedding_weight_decay: float = 1e-5,
+    embedding_optimizer: str = "adam",
+    embedding_eps: float = 1e-8,
 ) -> nn.Module:
     """Wrap model with TorchRec DistributedModelParallel.
 
     DMP shards EBC/EC submodules across GPUs via FBGEMM TBE kernels.
     Dense submodules are automatically wrapped with DDP by DMP.
-    Embedding optimizer defaults to fused Adam (consistent with AdamW on
-    single-GPU) with configurable LR and weight decay.
+    Embedding optimizer is configurable: "adam" or "row_wise_adagrad".
     """
     from torch.distributed.optim import _apply_optimizer_in_backward
     from torchrec.distributed import DistributedModelParallel
@@ -121,20 +125,38 @@ def _wrap_dmp(
         model = model.to(device)
         return DDP(model, device_ids=[get_local_rank()], find_unused_parameters=True)
 
-    # Apply fused Adam optimizer to embedding parameters so TBE uses Adam
-    # instead of the default SGD. This runs before DMP materializes weights.
-    adam_kwargs = {"lr": embedding_lr, "eps": 1e-8,
-                   "weight_decay": embedding_weight_decay}
+    if embedding_optimizer == "row_wise_adagrad":
+        import torchrec.optim
+        from fbgemm_gpu.split_table_batched_embeddings_ops import WeightDecayMode
+        optim_cls = torchrec.optim.RowWiseAdagrad
+        optim_kwargs = {
+            "lr": embedding_lr, "eps": embedding_eps,
+            "weight_decay": embedding_weight_decay,
+            "weight_decay_mode": WeightDecayMode.L2,
+        }
+    else:
+        optim_cls = torch.optim.Adam
+        optim_kwargs = {
+            "lr": embedding_lr, "eps": embedding_eps,
+            "weight_decay": embedding_weight_decay,
+        }
+
     n_emb_params = 0
     for m in model.modules():
         if isinstance(m, (EmbeddingBagCollection, EmbeddingCollection)):
             for p in m.parameters():
-                _apply_optimizer_in_backward(torch.optim.Adam, [p], adam_kwargs)
+                _apply_optimizer_in_backward(optim_cls, [p], optim_kwargs)
                 n_emb_params += 1
-    logger.info(f"Applied fused Adam to {n_emb_params} embedding params "
-                f"(lr={embedding_lr}, wd={embedding_weight_decay})")
+    logger.info(f"Applied fused {embedding_optimizer} to {n_emb_params} embedding params "
+                f"(lr={embedding_lr}, eps={embedding_eps}, wd={embedding_weight_decay})")
 
     constraints = _build_constraints(model, embedding_sharding)
+
+    if world_size <= 1:
+        logger.info("Single-GPU DMP: placing all tables on GPU 0")
+        dmp = DistributedModelParallel(module=model, device=device)
+        logger.info(f"Wrapped with TorchRec DMP for 1 GPU.")
+        return dmp
 
     topology = Topology(world_size=world_size, compute_device="cuda")
     planner = EmbeddingShardingPlanner(
@@ -142,7 +164,6 @@ def _wrap_dmp(
         constraints=constraints if constraints else None,
     )
     plan = planner.collective_plan(model, sharders, dist.GroupMember.WORLD)
-
     _log_sharding_plan(plan)
 
     # Multi-node workaround: TorchRec's DMP uses global device IDs in shard

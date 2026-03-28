@@ -271,9 +271,7 @@ def _build_onetrans(model_config=None, device="cpu", tasks=None, num_counter_win
     )
     if tasks:
         full_config.train.loss_weights = {t: 1.0 for t in tasks}
-    schema = build_schema_from_config(full_config, {
-        "item": 100, "artist": 50, "album": 30, "uid": 200,
-    })
+    schema = build_schema_from_config(full_config, [100, 50, 30, 200])
     return OneTransModel(model_config, schema=schema, device=torch.device(device))
 
 

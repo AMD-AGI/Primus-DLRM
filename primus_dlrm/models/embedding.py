@@ -124,9 +124,7 @@ class TorchRecEmbeddings(nn.Module):
         if scalar_feature_names is not None:
             self._scalar_features: set[str] = scalar_feature_names & self._unpooled_set
         else:
-            self._scalar_features: set[str] = {
-                f for f in self._unpooled_features if not f.startswith("hist_")
-            }
+            self._scalar_features: set[str] = set()
 
         self.ebc: EmbeddingBagCollection | None = None
         self.ec: EmbeddingCollection | None = None

@@ -52,25 +52,12 @@ def main():
     processed_dir = Path(args.processed_dir)
 
     train_dataset = YambdaTrainDataset(config.data, processed_dir)
-    num_users = int(train_dataset.store.unique_uids.max()) + 1
-    active_tasks = [k for k, v in config.train.loss_weights.items() if v > 0]
-    schema = build_schema_from_config(config, {
-        "item": train_dataset.num_items, "artist": train_dataset.num_artists,
-        "album": train_dataset.num_albums, "uid": num_users,
-    })
+    schema = build_schema_from_config(config, train_dataset.vocab_sizes)
 
     if config.model.model_type == "onetrans":
         model = OneTransModel(config=config.model, schema=schema, device=device)
     else:
-        model = DLRMBaseline(
-            config=config.model, num_users=num_users,
-            num_items=train_dataset.num_items,
-            num_artists=train_dataset.num_artists,
-            num_albums=train_dataset.num_albums,
-            audio_input_dim=train_dataset.audio_dim,
-            device=device, tasks=active_tasks,
-            num_counter_windows=num_counter_windows,
-        )
+        model = DLRMBaseline(config=config.model, schema=schema, device=device)
 
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
@@ -94,7 +81,7 @@ def main():
         rg = evaluate_ranking(
             model, eval_dataset, device,
             candidate_item_ids=candidate_items,
-            ks=[10, 50, 100], task="listen_plus",
+            ks=[10, 50, 100], task=active_tasks[0],
             log_interval=args.log_interval,
         )
     logger.info(f"Global eval done in {time.time() - t0:.1f}s")
@@ -104,7 +91,7 @@ def main():
     with torch.no_grad():
         rp = evaluate_ranking_peruser(
             model, eval_dataset, device,
-            ks=[10, 50, 100], task="listen_plus", top_n=100,
+            ks=[10, 50, 100], task=active_tasks[0], top_n=100,
             log_interval=args.log_interval,
         )
     logger.info(f"Per-user eval done in {time.time() - t0:.1f}s")

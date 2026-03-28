@@ -178,14 +178,30 @@ def _create_dense_optimizer(params: list, tc) -> torch.optim.Optimizer:
     """
     if tc.dense_optimizer == "shampoo":
         from distributed_shampoo import DistributedShampoo
-        from distributed_shampoo.shampoo_types import AdaGradPreconditionerConfig
+        from distributed_shampoo.shampoo_types import (
+            AdaGradPreconditionerConfig,
+            RootInvShampooPreconditionerConfig,
+        )
+        from distributed_shampoo.preconditioner.matrix_functions_types import EigenConfig
+
+        preconditioner_config = (
+            RootInvShampooPreconditionerConfig(
+                amortized_computation_config=EigenConfig(),
+                factor_matrix_dtype=torch.bfloat16,
+                inverse_exponent_override={1: 0.5, 2: 0.5},
+                num_tolerated_failed_amortized_computations=0,
+            )
+            if tc.shampoo_use_bf16_factor_matrix
+            else RootInvShampooPreconditionerConfig()
+        )
 
         logger.info(
             f"Using Distributed Shampoo (precondition_frequency={tc.shampoo_precondition_frequency}, "
-            f"max_preconditioner_dim={tc.shampoo_max_preconditioner_dim})"
+            f"max_preconditioner_dim={tc.shampoo_max_preconditioner_dim}, "
+            f"bf16_factor_matrix={tc.shampoo_use_bf16_factor_matrix}, "
+            f"momentum={tc.shampoo_momentum})"
         )
-        return DistributedShampoo(
-            params,
+        shampoo_kwargs: dict = dict(
             lr=tc.lr,
             betas=(0.9, 1.0),
             epsilon=1e-4,
@@ -193,8 +209,22 @@ def _create_dense_optimizer(params: list, tc) -> torch.optim.Optimizer:
             max_preconditioner_dim=tc.shampoo_max_preconditioner_dim,
             precondition_frequency=tc.shampoo_precondition_frequency,
             start_preconditioning_step=tc.shampoo_precondition_frequency,
-            grafting_config=AdaGradPreconditionerConfig(epsilon=1e-5),
+            grafting_config=AdaGradPreconditionerConfig(epsilon=1.4285714285714e-05),
+            preconditioner_config=preconditioner_config,
         )
+        # These kwargs were added in later Shampoo versions; only pass if non-default
+        import inspect
+        sig = inspect.signature(DistributedShampoo.__init__)
+        for key, val in [
+            ("momentum", tc.shampoo_momentum),
+            ("use_nesterov", tc.shampoo_use_nesterov),
+            ("use_bias_correction", True),
+            ("use_decoupled_weight_decay", tc.shampoo_use_decoupled_weight_decay),
+        ]:
+            if key in sig.parameters:
+                shampoo_kwargs[key] = val
+
+        return DistributedShampoo(params, **shampoo_kwargs)
 
     elif tc.dense_optimizer == "adamw":
         return AdamW(params, lr=tc.lr, weight_decay=tc.weight_decay)
@@ -267,8 +297,20 @@ class DistributedTrainer:
             )
             self.fused_optimizer = None
 
+        # Sparse warmup (wraps the fused TBE optimizer if configured)
+        if self.fused_optimizer is not None and tc.sparse_warmup_steps > 0:
+            from torchrec.optim.warmup import WarmupOptimizer, WarmupStage
+            self.fused_optimizer = WarmupOptimizer(
+                self.fused_optimizer,
+                [WarmupStage(max_iters=tc.sparse_warmup_steps, value=tc.sparse_warmup_value)],
+                lr=tc.embedding_lr,
+                param_name="__sparse_fused.__warmup",
+            )
+            logger.info(f"Sparse warmup: {tc.sparse_warmup_steps} steps, "
+                        f"value={tc.sparse_warmup_value}")
+
         total_steps = tc.epochs * len(train_loader)
-        warmup = LinearLR(self.optimizer, start_factor=0.01, total_iters=tc.warmup_steps)
+        warmup = LinearLR(self.optimizer, start_factor=tc.warmup_start_factor, total_iters=tc.warmup_steps)
         cosine = CosineAnnealingLR(self.optimizer, T_max=max(total_steps - tc.warmup_steps, 1))
         self.scheduler = SequentialLR(
             self.optimizer, [warmup, cosine], milestones=[tc.warmup_steps],
@@ -364,7 +406,6 @@ class DistributedTrainer:
         from torchrec.distributed.train_pipeline.tracing import (
             Tracer as _TorchRecTracer,
         )
-        from primus_dlrm.data.pipeline_batch import DlrmBatch
         from primus_dlrm.training.pipeline_wrapper import PipelineModelWrapper
 
         # -- Monkey-patch TorchRec's FX tracer leaf-module detection ----------

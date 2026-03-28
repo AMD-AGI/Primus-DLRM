@@ -6,6 +6,7 @@ data:
   enable_counters: true
   counter_windows_days: [7, 30]
   data_dir: "data"
+  schema_file: schemas/yambda.yaml
 
 model:
   model_type: "onetrans"

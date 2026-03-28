@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from primus_dlrm.config import Config
-from primus_dlrm.data.dataset import YambdaTrainDataset, YambdaEvalDataset, collate_scoring_pairs
+from primus_dlrm.data.dataset import YambdaTrainDataset, YambdaEvalDataset, collate_to_dict
 from primus_dlrm.evaluation.metrics import evaluate_ranking
 from primus_dlrm.schema import build_schema_from_config
 from primus_dlrm.training.runtime import configure_runtime
@@ -30,16 +30,7 @@ def build_model(config, schema, device):
         return OneTransModel(config=config.model, schema=schema, device=device)
     else:
         from primus_dlrm.models.dlrm import DLRMBaseline
-        tables = schema.embedding_tables
-        return DLRMBaseline(
-            config=config.model,
-            num_users=tables[3].num_embeddings if len(tables) > 3 else 0,
-            num_items=tables[0].num_embeddings if len(tables) > 0 else 0,
-            num_artists=tables[1].num_embeddings if len(tables) > 1 else 0,
-            num_albums=tables[2].num_embeddings if len(tables) > 2 else 0,
-            audio_input_dim=next((df.dim for df in schema.dense_features if df.project), 256),
-            device=device,
-        )
+        return DLRMBaseline(config=config.model, schema=schema, device=device)
 
 
 def main():
@@ -64,7 +55,7 @@ def main():
         batch_size=config.train.batch_size,
         shuffle=True,
         num_workers=config.data.num_workers,
-        collate_fn=collate_scoring_pairs,
+        collate_fn=collate_to_dict,
         pin_memory=True,
         drop_last=True,
     )
@@ -73,11 +64,7 @@ def main():
     eval_dataset = YambdaEvalDataset(config.data, processed_dir)
 
     logger.info(f"Building model (type={config.model.model_type})...")
-    num_users = int(train_dataset.store.unique_uids.max()) + 1
-    schema = build_schema_from_config(config, {
-        "item": train_dataset.num_items, "artist": train_dataset.num_artists,
-        "album": train_dataset.num_albums, "uid": num_users,
-    })
+    schema = build_schema_from_config(config, train_dataset.vocab_sizes)
     model = build_model(config, schema=schema, device=device)
     num_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model parameters: {num_params:,}")

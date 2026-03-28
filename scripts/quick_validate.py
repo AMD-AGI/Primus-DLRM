@@ -11,7 +11,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from primus_dlrm.config import Config
-from primus_dlrm.data.dataset import YambdaTrainDataset, YambdaEvalDataset, collate_scoring_pairs
+from primus_dlrm.data.dataset import YambdaTrainDataset, YambdaEvalDataset, collate_to_dict
 from primus_dlrm.evaluation.metrics import evaluate_ranking
 from primus_dlrm.models.dlrm import DLRMBaseline
 from primus_dlrm.training.losses import MultiTaskLoss
@@ -42,7 +42,7 @@ def main():
 
     train_loader = DataLoader(
         train_dataset, batch_size=config.train.batch_size, shuffle=True,
-        num_workers=config.data.num_workers, collate_fn=collate_scoring_pairs,
+        num_workers=config.data.num_workers, collate_fn=collate_to_dict,
         pin_memory=True, drop_last=True,
     )
 

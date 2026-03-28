@@ -10,7 +10,7 @@ TrainPipelineSparseDist needs two separate callables:
      redistributed embeddings are ready.  This is the ``custom_model_fwd`` arg
      and is what this module provides.
 
-Why two?  FX tracing must see a clean DlrmBatch → EC path (controlled by
+Why two?  FX tracing must see a clean batch → EC path (controlled by
 ``_pipeline_mode``), but at runtime we also need AMP autocast, loss
 computation, and optional contrastive loss — none of which should be traced.
 This wrapper keeps runtime-only logic out of the FX graph.
@@ -27,7 +27,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from primus_dlrm.data.pipeline_batch import DlrmBatch
+from torchrec.streamable import Pipelineable
 from primus_dlrm.training.losses import MultiTaskLoss, InBatchBPRLoss
 
 
@@ -64,10 +64,8 @@ class PipelineModelWrapper(nn.Module):
         self.use_amp = use_amp
 
     def forward(
-        self, batch: DlrmBatch,
+        self, batch: Pipelineable,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        # DlrmBatch is a Pipelineable dataclass; convert to a plain dict
-        # so the model's forward() can do batch["item_id"] etc.
         batch_dict = batch.to_dict()
 
         with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):

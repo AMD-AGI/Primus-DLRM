@@ -6,6 +6,13 @@ data:
   enable_counters: true
   counter_windows_days: [30]
   data_dir: "data"
+  schema_file: schemas/yambda.yaml
+  schema:
+    dense_features:
+      - { name: audio_embed, dim: 128, project: true, activation: gelu }
+      - { name: user_counters, dim: 3, project: false }
+      - { name: item_counters, dim: 3, project: false }
+      - { name: cross_counters, dim: 9, project: true, activation: relu }
 
 model:
   embedding_dim: 16

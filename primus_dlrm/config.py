@@ -53,8 +53,10 @@ class DataConfig:
     # Synthetic data generation (replaces real data when enabled)
     synthetic: SyntheticDataConfig = field(default_factory=lambda: SyntheticDataConfig())
 
-    # Feature schema definition.  Drives model construction, data generation,
-    # and the pipeline KJT layout.  When empty, uses the default Yambda schema.
+    # Feature schema: either inline (``schema:`` block) or loaded from a
+    # separate file (``schema_file: configs/schemas/yambda.yaml``).
+    # When ``schema_file`` is set, it takes precedence over inline ``schema``.
+    schema_file: str = ""
     schema: SchemaConfig = field(default_factory=lambda: SchemaConfig())
 
 
@@ -107,6 +109,7 @@ class SchemaConfig:
     """
     embedding_tables: list[SchemaTableConfig] = field(default_factory=list)
     sequence_groups: dict[str, list[str]] = field(default_factory=dict)
+    pooling: str = "mean"
     scalar_features: list[str] = field(default_factory=list)
     batch_to_feature: dict[str, str] = field(default_factory=dict)
     dense_features: list[DenseFeatureSpec] = field(default_factory=list)
@@ -255,14 +258,29 @@ class TrainConfig:
     # Separate learning rate for embedding parameters (via FBGEMM fused optimizer)
     embedding_lr: float = 1e-2
 
+    # Embedding optimizer: "adam" or "row_wise_adagrad"
+    embedding_optimizer: str = "adam"
+
+    # Embedding optimizer epsilon
+    embedding_eps: float = 1e-8
+
     # AdamW weight decay coefficient
     weight_decay: float = 1e-5
 
     # Number of training epochs
     epochs: int = 10
 
-    # Linear warmup steps before cosine decay schedule
+    # Dense warmup steps before cosine decay schedule
     warmup_steps: int = 1000
+
+    # Dense warmup: initial LR multiplier (LR starts at lr * warmup_start_factor)
+    warmup_start_factor: float = 0.01
+
+    # Sparse (embedding) warmup: number of steps and initial LR multiplier.
+    # During warmup, sparse LR = embedding_lr * sparse_warmup_value.
+    # Set sparse_warmup_steps=0 to disable.
+    sparse_warmup_steps: int = 0
+    sparse_warmup_value: float = 0.1
 
     # Enable BF16 mixed precision (torch.amp.autocast).
     # Forward/backward matmuls run in BF16; weights, optimizer state,
@@ -312,6 +330,20 @@ class TrainConfig:
     # Shampoo: max dimension for preconditioner matrices.
     # Params with dim > this are blocked into smaller chunks.
     shampoo_max_preconditioner_dim: int = 4096
+
+    # Shampoo: use BF16 for factor matrices in the preconditioner.
+    # WARNING: Setting this to true with TF32 matmuls on MI350X triggers
+    # a non-deterministic NaN in the eigenvalue decomposition.
+    shampoo_use_bf16_factor_matrix: bool = False
+
+    # Shampoo: momentum (0.0 = disabled). Reproducer uses 0.5.
+    shampoo_momentum: float = 0.0
+
+    # Shampoo: use Nesterov momentum
+    shampoo_use_nesterov: bool = False
+
+    # Shampoo: use decoupled weight decay (like AdamW)
+    shampoo_use_decoupled_weight_decay: bool = False
 
     # Weight for in-batch BPR contrastive loss (0.0 = disabled)
     contrastive_weight: float = 0.0
@@ -373,10 +405,31 @@ class Config:
             yaml.dump(asdict(self), f, default_flow_style=False, sort_keys=False)
 
     @classmethod
-    def load(cls, path: str | Path) -> Config:
+    def load(cls, path: str | Path) -> "Config":
+        path = Path(path)
         with open(path) as f:
             raw = yaml.safe_load(f)
-        return _from_dict(cls, raw)
+        config = _from_dict(cls, raw)
+
+        # Load schema from external file if specified, merging with
+        # any inline overrides (e.g. dense_features that depend on counter config)
+        if config.data.schema_file:
+            schema_path = Path(config.data.schema_file)
+            if not schema_path.is_absolute():
+                schema_path = path.parent / schema_path
+            with open(schema_path) as f:
+                schema_raw = yaml.safe_load(f)
+            file_schema = _from_dict(SchemaConfig, schema_raw)
+            inline = config.data.schema
+            defaults = SchemaConfig()
+            for f in fields(SchemaConfig):
+                inline_val = getattr(inline, f.name)
+                file_val = getattr(file_schema, f.name)
+                default_val = getattr(defaults, f.name)
+                if inline_val == default_val and file_val != default_val:
+                    setattr(inline, f.name, file_val)
+
+        return config
 
 
 _DC_REGISTRY: dict[str, type] = {}

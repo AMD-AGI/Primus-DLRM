@@ -39,17 +39,29 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class SyntheticDataset(Dataset):
-    """Generates random samples matching a FeatureSchema."""
+    """Generates random samples matching a FeatureSchema.
+
+    When ``num_samples > 0``, behaves as a finite map-style Dataset (works
+    with DistributedSampler + DataLoader).
+
+    When ``num_samples <= 0`` (e.g. -1), behaves as an infinite dataset.
+    Use with ``max_steps`` to control training duration.
+    """
 
     def __init__(self, schema: FeatureSchema, config: SyntheticDataConfig):
         self.schema = schema
         self.config = config
+        self._infinite = config.num_samples <= 0
         self._table_sizes: dict[str, int] = {}
         for table in schema.embedding_tables:
             for feat in table.feature_names:
                 self._table_sizes[feat] = table.num_embeddings
 
     def __len__(self) -> int:
+        if self._infinite:
+            # Large but not huge — must be manageable for DistributedSampler
+            # which shuffles all indices.  10M gives ~2400 steps at B=4096/GPU.
+            return 10_000_000
         return self.config.num_samples
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
@@ -237,10 +249,14 @@ def generate_batch(
 # ---------------------------------------------------------------------------
 
 class SyntheticDataPipe:
-    """Infinite iterator cycling through pre-generated batches.
+    """Infinite iterator that produces synthetic batches.
 
-    Mimics the MI350X NaN reproducer's DataPipe: generates N batches up front,
-    then cycles through them with ``deepcopy`` to avoid mutation.
+    Two modes controlled by ``num_prebatched``:
+
+    - **num_prebatched > 0** (reproducer-style): pre-generates N batches and
+      cycles through them with ``deepcopy``.  Faster per step but repeats data.
+    - **num_prebatched == 0**: generates a fresh random batch on every call.
+      Slower but every batch is unique.
     """
 
     def __init__(
@@ -251,18 +267,32 @@ class SyntheticDataPipe:
         seed: int = 42,
         label_positive_rate: float = 0.3,
     ):
-        logger.info(f"Pre-generating {num_prebatched} synthetic batches (B={batch_size})...")
-        self._batches = [
-            generate_batch(schema, batch_size, seed=seed + i,
-                           label_positive_rate=label_positive_rate)
-            for i in range(num_prebatched)
-        ]
+        self._schema = schema
+        self._batch_size = batch_size
+        self._seed = seed
+        self._label_positive_rate = label_positive_rate
         self._idx = 0
+
+        if num_prebatched > 0:
+            logger.info(f"Pre-generating {num_prebatched} synthetic batches (B={batch_size})...")
+            self._batches = [
+                generate_batch(schema, batch_size, seed=seed + i,
+                               label_positive_rate=label_positive_rate)
+                for i in range(num_prebatched)
+            ]
+        else:
+            logger.info(f"Synthetic data: generating fresh batches on the fly (B={batch_size})")
+            self._batches = None
 
     def __iter__(self):
         return self
 
     def __next__(self) -> dict[str, torch.Tensor]:
-        batch = self._batches[self._idx % len(self._batches)]
         self._idx += 1
-        return copy.deepcopy(batch)
+        if self._batches is not None:
+            return copy.deepcopy(self._batches[(self._idx - 1) % len(self._batches)])
+        return generate_batch(
+            self._schema, self._batch_size,
+            seed=self._seed + self._idx,
+            label_positive_rate=self._label_positive_rate,
+        )
