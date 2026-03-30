@@ -243,9 +243,6 @@ class ModelConfig:
     # Dropout rate for MLP layers
     dropout: float = 0.1
 
-    # Input dimension of audio embeddings from the dataset
-    audio_embed_dim: int = 256
-
     # Embedding weight initialization:
     #   "uniform" — TorchRec default (uniform within bounds)
     #   "normal"  — nn.Embedding default (normal distribution, std=1)

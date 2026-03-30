@@ -11,7 +11,6 @@ data:
 model:
   model_type: "onetrans"
   embedding_dim: 64
-  audio_embed_dim: 128
   embedding_init: "uniform"
   onetrans:
     d_model: 256

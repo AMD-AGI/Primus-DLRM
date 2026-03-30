@@ -20,7 +20,6 @@ model:
   bottom_mlp_dims: [128]
   top_mlp_dims: [256, 128]
   dropout: 0.1
-  audio_embed_dim: 128
 
 train:
   batch_size: 256
