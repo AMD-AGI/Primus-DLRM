@@ -21,6 +21,15 @@ model:
     use_pyramid: true
     dropout: 0.1
     pos_embed: true
+  embedding_tables:
+    - name: item
+      features: [item, hist_lp_item, hist_like_item, hist_skip_item]
+    - name: artist
+      features: [artist, hist_lp_artist, hist_like_artist, hist_skip_artist]
+    - name: album
+      features: [album, hist_lp_album, hist_like_album, hist_skip_album]
+    - name: uid
+      features: [uid]
 
 train:
   batch_size: 32768

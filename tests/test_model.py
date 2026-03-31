@@ -9,6 +9,14 @@ from primus_dlrm.schema import build_schema_from_config
 from primus_dlrm.training.losses import MultiTaskLoss
 
 
+_YAMBDA_EMBEDDING_TABLES = [
+    SchemaTableConfig("item", ["item", "hist_lp_item", "hist_like_item", "hist_skip_item"]),
+    SchemaTableConfig("artist", ["artist", "hist_lp_artist", "hist_like_artist", "hist_skip_artist"]),
+    SchemaTableConfig("album", ["album", "hist_lp_album", "hist_like_album", "hist_skip_album"]),
+    SchemaTableConfig("uid", ["uid"]),
+]
+
+
 def _yambda_schema_config(audio_dim=32, enable_counters=False, counter_windows=None):
     """Build a SchemaConfig matching the Yambda layout for tests."""
     dense = [DenseFeatureSpec("audio_embed", audio_dim, project=True, activation="gelu")]
@@ -18,12 +26,6 @@ def _yambda_schema_config(audio_dim=32, enable_counters=False, counter_windows=N
         dense.append(DenseFeatureSpec("item_counters", 3 * W, project=False))
         dense.append(DenseFeatureSpec("cross_counters", 9 * W, project=True, activation="relu"))
     return SchemaConfig(
-        embedding_tables=[
-            SchemaTableConfig("item", ["item", "hist_lp_item", "hist_like_item", "hist_skip_item"]),
-            SchemaTableConfig("artist", ["artist", "hist_lp_artist", "hist_like_artist", "hist_skip_artist"]),
-            SchemaTableConfig("album", ["album", "hist_lp_album", "hist_like_album", "hist_skip_album"]),
-            SchemaTableConfig("uid", ["uid"]),
-        ],
         sequence_groups={
             "hist_lp": ["hist_lp_item", "hist_lp_artist", "hist_lp_album"],
             "hist_like": ["hist_like_item", "hist_like_artist", "hist_like_album"],
@@ -260,6 +262,7 @@ def _onetrans_config(**overrides):
 
 def _build_onetrans(model_config=None, device="cpu", tasks=None, num_counter_windows=0):
     model_config = model_config or _onetrans_config()
+    model_config.embedding_tables = list(_YAMBDA_EMBEDDING_TABLES)
     counter_days = list(range(1, num_counter_windows + 1)) if num_counter_windows > 0 else []
     full_config = Config()
     full_config.model = model_config

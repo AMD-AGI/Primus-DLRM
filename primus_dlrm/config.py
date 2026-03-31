@@ -72,44 +72,11 @@ class SchemaTableConfig:
 
 @dataclass
 class SchemaConfig:
-    """Full feature schema definition, read from YAML.
+    """Feature schema: data-mapping fields loaded from schema_file or inline.
 
-    When ``embedding_tables`` is non-empty, the schema is built from these
-    definitions.  The schema must be present — ``build_schema_from_config``
-    reads tables, features, groups, and dense specs from this section.
-
-    Example YAML::
-
-        schema:
-          embedding_tables:
-            - name: item
-              features: [item, hist_lp_item, hist_like_item, hist_skip_item]
-            - name: artist
-              features: [artist, hist_lp_artist, hist_like_artist, hist_skip_artist]
-            - name: album
-              features: [album, hist_lp_album, hist_like_album, hist_skip_album]
-            - name: uid
-              features: [uid]
-          sequence_groups:
-            hist_lp: [hist_lp_item, hist_lp_artist, hist_lp_album]
-            hist_like: [hist_like_item, hist_like_artist, hist_like_album]
-            hist_skip: [hist_skip_item, hist_skip_artist, hist_skip_album]
-          scalar_features: [uid, item, artist, album]
-          batch_to_feature:
-            item_id: item
-            artist_id: artist
-            album_id: album
-            hist_lp_item_ids: hist_lp_item
-            ...
-          dense_features:
-            - {name: audio_embed, dim: 128, project: true, activation: gelu}
-            - {name: user_counters, dim: 6, project: false}
-            ...
-          kjt_feature_order: [item, artist, album, hist_lp_item, ...]
+    Does NOT contain embedding_tables (those belong in ``ModelConfig``).
     """
-    embedding_tables: list[SchemaTableConfig] = field(default_factory=list)
     sequence_groups: dict[str, list[str]] = field(default_factory=dict)
-    pooling: str = "mean"
     scalar_features: list[str] = field(default_factory=list)
     batch_to_feature: dict[str, str] = field(default_factory=dict)
     dense_features: list[DenseFeatureSpec] = field(default_factory=list)
@@ -247,6 +214,12 @@ class ModelConfig:
     #   "uniform" — TorchRec default (uniform within bounds)
     #   "normal"  — nn.Embedding default (normal distribution, std=1)
     embedding_init: str = "uniform"
+
+    # Embedding tables: table names, features, and optional per-table sizes.
+    embedding_tables: list[SchemaTableConfig] = field(default_factory=list)
+
+    # Pooling mode for sequence features in DLRM ("mean", "sum")
+    pooling: str = "mean"
 
     # OneTrans-specific hyperparameters (only used when model_type="onetrans")
     onetrans: OneTransConfig = field(default_factory=OneTransConfig)
@@ -425,7 +398,9 @@ class Config:
             if not schema_path.is_absolute():
                 schema_path = path.parent / schema_path
             with open(schema_path) as f:
-                schema_raw = yaml.safe_load(f)
+                schema_raw = yaml.safe_load(f) or {}
+
+            # Merge SchemaConfig fields into data.schema
             file_schema = _from_dict(SchemaConfig, schema_raw)
             inline = config.data.schema
             defaults = SchemaConfig()
@@ -435,6 +410,15 @@ class Config:
                 default_val = getattr(defaults, f.name)
                 if inline_val == default_val and file_val != default_val:
                     setattr(inline, f.name, file_val)
+
+            # Merge embedding_tables into model (if not already set inline)
+            if not config.model.embedding_tables and "embedding_tables" in schema_raw:
+                et = schema_raw["embedding_tables"]
+                if isinstance(et, list):
+                    config.model.embedding_tables = [
+                        _from_dict(SchemaTableConfig, t) if isinstance(t, dict) else t
+                        for t in et
+                    ]
 
         return config
 

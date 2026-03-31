@@ -83,27 +83,17 @@ def build_schema_from_config(
     config: Config,
     vocab_sizes: list[int],
 ) -> FeatureSchema:
-    """Build a FeatureSchema from ``config.data.schema`` + runtime vocab sizes.
+    """Build a FeatureSchema from config + runtime vocab sizes.
 
-    All feature names, table definitions, sequence groups, dense features,
-    and batch-to-feature mappings are read from the YAML config.  Only the
-    vocabulary sizes (discovered at runtime from the dataset) are passed
-    separately as a **positional list** matching the table order in the YAML::
+    Embedding tables come from ``config.model.embedding_tables``.
+    Feature mapping (groups, scalars, dense, batch keys) comes from
+    ``config.data.schema``.  Vocab sizes are passed positionally::
 
         schema = build_schema_from_config(config, [
-            dataset.num_items,    # matches 1st table in YAML
+            dataset.num_items,    # matches 1st table in model.embedding_tables
             dataset.num_artists,  # matches 2nd table
-            dataset.num_albums,   # matches 3rd table
-            num_users,            # matches 4th table
+            ...
         ])
-
-    Args:
-        config: Top-level ``Config``.  The ``data.schema`` section defines
-            tables, features, groups, and dense specs.  ``model`` provides
-            ``embedding_dim`` and ``embedding_init``.  ``train.loss_weights``
-            determines task names.
-        vocab_sizes: Vocabulary sizes in the same order as
-            ``config.data.schema.embedding_tables``.
     """
     dc = config.data
     mc = config.model
@@ -111,10 +101,10 @@ def build_schema_from_config(
     sc = dc.schema
     D = mc.embedding_dim
 
-    if not sc.embedding_tables:
+    if not mc.embedding_tables:
         raise ValueError(
-            "config.data.schema.embedding_tables is empty. "
-            "Define embedding tables in the YAML config under data.schema."
+            "config.model.embedding_tables is empty. "
+            "Define embedding tables under model.embedding_tables or in schema_file."
         )
 
     tables = [
@@ -125,7 +115,7 @@ def build_schema_from_config(
             pooling="none",
             feature_names=list(t.features),
         )
-        for i, t in enumerate(sc.embedding_tables)
+        for i, t in enumerate(mc.embedding_tables)
     ]
 
     active_tasks = [k for k, v in tc.loss_weights.items() if v > 0]
@@ -140,7 +130,7 @@ def build_schema_from_config(
         batch_to_feature=dict(sc.batch_to_feature),
         kjt_feature_order=list(sc.kjt_feature_order),
         sequence_length=dc.history_length,
-        pooling=sc.pooling,
+        pooling=mc.pooling,
         num_tasks=len(active_tasks),
         task_names=active_tasks,
         embedding_dim=D,

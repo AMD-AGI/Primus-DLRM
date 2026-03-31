@@ -8,16 +8,6 @@
 #   data:
 #     schema_file: configs/schemas/yambda.yaml
 
-embedding_tables:
-  - name: item
-    features: [item, hist_lp_item, hist_like_item, hist_skip_item]
-  - name: artist
-    features: [artist, hist_lp_artist, hist_like_artist, hist_skip_artist]
-  - name: album
-    features: [album, hist_lp_album, hist_like_album, hist_skip_album]
-  - name: uid
-    features: [uid]
-
 sequence_groups:
   hist_lp: [hist_lp_item, hist_lp_artist, hist_lp_album]
   hist_like: [hist_like_item, hist_like_artist, hist_like_album]
