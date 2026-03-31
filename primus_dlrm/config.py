@@ -63,10 +63,12 @@ class DataConfig:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class SchemaTableConfig:
-    """One embedding table with its features."""
+class EmbeddingTableConfig:
+    """One embedding table: name, features, and optional size/dim."""
     name: str = ""
     features: list[str] = field(default_factory=list)
+    num_embeddings: int = 0
+    embedding_dim: int = 0
 
 @dataclass
 class FeatureConfig:
@@ -108,13 +110,6 @@ class DenseFeatureSpec:
 
 
 @dataclass
-class SyntheticTableSpec:
-    """One embedding table in a synthetic config."""
-    num_embeddings: int = 10000
-    embedding_dim: int = 64
-
-
-@dataclass
 class SyntheticSparseSpec:
     """A group of sparse features sharing one table."""
     table_index: int = 0
@@ -148,7 +143,6 @@ class SyntheticDataConfig:
     sparse_len_min: int = 0
     sparse_len_max: int = 0
 
-    embedding_tables: list[SyntheticTableSpec] = field(default_factory=list)
     sparse_features: list[SyntheticSparseSpec] = field(default_factory=list)
     dense_features: list[DenseFeatureSpec] = field(default_factory=list)
     num_tasks: int = 1
@@ -219,7 +213,7 @@ class ModelConfig:
     embedding_init: str = "uniform"
 
     # Embedding tables: table names, features, and optional per-table sizes.
-    embedding_tables: list[SchemaTableConfig] = field(default_factory=list)
+    embedding_tables: list[EmbeddingTableConfig] = field(default_factory=list)
 
     # Pooling mode for sequence features in DLRM ("mean", "sum")
     pooling: str = "mean"
@@ -416,8 +410,8 @@ def _from_dict(dc_cls: type, raw: dict[str, Any]) -> Any:
         for cls in (
             DataConfig, ModelConfig, TrainConfig, OneTransConfig,
             DistributedConfig, EmbeddingShardingConfig,
-            FeatureConfig, SchemaConfig, SchemaTableConfig,
-            SyntheticDataConfig, SyntheticTableSpec, SyntheticSparseSpec,
+            FeatureConfig, SchemaConfig, EmbeddingTableConfig,
+            SyntheticDataConfig, SyntheticSparseSpec,
             DenseFeatureSpec,
         ):
             _DC_REGISTRY[cls.__name__] = cls

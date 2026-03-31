@@ -111,8 +111,9 @@ def build_schema_from_config(
     tables = [
         TableSpec(
             name=t.name,
-            num_embeddings=vocab_sizes[i] if i < len(vocab_sizes) else 0,
-            embedding_dim=D,
+            num_embeddings=(t.num_embeddings if t.num_embeddings > 0
+                            else vocab_sizes[i] if i < len(vocab_sizes) else 0),
+            embedding_dim=t.embedding_dim if t.embedding_dim > 0 else D,
             pooling="none",
             feature_names=list(t.features),
         )
@@ -146,22 +147,22 @@ def build_schema_from_synthetic(
 ) -> FeatureSchema:
     """Auto-generate a FeatureSchema from a SyntheticDataConfig.
 
-    Table and feature names are anonymous: ``t0``, ``t1``, ``f_t0_seq0``,
+    Table sizes and dims come from ``model_config.embedding_tables``.
+    Feature names are anonymous: ``t0``, ``t1``, ``f_t0_seq0``,
     ``f_t0_s0``, ``dense_0``, ``task0``, etc.
     """
     emb_dim = model_config.embedding_dim
+    mc_tables = model_config.embedding_tables
 
     tables: list[TableSpec] = []
     sequence_groups: dict[str, list[str]] = {}
     scalar_features: list[str] = []
 
-    # Track which features belong to each table
-    table_feature_names: list[list[str]] = [[] for _ in syn.embedding_tables]
+    table_feature_names: list[list[str]] = [[] for _ in mc_tables]
 
     group_counter = 0
     for spec in syn.sparse_features:
         ti = spec.table_index
-        t_spec = syn.embedding_tables[ti]
         t_name = f"t{ti}"
 
         if spec.is_sequence:
@@ -177,11 +178,11 @@ def build_schema_from_synthetic(
                 table_feature_names[ti].append(feat_name)
                 scalar_features.append(feat_name)
 
-    for ti, t_spec in enumerate(syn.embedding_tables):
+    for ti, t in enumerate(mc_tables):
         tables.append(TableSpec(
-            name=f"t{ti}",
-            num_embeddings=t_spec.num_embeddings,
-            embedding_dim=emb_dim,
+            name=t.name or f"t{ti}",
+            num_embeddings=t.num_embeddings,
+            embedding_dim=t.embedding_dim if t.embedding_dim > 0 else emb_dim,
             pooling="none",
             feature_names=table_feature_names[ti],
         ))

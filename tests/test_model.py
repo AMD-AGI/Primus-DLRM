@@ -2,7 +2,7 @@
 import torch
 import pytest
 
-from primus_dlrm.config import Config, DenseFeatureSpec, FeatureConfig, ModelConfig, OneTransConfig, SchemaConfig, SchemaTableConfig
+from primus_dlrm.config import Config, DenseFeatureSpec, FeatureConfig, ModelConfig, OneTransConfig, SchemaConfig, EmbeddingTableConfig
 from primus_dlrm.models.dlrm import DLRMBaseline
 from primus_dlrm.models.onetrans import OneTransModel, pyramid_schedule
 from primus_dlrm.schema import build_schema_from_config
@@ -10,10 +10,10 @@ from primus_dlrm.training.losses import MultiTaskLoss
 
 
 _YAMBDA_EMBEDDING_TABLES = [
-    SchemaTableConfig("item", ["item", "hist_lp_item", "hist_like_item", "hist_skip_item"]),
-    SchemaTableConfig("artist", ["artist", "hist_lp_artist", "hist_like_artist", "hist_skip_artist"]),
-    SchemaTableConfig("album", ["album", "hist_lp_album", "hist_like_album", "hist_skip_album"]),
-    SchemaTableConfig("uid", ["uid"]),
+    EmbeddingTableConfig("item", ["item", "hist_lp_item", "hist_like_item", "hist_skip_item"]),
+    EmbeddingTableConfig("artist", ["artist", "hist_lp_artist", "hist_like_artist", "hist_skip_artist"]),
+    EmbeddingTableConfig("album", ["album", "hist_lp_album", "hist_like_album", "hist_skip_album"]),
+    EmbeddingTableConfig("uid", ["uid"]),
 ]
 
 

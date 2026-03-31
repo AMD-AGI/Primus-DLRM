@@ -99,11 +99,10 @@ class _InfiniteDataLoader:
 def _setup_synthetic(config, world_size, rank, pipeline):
     """Build schema, dataset, and dataloader for synthetic data.
 
-    Vocab sizes come from ``synthetic.embedding_tables`` in positional order,
-    matching the schema tables defined in the YAML.
+    Vocab sizes come from ``model.embedding_tables`` in positional order.
     """
     syn = config.data.synthetic
-    vocab_sizes = [t.num_embeddings for t in syn.embedding_tables]
+    vocab_sizes = [t.num_embeddings for t in config.model.embedding_tables]
     schema = build_schema_from_config(config, vocab_sizes)
 
     if is_main_process():
