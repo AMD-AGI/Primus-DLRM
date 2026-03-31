@@ -2,7 +2,7 @@
 import torch
 import pytest
 
-from primus_dlrm.config import Config, DenseFeatureSpec, ModelConfig, OneTransConfig, SchemaConfig, SchemaTableConfig
+from primus_dlrm.config import Config, DenseFeatureSpec, FeatureConfig, ModelConfig, OneTransConfig, SchemaConfig, SchemaTableConfig
 from primus_dlrm.models.dlrm import DLRMBaseline
 from primus_dlrm.models.onetrans import OneTransModel, pyramid_schedule
 from primus_dlrm.schema import build_schema_from_config
@@ -17,37 +17,41 @@ _YAMBDA_EMBEDDING_TABLES = [
 ]
 
 
-def _yambda_schema_config(audio_dim=32, enable_counters=False, counter_windows=None):
-    """Build a SchemaConfig matching the Yambda layout for tests."""
+_YAMBDA_SCHEMA = SchemaConfig(
+    batch_to_feature={
+        "item_id": "item", "artist_id": "artist", "album_id": "album",
+        "hist_lp_item_ids": "hist_lp_item", "hist_lp_artist_ids": "hist_lp_artist",
+        "hist_lp_album_ids": "hist_lp_album", "hist_like_item_ids": "hist_like_item",
+        "hist_like_artist_ids": "hist_like_artist", "hist_like_album_ids": "hist_like_album",
+        "hist_skip_item_ids": "hist_skip_item", "hist_skip_artist_ids": "hist_skip_artist",
+        "hist_skip_album_ids": "hist_skip_album",
+    },
+    kjt_feature_order=[
+        "item", "artist", "album",
+        "hist_lp_item", "hist_like_item", "hist_skip_item",
+        "hist_lp_artist", "hist_like_artist", "hist_skip_artist",
+        "hist_lp_album", "hist_like_album", "hist_skip_album",
+        "uid",
+    ],
+)
+
+
+def _yambda_feature_config(audio_dim=32, enable_counters=False, counter_windows=None):
+    """Build a FeatureConfig matching the Yambda layout for tests."""
     dense = [DenseFeatureSpec("audio_embed", audio_dim, project=True, activation="gelu")]
     if enable_counters and counter_windows:
         W = len(counter_windows)
         dense.append(DenseFeatureSpec("user_counters", 3 * W, project=False))
         dense.append(DenseFeatureSpec("item_counters", 3 * W, project=False))
         dense.append(DenseFeatureSpec("cross_counters", 9 * W, project=True, activation="relu"))
-    return SchemaConfig(
+    return FeatureConfig(
         sequence_groups={
             "hist_lp": ["hist_lp_item", "hist_lp_artist", "hist_lp_album"],
             "hist_like": ["hist_like_item", "hist_like_artist", "hist_like_album"],
             "hist_skip": ["hist_skip_item", "hist_skip_artist", "hist_skip_album"],
         },
         scalar_features=["uid", "item", "artist", "album"],
-        batch_to_feature={
-            "item_id": "item", "artist_id": "artist", "album_id": "album",
-            "hist_lp_item_ids": "hist_lp_item", "hist_lp_artist_ids": "hist_lp_artist",
-            "hist_lp_album_ids": "hist_lp_album", "hist_like_item_ids": "hist_like_item",
-            "hist_like_artist_ids": "hist_like_artist", "hist_like_album_ids": "hist_like_album",
-            "hist_skip_item_ids": "hist_skip_item", "hist_skip_artist_ids": "hist_skip_artist",
-            "hist_skip_album_ids": "hist_skip_album",
-        },
         dense_features=dense,
-        kjt_feature_order=[
-            "item", "artist", "album",
-            "hist_lp_item", "hist_like_item", "hist_skip_item",
-            "hist_lp_artist", "hist_like_artist", "hist_skip_artist",
-            "hist_lp_album", "hist_like_album", "hist_skip_album",
-            "uid",
-        ],
     )
 
 
@@ -266,11 +270,12 @@ def _build_onetrans(model_config=None, device="cpu", tasks=None, num_counter_win
     counter_days = list(range(1, num_counter_windows + 1)) if num_counter_windows > 0 else []
     full_config = Config()
     full_config.model = model_config
-    full_config.data.schema = _yambda_schema_config(
+    full_config.feature = _yambda_feature_config(
         audio_dim=32,
         enable_counters=num_counter_windows > 0,
         counter_windows=counter_days if num_counter_windows > 0 else None,
     )
+    full_config.data.schema = _YAMBDA_SCHEMA
     if tasks:
         full_config.train.loss_weights = {t: 1.0 for t in tasks}
     schema = build_schema_from_config(full_config, [100, 50, 30, 200])

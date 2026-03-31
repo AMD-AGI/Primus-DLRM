@@ -6,14 +6,7 @@
 #
 # Used by all configs that train on Yambda data.  Include via:
 #   data:
-#     schema_file: configs/schemas/yambda.yaml
-
-sequence_groups:
-  hist_lp: [hist_lp_item, hist_lp_artist, hist_lp_album]
-  hist_like: [hist_like_item, hist_like_artist, hist_like_album]
-  hist_skip: [hist_skip_item, hist_skip_artist, hist_skip_album]
-
-scalar_features: [uid, item, artist, album]
+#     schema: schemas/yambda.yaml
 
 batch_to_feature:
   item_id: item
@@ -28,12 +21,6 @@ batch_to_feature:
   hist_skip_item_ids: hist_skip_item
   hist_skip_artist_ids: hist_skip_artist
   hist_skip_album_ids: hist_skip_album
-
-dense_features:
-  - { name: audio_embed, dim: 128, project: true, activation: gelu }
-  - { name: user_counters, dim: 6, project: false }
-  - { name: item_counters, dim: 6, project: false }
-  - { name: cross_counters, dim: 18, project: true, activation: relu }
 
 kjt_feature_order:
   [item, artist, album,

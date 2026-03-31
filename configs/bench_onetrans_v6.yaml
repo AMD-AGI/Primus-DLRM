@@ -6,7 +6,7 @@ data:
   enable_counters: true
   counter_windows_days: [7, 30]
   data_dir: "data"
-  schema_file: schemas/yambda.yaml
+  schema: schemas/yambda.yaml
 
 model:
   model_type: "onetrans"
@@ -30,6 +30,19 @@ model:
       features: [album, hist_lp_album, hist_like_album, hist_skip_album]
     - name: uid
       features: [uid]
+
+feature:
+  sequence_groups:
+    hist_lp: [hist_lp_item, hist_lp_artist, hist_lp_album]
+    hist_like: [hist_like_item, hist_like_artist, hist_like_album]
+    hist_skip: [hist_skip_item, hist_skip_artist, hist_skip_album]
+  scalar_features: [uid, item, artist, album]
+  dense_features:
+    - { name: audio_embed, dim: 128, project: true, activation: gelu }
+    - { name: user_counters, dim: 6, project: false }
+    - { name: item_counters, dim: 6, project: false }
+    - { name: cross_counters, dim: 18, project: true, activation: relu }
+
 
 train:
   batch_size: 32768

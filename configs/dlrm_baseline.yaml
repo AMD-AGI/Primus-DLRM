@@ -8,7 +8,7 @@ data:
   num_workers: 4
   enable_counters: false
   data_dir: "data"
-  schema_file: schemas/yambda.yaml
+  schema: schemas/yambda.yaml
   schema:
     dense_features:
       - { name: audio_embed, dim: 128, project: true, activation: gelu }

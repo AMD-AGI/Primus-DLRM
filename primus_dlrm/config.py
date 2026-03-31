@@ -53,11 +53,9 @@ class DataConfig:
     # Synthetic data generation (replaces real data when enabled)
     synthetic: SyntheticDataConfig = field(default_factory=lambda: SyntheticDataConfig())
 
-    # Feature schema: either inline (``schema:`` block) or loaded from a
-    # separate file (``schema_file: configs/schemas/yambda.yaml``).
-    # When ``schema_file`` is set, it takes precedence over inline ``schema``.
-    schema_file: str = ""
-    schema: SchemaConfig = field(default_factory=lambda: SchemaConfig())
+    # Schema: a file path (str) or inline SchemaConfig.
+    # When a string, the file is loaded and parsed during Config.load().
+    schema: SchemaConfig | str = field(default_factory=lambda: SchemaConfig())
 
 
 # ---------------------------------------------------------------------------
@@ -71,15 +69,20 @@ class SchemaTableConfig:
     features: list[str] = field(default_factory=list)
 
 @dataclass
-class SchemaConfig:
-    """Feature schema: data-mapping fields loaded from schema_file or inline.
-
-    Does NOT contain embedding_tables (those belong in ``ModelConfig``).
-    """
+class FeatureConfig:
+    """Feature definitions: what features exist and how they are grouped."""
     sequence_groups: dict[str, list[str]] = field(default_factory=dict)
     scalar_features: list[str] = field(default_factory=list)
-    batch_to_feature: dict[str, str] = field(default_factory=dict)
     dense_features: list[DenseFeatureSpec] = field(default_factory=list)
+
+
+@dataclass
+class SchemaConfig:
+    """Data-pipeline mapping loaded from a schema file or inline.
+
+    Maps batch dict keys to EC feature names and defines KJT ordering.
+    """
+    batch_to_feature: dict[str, str] = field(default_factory=dict)
     kjt_feature_order: list[str] = field(default_factory=list)
 
 
@@ -371,8 +374,9 @@ class DistributedConfig:
 
 @dataclass
 class Config:
-    """Top-level configuration combining data, model, training, and distributed settings."""
+    """Top-level configuration."""
 
+    feature: FeatureConfig = field(default_factory=FeatureConfig)
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
@@ -391,34 +395,12 @@ class Config:
             raw = yaml.safe_load(f)
         config = _from_dict(cls, raw)
 
-        # Load schema from external file if specified, merging with
-        # any inline overrides (e.g. dense_features that depend on counter config)
-        if config.data.schema_file:
-            schema_path = Path(config.data.schema_file)
+        if isinstance(config.data.schema, str) and config.data.schema:
+            schema_path = Path(config.data.schema)
             if not schema_path.is_absolute():
                 schema_path = path.parent / schema_path
             with open(schema_path) as f:
-                schema_raw = yaml.safe_load(f) or {}
-
-            # Merge SchemaConfig fields into data.schema
-            file_schema = _from_dict(SchemaConfig, schema_raw)
-            inline = config.data.schema
-            defaults = SchemaConfig()
-            for f in fields(SchemaConfig):
-                inline_val = getattr(inline, f.name)
-                file_val = getattr(file_schema, f.name)
-                default_val = getattr(defaults, f.name)
-                if inline_val == default_val and file_val != default_val:
-                    setattr(inline, f.name, file_val)
-
-            # Merge embedding_tables into model (if not already set inline)
-            if not config.model.embedding_tables and "embedding_tables" in schema_raw:
-                et = schema_raw["embedding_tables"]
-                if isinstance(et, list):
-                    config.model.embedding_tables = [
-                        _from_dict(SchemaTableConfig, t) if isinstance(t, dict) else t
-                        for t in et
-                    ]
+                config.data.schema = _from_dict(SchemaConfig, yaml.safe_load(f) or {})
 
         return config
 
@@ -434,7 +416,7 @@ def _from_dict(dc_cls: type, raw: dict[str, Any]) -> Any:
         for cls in (
             DataConfig, ModelConfig, TrainConfig, OneTransConfig,
             DistributedConfig, EmbeddingShardingConfig,
-            SchemaConfig, SchemaTableConfig,
+            FeatureConfig, SchemaConfig, SchemaTableConfig,
             SyntheticDataConfig, SyntheticTableSpec, SyntheticSparseSpec,
             DenseFeatureSpec,
         ):

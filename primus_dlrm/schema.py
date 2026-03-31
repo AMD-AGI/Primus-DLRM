@@ -95,6 +95,7 @@ def build_schema_from_config(
             ...
         ])
     """
+    fc = config.feature
     dc = config.data
     mc = config.model
     tc = config.train
@@ -104,7 +105,7 @@ def build_schema_from_config(
     if not mc.embedding_tables:
         raise ValueError(
             "config.model.embedding_tables is empty. "
-            "Define embedding tables under model.embedding_tables or in schema_file."
+            "Define embedding tables under model.embedding_tables."
         )
 
     tables = [
@@ -124,9 +125,9 @@ def build_schema_from_config(
 
     return FeatureSchema(
         embedding_tables=tables,
-        sequence_groups=dict(sc.sequence_groups),
-        scalar_features=list(sc.scalar_features),
-        dense_features=list(sc.dense_features),
+        sequence_groups=dict(fc.sequence_groups),
+        scalar_features=list(fc.scalar_features),
+        dense_features=list(fc.dense_features),
         batch_to_feature=dict(sc.batch_to_feature),
         kjt_feature_order=list(sc.kjt_feature_order),
         sequence_length=dc.history_length,
