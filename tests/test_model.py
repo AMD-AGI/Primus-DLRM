@@ -5,15 +5,14 @@ import pytest
 from primus_dlrm.config import Config, DenseFeatureSpec, FeatureConfig, ModelConfig, OneTransConfig, SchemaConfig, EmbeddingTableConfig
 from primus_dlrm.models.dlrm import DLRMBaseline
 from primus_dlrm.models.onetrans import OneTransModel, pyramid_schedule
-from primus_dlrm.schema import build_schema_from_config
 from primus_dlrm.training.losses import MultiTaskLoss
 
 
 _YAMBDA_EMBEDDING_TABLES = [
-    EmbeddingTableConfig("item", ["item", "hist_lp_item", "hist_like_item", "hist_skip_item"]),
-    EmbeddingTableConfig("artist", ["artist", "hist_lp_artist", "hist_like_artist", "hist_skip_artist"]),
-    EmbeddingTableConfig("album", ["album", "hist_lp_album", "hist_like_album", "hist_skip_album"]),
-    EmbeddingTableConfig("uid", ["uid"]),
+    EmbeddingTableConfig("item", ["item", "hist_lp_item", "hist_like_item", "hist_skip_item"], num_embeddings=100),
+    EmbeddingTableConfig("artist", ["artist", "hist_lp_artist", "hist_like_artist", "hist_skip_artist"], num_embeddings=50),
+    EmbeddingTableConfig("album", ["album", "hist_lp_album", "hist_like_album", "hist_skip_album"], num_embeddings=30),
+    EmbeddingTableConfig("uid", ["uid"], num_embeddings=200),
 ]
 
 
@@ -181,7 +180,6 @@ def test_interaction_types():
     """Test all three interaction types produce valid output."""
     for itype in ["concat_mlp", "dcnv2"]:
         config = ModelConfig(
-            embedding_dim=16,
             top_mlp_dims=[32, 16], bottom_mlp_dims=[32],
             interaction_type=itype,
         )
@@ -278,8 +276,7 @@ def _build_onetrans(model_config=None, device="cpu", tasks=None, num_counter_win
     full_config.data.schema = _YAMBDA_SCHEMA
     if tasks:
         full_config.train.loss_weights = {t: 1.0 for t in tasks}
-    schema = build_schema_from_config(full_config, [100, 50, 30, 200])
-    return OneTransModel(model_config, schema=schema, device=torch.device(device))
+    return OneTransModel(full_config, device=torch.device(device))
 
 
 def test_onetrans_forward_cpu():
@@ -370,7 +367,7 @@ def test_onetrans_forward_cross_with_counters():
 def test_dot_interaction_with_counters():
     """DotInteraction should handle variable feature dims from cross_proj."""
     config = ModelConfig(
-        embedding_dim=16, top_mlp_dims=[32, 16], bottom_mlp_dims=[32],
+        top_mlp_dims=[32, 16], bottom_mlp_dims=[32],
         interaction_type="dot",
     )
     model = DLRMBaseline(

@@ -14,10 +14,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from primus_dlrm.config import ModelConfig
+from primus_dlrm.config import Config
 from primus_dlrm.models.base import BaseModel
 from primus_dlrm.models.embedding import TorchRecEmbeddings
-from primus_dlrm.schema import FeatureSchema
 
 
 # ---------------------------------------------------------------------------
@@ -221,17 +220,17 @@ class AutoSplitTokenizer(nn.Module):
 class OneTransModel(BaseModel):
     """OneTrans: schema-driven Transformer for ranking.
 
-    All architecture decisions are driven by a ``FeatureSchema``:
+    All architecture decisions are driven by ``Config``:
 
-    - **Embedding tables**: from ``schema.embedding_tables``
-    - **Sequence groups**: from ``schema.sequence_groups`` — each group gets
+    - **Embedding tables**: from ``config.model.embedding_tables``
+    - **Sequence groups**: from ``config.feature.sequence_groups`` — each group gets
       its own ``SequentialTokenizer``
-    - **Scalar features**: from ``schema.scalar_features`` — concatenated
+    - **Scalar features**: from ``config.feature.scalar_features`` — concatenated
       into the NS-token input
-    - **Dense features**: from ``schema.dense_features`` — projected to D
+    - **Dense features**: from ``config.feature.dense_features`` — projected to D
       (``project=True``, activation from ``df.activation``) or concatenated
       raw (``project=False``)
-    - **Task heads**: from ``schema.task_names``
+    - **Task heads**: from ``config.task_names``
 
     Pipeline mode (``_pipeline_mode=True``): forward() passes a pre-built KJT
     directly to ``emb.ec``, giving FX a traceable getitem→call_module path so
@@ -240,29 +239,29 @@ class OneTransModel(BaseModel):
 
     def __init__(
         self,
-        config: ModelConfig,
-        schema: FeatureSchema,
+        config: Config,
         device: torch.device | None = None,
         meta_device: bool = False,
     ):
         super().__init__()
         self._pipeline_mode = False
         self.config = config
-        self.schema = schema
-        ot = config.onetrans
+        mc = config.model
+        fc = config.feature
+        ot = mc.onetrans
 
         if device is None:
             device = torch.device("cpu")
         emb_device = torch.device("meta") if meta_device else device
-        self.tasks = list(schema.task_names)
-        D = schema.embedding_dim
+        self.tasks = list(config.task_names)
+        D = mc.embedding_dim
 
         # Embeddings
         self.emb = TorchRecEmbeddings(
-            schema.embedding_tables,
+            mc.resolved_embedding_tables(),
             device=emb_device,
-            embedding_init=schema.embedding_init,
-            scalar_feature_names=set(schema.scalar_features),
+            embedding_init=mc.embedding_init,
+            scalar_feature_names=set(fc.scalar_features),
         )
 
         # Per-group sequential tokenizers
@@ -270,13 +269,13 @@ class OneTransModel(BaseModel):
             group_name: SequentialTokenizer(
                 len(feats) * D, ot.d_model, max_len=2048, use_pos_embed=ot.pos_embed,
             ).to(device)
-            for group_name, feats in schema.sequence_groups.items()
+            for group_name, feats in fc.sequence_groups.items()
         })
 
         # Dense feature projections (project=True → Linear+activation, else raw concat)
         self.dense_projs = nn.ModuleDict()
-        ns_raw_dim = len(schema.scalar_features) * D
-        for df in schema.dense_features:
+        ns_raw_dim = len(fc.scalar_features) * D
+        for df in fc.dense_features:
             if df.project:
                 act: nn.Module = nn.ReLU(inplace=True) if df.activation == "relu" else nn.GELU()
                 self.dense_projs[df.name] = nn.Sequential(
@@ -310,7 +309,7 @@ class OneTransModel(BaseModel):
         })
 
         # Contrastive heads (uses scalar features for item representation)
-        n_scalar = len(schema.scalar_features)
+        n_scalar = len(fc.scalar_features)
         self.contrastive_user_proj = nn.Linear(ot.d_model, ot.d_model, device=device)
         self.contrastive_item_proj = nn.Sequential(
             nn.Linear(n_scalar * D, ot.d_model, device=device),
@@ -323,9 +322,9 @@ class OneTransModel(BaseModel):
 
     def _lookup_all(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Schema-driven TorchRec lookup: maps batch keys to EC feature names."""
-        feat_to_key = self.schema.feature_to_batch_key()
+        feat_to_key = self.config.feature_to_batch_key()
         lookup_dict = {}
-        for feat_name in self.schema.all_ec_feature_names():
+        for feat_name in self.config.feature.all_ec_feature_names():
             batch_key = feat_to_key.get(feat_name, feat_name)
             if batch_key in batch:
                 lookup_dict[feat_name] = batch[batch_key]
@@ -338,8 +337,8 @@ class OneTransModel(BaseModel):
         TrainPipelineSparseDist can pipeline the embedding all-to-all.
         """
         ec_out = self.emb.ec(batch["unpooled_kjt"])
-        first_ec_feat = self.schema.scalar_features[0]
-        first_batch_key = self.schema.feature_to_batch_key().get(first_ec_feat, first_ec_feat)
+        first_ec_feat = self.config.feature.scalar_features[0]
+        first_batch_key = self.config.feature_to_batch_key().get(first_ec_feat, first_ec_feat)
         B = batch[first_batch_key].shape[0]
         embs: dict[str, Tensor] = {}
         for feat in self.emb._unpooled_features:
@@ -360,15 +359,15 @@ class OneTransModel(BaseModel):
         self, embs: dict[str, Tensor], group_name: str,
     ) -> Tensor:
         """Concatenate embeddings for one sequence group: [B, L, N*D]."""
-        feats = self.schema.sequence_groups[group_name]
+        feats = self.config.feature.sequence_groups[group_name]
         return torch.cat([embs[f] for f in feats], dim=-1)
 
     def _build_ns_raw(
         self, embs: dict[str, Tensor], batch: dict[str, Tensor],
     ) -> Tensor:
         """Build NS raw vector: scalar embeddings + dense features."""
-        parts = [embs[f] for f in self.schema.scalar_features]
-        for df in self.schema.dense_features:
+        parts = [embs[f] for f in self.config.feature.scalar_features]
+        for df in self.config.feature.dense_features:
             if df.name in self.dense_projs:
                 parts.append(self.dense_projs[df.name](batch[df.name]))
             else:
@@ -388,15 +387,15 @@ class OneTransModel(BaseModel):
         s_repr: [B, d_model] mean-pooled S-token representation (user history
                 only, no candidate item info -- used for contrastive loss).
         """
-        ot = self.config.onetrans
-        first_ec = self.schema.scalar_features[0]
-        first_key = self.schema.feature_to_batch_key().get(first_ec, first_ec)
+        ot = self.config.model.onetrans
+        first_ec = self.config.feature.scalar_features[0]
+        first_key = self.config.feature_to_batch_key().get(first_ec, first_ec)
         B = batch[first_key].shape[0]
         L_NS = ot.n_ns_tokens
 
         # S-token construction: per-group tokenization
         pool_tokens = []
-        for group_name in self.schema.sequence_groups:
+        for group_name in self.config.feature.sequence_groups:
             raw = self._build_pool_raw(embs, group_name)
             pool_tokens.append(self.seq_tokenizers[group_name](raw))
         s_tokens = torch.cat(pool_tokens, dim=1)
@@ -460,7 +459,7 @@ class OneTransModel(BaseModel):
         preds = {task: head(h).squeeze(-1) for task, head in self.heads.items()}
 
         user_emb = self.contrastive_user_proj(s_repr)
-        item_raw = torch.cat([embs[f] for f in self.schema.scalar_features], dim=-1)
+        item_raw = torch.cat([embs[f] for f in self.config.feature.scalar_features], dim=-1)
         item_emb = self.contrastive_item_proj(item_raw)
 
         cross_scores = user_emb @ item_emb.T

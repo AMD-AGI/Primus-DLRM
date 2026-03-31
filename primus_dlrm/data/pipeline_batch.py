@@ -11,7 +11,7 @@ interface (to, record_stream, pin_memory) so the pipeline can:
 
 ``PipelineBatch`` is a generic dict-based Pipelineable that wraps any set of
 tensors plus an optional KJT.  No hardcoded feature names — the KJT is built
-from the FeatureSchema at collate time.
+from the Config at collate time.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ import torch
 from torchrec import KeyedJaggedTensor
 from torchrec.streamable import Pipelineable
 
-from primus_dlrm.schema import FeatureSchema
+from primus_dlrm.config import Config
 
 
 @dataclass
@@ -69,16 +69,11 @@ class PipelineBatch(Pipelineable):
 
 def build_kjt(
     tensors: dict[str, torch.Tensor],
-    schema: FeatureSchema,
+    config: Config,
 ) -> KeyedJaggedTensor:
-    """Build a KJT from batch tensors using the schema's feature order.
-
-    Uses ``schema.kjt_feature_order`` (if set) or ``schema.all_ec_feature_names()``
-    to determine KJT key order.  Maps batch dict keys to EC feature names via
-    ``schema.feature_to_batch_key()``.
-    """
-    feat_order = schema.kjt_feature_order or schema.all_ec_feature_names()
-    feat_to_key = schema.feature_to_batch_key()
+    """Build a KJT from batch tensors using the config's feature order."""
+    feat_order = config.data.schema.kjt_feature_order or config.feature.all_ec_feature_names()
+    feat_to_key = config.feature_to_batch_key()
     keys, all_values, all_lengths = [], [], []
     for feat in feat_order:
         batch_key = feat_to_key.get(feat, feat)
@@ -107,7 +102,7 @@ def build_kjt(
 
 def collate_pipeline_batch(
     batch: list,
-    schema: FeatureSchema,
+    config: Config,
 ) -> PipelineBatch:
     """Collate a list of sample dicts into a PipelineBatch with pre-built KJT.
 
@@ -132,7 +127,7 @@ def collate_pipeline_batch(
             dtype = torch.float32 if isinstance(vals[0], float) else torch.long
             tensors[k] = torch.tensor(vals, dtype=dtype)
 
-    kjt = build_kjt(tensors, schema)
+    kjt = build_kjt(tensors, config)
     return PipelineBatch(tensors=tensors, unpooled_kjt=kjt)
 
 

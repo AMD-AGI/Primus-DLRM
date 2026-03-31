@@ -9,7 +9,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Literal
 
-from primus_dlrm.models.embedding import TableSpec
+from primus_dlrm.config import EmbeddingTableConfig
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ class DistributedPlan:
 
 
 def plan_sharding(
-    table_specs: list[TableSpec],
+    table_specs: list[EmbeddingTableConfig],
     dense_param_count: int,
     topology: HardwareTopology | None = None,
 ) -> DistributedPlan:

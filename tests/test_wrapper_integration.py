@@ -28,17 +28,17 @@ def main():
     os.environ["LOCAL_RANK"] = str(local_rank)
     os.environ["WORLD_SIZE"] = str(world_size)
 
-    from primus_dlrm.models.embedding import TableSpec, TorchRecEmbeddings
+    from primus_dlrm.config import EmbeddingTableConfig
+    from primus_dlrm.models.embedding import TorchRecEmbeddings
     from primus_dlrm.distributed.wrapper import wrap_model
 
     class ToyDLRM(nn.Module):
         def __init__(self):
             super().__init__()
             self.emb = TorchRecEmbeddings([
-                TableSpec("hist_item", 1000, 16, "mean",
-                          ["hist_lp_item", "hist_like_item"]),
-                TableSpec("item", 1000, 16, "none", ["item"]),
-                TableSpec("user", 500, 16, "none", ["uid"]),
+                EmbeddingTableConfig(name="hist_item", features=["hist_lp_item", "hist_like_item"], num_embeddings=1000, embedding_dim=16, pooling="mean"),
+                EmbeddingTableConfig(name="item", features=["item"], num_embeddings=1000, embedding_dim=16, pooling="none"),
+                EmbeddingTableConfig(name="user", features=["uid"], num_embeddings=500, embedding_dim=16, pooling="none"),
             ], device=device)
             self.head = nn.Sequential(
                 nn.Linear(48, 32, device=device),

@@ -45,31 +45,23 @@ from primus_dlrm.distributed.setup import (
 from primus_dlrm.distributed.wrapper import wrap_model
 from primus_dlrm.evaluation.metrics import evaluate_ranking, evaluate_ranking_peruser
 from primus_dlrm.models.dlrm import DLRMBaseline
-from primus_dlrm.schema import (
-    FeatureSchema,
-    build_schema_from_config,
-    build_schema_from_synthetic,
-)
 from primus_dlrm.training.dist_trainer import DistributedTrainer
 from primus_dlrm.training.runtime import configure_runtime
+from primus_dlrm.models.onetrans import OneTransModel
 
 
-def build_model(config, schema: FeatureSchema, device=None, meta_device=False):
-    """Build a model from config and schema.
-
-    OneTrans is fully schema-driven.  DLRMBaseline still uses legacy params
-    extracted from the schema's embedding tables.
-    """
+def build_model(config, device=None, meta_device=False):
+    """Build a model from config."""
     if config.model.model_type == "onetrans":
-        from primus_dlrm.models.onetrans import OneTransModel
         return OneTransModel(
-            config=config.model, schema=schema,
-            device=device, meta_device=meta_device,
+            config=config, device=device, meta_device=meta_device,
         )
-    return DLRMBaseline(
-        config=config.model, schema=schema,
-        device=device, meta_device=meta_device,
-    )
+    elif config.model.model_type == "dlrm":
+        return DLRMBaseline(
+            config=config, device=device, meta_device=meta_device,
+        )
+    else:
+        raise ValueError(f"Invalid model type: {config.model.model_type}")
 
 _rank = os.environ.get("RANK", "?")
 logging.basicConfig(
@@ -97,22 +89,19 @@ class _InfiniteDataLoader:
 
 
 def _setup_synthetic(config, world_size, rank, pipeline):
-    """Build schema, dataset, and dataloader for synthetic data.
-
-    Vocab sizes come from ``model.embedding_tables`` in positional order.
-    """
+    """Build dataset and dataloader for synthetic data."""
     syn = config.data.synthetic
-    vocab_sizes = [t.num_embeddings for t in config.model.embedding_tables]
-    schema = build_schema_from_config(config, vocab_sizes)
+    mc = config.model
+    fc = config.feature
 
     if is_main_process():
-        n_tables = len(schema.embedding_tables)
-        n_feats = len(schema.scalar_features) + sum(
-            len(f) for f in schema.sequence_groups.values()
+        n_tables = len(mc.embedding_tables)
+        n_feats = len(fc.scalar_features) + sum(
+            len(f) for f in fc.sequence_groups.values()
         )
-        n_dense = len(schema.dense_features)
+        n_dense = len(fc.dense_features)
         table_summary = ", ".join(
-            f"{t.name}={t.num_embeddings}" for t in schema.embedding_tables
+            f"{t.name}={t.num_embeddings}" for t in mc.embedding_tables
         )
         logger.info(
             f"Synthetic data: {n_tables} tables, {n_feats} sparse features, "
@@ -123,12 +112,10 @@ def _setup_synthetic(config, world_size, rank, pipeline):
     per_gpu_batch = config.train.batch_size // world_size
 
     if syn.num_prebatched > 0:
-        # Pre-generate batches and cycle.
-        # Eliminates per-step randint overhead — much faster throughput.
         if is_main_process():
             logger.info(f"Using SyntheticDataPipe: {syn.num_prebatched} pre-generated batches")
         pipe = SyntheticDataPipe(
-            schema, per_gpu_batch,
+            config, per_gpu_batch,
             num_prebatched=syn.num_prebatched,
             seed=syn.seed + rank,
             label_positive_rate=syn.label_positive_rate,
@@ -141,33 +128,32 @@ def _setup_synthetic(config, world_size, rank, pipeline):
             from primus_dlrm.data.pipeline_batch import build_kjt, PipelineBatch
 
             class _PipelinedDataPipe:
-                """Wraps SyntheticDataPipe to produce PipelineBatch with KJT."""
-                def __init__(self, pipe, schema):
+                def __init__(self, pipe, config):
                     self.pipe = pipe
-                    self.schema = schema
+                    self.config = config
                     self.sampler = None
                 def __iter__(self):
                     for batch_dict in self.pipe:
-                        kjt = build_kjt(batch_dict, self.schema)
+                        kjt = build_kjt(batch_dict, self.config)
                         clean = {k: v for k, v in batch_dict.items()
                                  if not k.endswith("__lengths")}
                         yield PipelineBatch(tensors=clean, unpooled_kjt=kjt)
                 def __len__(self):
                     return 10_000_000
 
-            loader = _PipelinedDataPipe(pipe, schema)
+            loader = _PipelinedDataPipe(pipe, config)
         else:
             loader = pipe
-        return schema, None, loader
+        return None, loader
 
-    dataset = SyntheticDataset(schema, syn)
+    dataset = SyntheticDataset(config)
     shuffle = config.train.shuffle and not dataset._infinite
     sampler = DistributedSampler(
         dataset, num_replicas=world_size, rank=rank,
         shuffle=shuffle,
     )
     if pipeline:
-        collate_fn = partial(collate_pipeline_batch, schema=schema)
+        collate_fn = partial(collate_pipeline_batch, config=config)
     else:
         collate_fn = collate_synthetic
 
@@ -184,15 +170,14 @@ def _setup_synthetic(config, world_size, rank, pipeline):
     if dataset._infinite:
         loader = _InfiniteDataLoader(loader)
 
-    return schema, None, loader
+    return None, loader
 
 
 def _setup_real_data(config, processed_dir, world_size, rank, pipeline):
-    """Build schema, dataset, and dataloader for real Yambda data."""
+    """Build dataset and dataloader for real Yambda data."""
     if is_main_process():
         logger.info("Loading training dataset...")
     dataset = YambdaTrainDataset(config.data, processed_dir)
-    schema = build_schema_from_config(config, dataset.vocab_sizes)
 
     per_gpu_batch = config.train.batch_size // world_size
     sampler = DistributedSampler(
@@ -200,7 +185,7 @@ def _setup_real_data(config, processed_dir, world_size, rank, pipeline):
         shuffle=config.train.shuffle,
     )
     if pipeline:
-        collate_fn = partial(collate_pipeline_batch, schema=schema)
+        collate_fn = partial(collate_pipeline_batch, config=config)
     else:
         collate_fn = collate_to_dict
     loader = DataLoader(
@@ -212,7 +197,7 @@ def _setup_real_data(config, processed_dir, world_size, rank, pipeline):
         pin_memory=True,
         drop_last=True,
     )
-    return schema, dataset, loader
+    return dataset, loader
 
 
 def main():
@@ -267,22 +252,20 @@ def main():
     build_device = torch.device("cpu") if use_meta else device
 
     if use_synthetic:
-        schema, train_dataset, train_loader = _setup_synthetic(
+        train_dataset, train_loader = _setup_synthetic(
             config, world_size, rank, args.pipeline,
         )
     else:
-        schema, train_dataset, train_loader = _setup_real_data(
+        train_dataset, train_loader = _setup_real_data(
             config, processed_dir, world_size, rank, args.pipeline,
         )
 
     # Model
     if is_main_process():
         logger.info("Building model...")
-    active_tasks = [k for k, v in config.train.loss_weights.items() if v > 0]
 
     model = build_model(
         config=config,
-        schema=schema,
         device=build_device,
         meta_device=use_meta,
     )

@@ -64,11 +64,12 @@ class DataConfig:
 
 @dataclass
 class EmbeddingTableConfig:
-    """One embedding table: name, features, and optional size/dim."""
+    """One embedding table: name, features, and optional size/dim/pooling."""
     name: str = ""
     features: list[str] = field(default_factory=list)
     num_embeddings: int = 0
     embedding_dim: int = 0
+    pooling: str = "none"
 
 @dataclass
 class FeatureConfig:
@@ -76,6 +77,13 @@ class FeatureConfig:
     sequence_groups: dict[str, list[str]] = field(default_factory=dict)
     scalar_features: list[str] = field(default_factory=list)
     dense_features: list[DenseFeatureSpec] = field(default_factory=list)
+
+    def all_ec_feature_names(self) -> list[str]:
+        """All EC feature names in deterministic order (scalars first)."""
+        names = list(self.scalar_features)
+        for feats in self.sequence_groups.values():
+            names.extend(feats)
+        return names
 
 
 @dataclass
@@ -110,15 +118,6 @@ class DenseFeatureSpec:
 
 
 @dataclass
-class SyntheticSparseSpec:
-    """A group of sparse features sharing one table."""
-    table_index: int = 0
-    is_sequence: bool = False
-    sequence_length: int = 20
-    num_features: int = 1
-
-
-@dataclass
 class SyntheticDataConfig:
     """Synthetic random data generation config.
 
@@ -143,9 +142,6 @@ class SyntheticDataConfig:
     sparse_len_min: int = 0
     sparse_len_max: int = 0
 
-    sparse_features: list[SyntheticSparseSpec] = field(default_factory=list)
-    dense_features: list[DenseFeatureSpec] = field(default_factory=list)
-    num_tasks: int = 1
 
 
 @dataclass
@@ -186,11 +182,8 @@ class ModelConfig:
     # Model architecture: "dlrm" (DLRM++ baseline) or "onetrans" (OneTrans Transformer)
     model_type: str = "dlrm"
 
-    # Embedding dimension for main tables (item, artist, album, uid)
-    embedding_dim: int = 16
-
-    # Embedding dimension for small tables (event_type, is_organic, time_gap)
-    embedding_dim_small: int = 8
+    # Embedding dimension for all tables (default when per-table dim is 0)
+    embedding_dim: int = 64
 
     # DLRM interaction module: "concat_mlp" | "dot" | "dcnv2"
     interaction_type: str = "concat_mlp"
@@ -212,14 +205,25 @@ class ModelConfig:
     #   "normal"  — nn.Embedding default (normal distribution, std=1)
     embedding_init: str = "uniform"
 
-    # Embedding tables: table names, features, and optional per-table sizes.
+    # Embedding tables: table names, features, sizes, and per-table pooling.
     embedding_tables: list[EmbeddingTableConfig] = field(default_factory=list)
-
-    # Pooling mode for sequence features in DLRM ("mean", "sum")
-    pooling: str = "mean"
 
     # OneTrans-specific hyperparameters (only used when model_type="onetrans")
     onetrans: OneTransConfig = field(default_factory=OneTransConfig)
+
+    def resolved_embedding_tables(self) -> list[EmbeddingTableConfig]:
+        """Return embedding tables with embedding_dim resolved to model default."""
+        D = self.embedding_dim
+        return [
+            EmbeddingTableConfig(
+                name=t.name, features=t.features,
+                num_embeddings=t.num_embeddings,
+                embedding_dim=t.embedding_dim if t.embedding_dim > 0 else D,
+                pooling=t.pooling,
+            )
+            for t in self.embedding_tables
+        ]
+
 
 
 @dataclass
@@ -376,6 +380,20 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
     distributed: DistributedConfig = field(default_factory=DistributedConfig)
 
+    @property
+    def task_names(self) -> list[str]:
+        """Active task names derived from train.loss_weights."""
+        active = [k for k, v in self.train.loss_weights.items() if v > 0]
+        return active if active else ["task0"]
+
+    def feature_to_batch_key(self) -> dict[str, str]:
+        """EC feature name → batch dict key mapping."""
+        inv = {v: k for k, v in self.data.schema.batch_to_feature.items()}
+        for name in self.feature.all_ec_feature_names():
+            if name not in inv:
+                inv[name] = name
+        return inv
+
     def save(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -411,7 +429,7 @@ def _from_dict(dc_cls: type, raw: dict[str, Any]) -> Any:
             DataConfig, ModelConfig, TrainConfig, OneTransConfig,
             DistributedConfig, EmbeddingShardingConfig,
             FeatureConfig, SchemaConfig, EmbeddingTableConfig,
-            SyntheticDataConfig, SyntheticSparseSpec,
+            SyntheticDataConfig,
             DenseFeatureSpec,
         ):
             _DC_REGISTRY[cls.__name__] = cls

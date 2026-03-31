@@ -1,6 +1,6 @@
 """Synthetic random data generator for benchmarking and NaN reproduction.
 
-Produces batches matching a FeatureSchema without requiring any real dataset.
+Produces batches matching Config without requiring any real dataset.
 Feature names, table sizes, dimensions, and value ranges are all configurable
 via ``SyntheticDataConfig`` in the YAML.
 
@@ -28,8 +28,7 @@ from torch.utils.data import Dataset
 from torchrec import KeyedJaggedTensor
 from torchrec.streamable import Pipelineable
 
-from primus_dlrm.config import SyntheticDataConfig
-from primus_dlrm.schema import FeatureSchema
+from primus_dlrm.config import Config, SyntheticDataConfig
 
 logger = logging.getLogger(__name__)
 
@@ -39,61 +38,53 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class SyntheticDataset(Dataset):
-    """Generates random samples matching a FeatureSchema.
+    """Generates random samples matching Config.
 
-    When ``num_samples > 0``, behaves as a finite map-style Dataset (works
-    with DistributedSampler + DataLoader).
-
-    When ``num_samples <= 0`` (e.g. -1), behaves as an infinite dataset.
-    Use with ``max_steps`` to control training duration.
+    When ``num_samples > 0``, behaves as a finite map-style Dataset.
+    When ``num_samples <= 0``, behaves as an infinite dataset.
     """
 
-    def __init__(self, schema: FeatureSchema, config: SyntheticDataConfig):
-        self.schema = schema
+    def __init__(self, config: Config):
         self.config = config
-        self._infinite = config.num_samples <= 0
+        syn = config.data.synthetic
+        self._syn = syn
+        self._infinite = syn.num_samples <= 0
         self._table_sizes: dict[str, int] = {}
-        for table in schema.embedding_tables:
-            for feat in table.feature_names:
+        for table in config.model.embedding_tables:
+            for feat in table.features:
                 self._table_sizes[feat] = table.num_embeddings
 
     def __len__(self) -> int:
         if self._infinite:
-            # Large but not huge — must be manageable for DistributedSampler
-            # which shuffles all indices.  10M gives ~2400 steps at B=4096/GPU.
             return 10_000_000
-        return self.config.num_samples
+        return self._syn.num_samples
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        rng = torch.Generator().manual_seed(self.config.seed + idx)
-        schema = self.schema
-        feat_to_key = schema.feature_to_batch_key()
+        rng = torch.Generator().manual_seed(self._syn.seed + idx)
+        fc = self.config.feature
+        feat_to_key = self.config.feature_to_batch_key()
         sample: dict[str, torch.Tensor] = {}
 
-        # Scalar sparse features: [1] each
-        for feat in schema.scalar_features:
+        for feat in fc.scalar_features:
             vocab = self._table_sizes[feat]
             key = feat_to_key.get(feat, feat)
             sample[key] = torch.randint(0, vocab, (1,), generator=rng).squeeze(0)
 
-        # Sequence sparse features: [L] each
-        for group_feats in schema.sequence_groups.values():
+        for group_feats in fc.sequence_groups.values():
             for feat in group_feats:
                 vocab = self._table_sizes[feat]
                 key = feat_to_key.get(feat, feat)
                 sample[key] = torch.randint(
-                    0, vocab, (schema.sequence_length,), generator=rng,
+                    0, vocab, (self.config.data.history_length,), generator=rng,
                 )
 
-        # Dense features
-        for df in schema.dense_features:
+        for df in fc.dense_features:
             lo, hi = df.value_range_min, df.value_range_max
             sample[df.name] = torch.empty(df.dim).uniform_(lo, hi)
 
-        # Labels
-        for task in schema.task_names:
+        for task in self.config.task_names:
             sample[task] = torch.tensor(
-                1.0 if torch.rand(1, generator=rng).item() < self.config.label_positive_rate else 0.0,
+                1.0 if torch.rand(1, generator=rng).item() < self._syn.label_positive_rate else 0.0,
             )
 
         return sample
@@ -162,15 +153,11 @@ class SyntheticBatch(Pipelineable):
 
 def _build_synthetic_kjt(
     tensors: dict[str, torch.Tensor],
-    schema: FeatureSchema,
+    config: Config,
 ) -> KeyedJaggedTensor:
-    """Build KJT from all EC features in the schema.
-
-    Uses ``schema.kjt_feature_order`` when set, so the KJT key order matches
-    exactly what the pipeline / EmbeddingCollection expects.
-    """
-    feat_order = schema.kjt_feature_order or schema.all_ec_feature_names()
-    feat_to_key = schema.feature_to_batch_key()
+    """Build KJT from all EC features."""
+    feat_order = config.data.schema.kjt_feature_order or config.feature.all_ec_feature_names()
+    feat_to_key = config.feature_to_batch_key()
     keys, all_values, all_lengths = [], [], []
     for feat in feat_order:
         batch_key = feat_to_key.get(feat, feat)
@@ -193,11 +180,11 @@ def _build_synthetic_kjt(
 
 def collate_synthetic_pipeline(
     batch: list[dict[str, torch.Tensor]],
-    schema: FeatureSchema,
+    config: Config,
 ) -> SyntheticBatch:
     """Collate into a SyntheticBatch with pre-built KJT for pipeline mode."""
     tensors = collate_synthetic(batch)
-    kjt = _build_synthetic_kjt(tensors, schema)
+    kjt = _build_synthetic_kjt(tensors, config)
     return SyntheticBatch(tensors=tensors, unpooled_kjt=kjt)
 
 
@@ -206,7 +193,7 @@ def collate_synthetic_pipeline(
 # ---------------------------------------------------------------------------
 
 def generate_batch(
-    schema: FeatureSchema,
+    config: Config,
     batch_size: int,
     seed: int = 42,
     label_positive_rate: float = 0.3,
@@ -215,31 +202,26 @@ def generate_batch(
     sparse_len_min: int = 0,
     sparse_len_max: int = 0,
 ) -> dict[str, torch.Tensor]:
-    """Generate a full random batch directly as tensors (no per-sample overhead).
-
-    Args:
-        sparse_id_max: Upper bound for sparse IDs. 0 = use table num_embeddings.
-        sparse_len_min/max: Variable-length range for sequence features.
-            0/0 = fixed length from schema.sequence_length.
-    """
+    """Generate a full random batch directly as tensors."""
     rng = torch.Generator().manual_seed(seed)
+    fc = config.feature
     table_sizes: dict[str, int] = {}
-    for table in schema.embedding_tables:
-        for feat in table.feature_names:
+    for table in config.model.embedding_tables:
+        for feat in table.features:
             table_sizes[feat] = table.num_embeddings
 
-    feat_to_key = schema.feature_to_batch_key()
+    feat_to_key = config.feature_to_batch_key()
     batch: dict[str, torch.Tensor] = {}
     B = batch_size
-    L = schema.sequence_length
+    L = config.data.history_length
     use_var_len = sparse_len_min > 0 or sparse_len_max > 0
 
-    for feat in schema.scalar_features:
+    for feat in fc.scalar_features:
         id_max = sparse_id_max if sparse_id_max > 0 else table_sizes[feat]
         key = feat_to_key.get(feat, feat)
         batch[key] = torch.randint(sparse_id_min, id_max, (B,), generator=rng)
 
-    for group_feats in schema.sequence_groups.values():
+    for group_feats in fc.sequence_groups.values():
         for feat in group_feats:
             id_max = sparse_id_max if sparse_id_max > 0 else table_sizes[feat]
             key = feat_to_key.get(feat, feat)
@@ -251,11 +233,11 @@ def generate_batch(
             else:
                 batch[key] = torch.randint(sparse_id_min, id_max, (B, L), generator=rng)
 
-    for df in schema.dense_features:
+    for df in fc.dense_features:
         lo, hi = df.value_range_min, df.value_range_max
         batch[df.name] = torch.empty(B, df.dim).uniform_(lo, hi)
 
-    for task in schema.task_names:
+    for task in config.task_names:
         batch[task] = (torch.rand(B, generator=rng) < label_positive_rate).float()
 
     return batch
@@ -278,7 +260,7 @@ class SyntheticDataPipe:
 
     def __init__(
         self,
-        schema: FeatureSchema,
+        config: Config,
         batch_size: int,
         num_prebatched: int = 16,
         seed: int = 42,
@@ -288,7 +270,7 @@ class SyntheticDataPipe:
         sparse_len_min: int = 0,
         sparse_len_max: int = 0,
     ):
-        self._schema = schema
+        self._config = config
         self._batch_size = batch_size
         self._seed = seed
         self._label_positive_rate = label_positive_rate
@@ -302,7 +284,7 @@ class SyntheticDataPipe:
         if num_prebatched > 0:
             logger.info(f"Pre-generating {num_prebatched} synthetic batches (B={batch_size})...")
             self._batches = [
-                generate_batch(schema, batch_size, seed=seed + i,
+                generate_batch(config, batch_size, seed=seed + i,
                                label_positive_rate=label_positive_rate,
                                **self._sparse_kwargs)
                 for i in range(num_prebatched)
@@ -322,7 +304,7 @@ class SyntheticDataPipe:
         if self._batches is not None:
             return copy.deepcopy(self._batches[(self._idx - 1) % len(self._batches)])
         return generate_batch(
-            self._schema, self._batch_size,
+            self._config, self._batch_size,
             seed=self._seed + self._idx,
             label_positive_rate=self._label_positive_rate,
             **self._sparse_kwargs,

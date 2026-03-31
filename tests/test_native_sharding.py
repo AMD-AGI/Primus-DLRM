@@ -34,12 +34,12 @@ def log(rank, msg):
 
 def test_table_wise(rank, world_size, device):
     """Table-wise sharding: each table on one GPU."""
-    from primus_dlrm.models.embedding import TableSpec
+    from primus_dlrm.config import EmbeddingTableConfig
     from primus_dlrm.models.sharded_embedding import ShardedEmbeddingCollection, assign_sharding
 
     specs = [
-        TableSpec("item", 1000, 16, "none", ["item", "hist_item"]),
-        TableSpec("user", 500, 16, "none", ["uid"]),
+        EmbeddingTableConfig(name="item", features=["item", "hist_item"], num_embeddings=1000, embedding_dim=16, pooling="none"),
+        EmbeddingTableConfig(name="user", features=["uid"], num_embeddings=500, embedding_dim=16, pooling="none"),
     ]
     plan = assign_sharding(specs, world_size, strategy="table_wise")
     log(rank, f"table_wise plan: {[(k, v.owner_rank) for k, v in plan.items()]}")
@@ -71,12 +71,12 @@ def test_table_wise(rank, world_size, device):
 
 def test_row_wise(rank, world_size, device):
     """Row-wise sharding: table rows split across GPUs."""
-    from primus_dlrm.models.embedding import TableSpec
+    from primus_dlrm.config import EmbeddingTableConfig
     from primus_dlrm.models.sharded_embedding import ShardedEmbeddingCollection, assign_sharding
 
     specs = [
-        TableSpec("item", 1000, 16, "none", ["item"]),
-        TableSpec("user", 500, 16, "none", ["uid"]),
+        EmbeddingTableConfig(name="item", features=["item"], num_embeddings=1000, embedding_dim=16, pooling="none"),
+        EmbeddingTableConfig(name="user", features=["uid"], num_embeddings=500, embedding_dim=16, pooling="none"),
     ]
     plan = assign_sharding(specs, world_size, strategy="row_wise")
 
@@ -104,12 +104,12 @@ def test_row_wise(rank, world_size, device):
 
 def test_pooled_table_wise(rank, world_size, device):
     """Table-wise sharding with pooled (mean) embeddings."""
-    from primus_dlrm.models.embedding import TableSpec
+    from primus_dlrm.config import EmbeddingTableConfig
     from primus_dlrm.models.sharded_embedding import ShardedEmbeddingCollection, assign_sharding
 
     specs = [
-        TableSpec("hist_item", 1000, 16, "mean", ["hist_lp_item", "hist_like_item"]),
-        TableSpec("item", 1000, 16, "none", ["item"]),
+        EmbeddingTableConfig(name="hist_item", features=["hist_lp_item", "hist_like_item"], num_embeddings=1000, embedding_dim=16, pooling="mean"),
+        EmbeddingTableConfig(name="item", features=["item"], num_embeddings=1000, embedding_dim=16, pooling="none"),
     ]
     plan = assign_sharding(specs, world_size, strategy="table_wise")
 
@@ -135,15 +135,16 @@ def test_pooled_table_wise(rank, world_size, device):
 
 def test_full_model_integration(rank, world_size, device):
     """Test replacing TorchRecEmbeddings with ShardedEmbeddingCollection in a model."""
-    from primus_dlrm.models.embedding import TableSpec, TorchRecEmbeddings
+    from primus_dlrm.config import EmbeddingTableConfig
+    from primus_dlrm.models.embedding import TorchRecEmbeddings
     from primus_dlrm.models.sharded_embedding import ShardedEmbeddingCollection, assign_sharding
 
     class ToyRecommender(nn.Module):
         def __init__(self):
             super().__init__()
             specs = [
-                TableSpec("item", 1000, 16, "none", ["item"]),
-                TableSpec("user", 500, 16, "none", ["uid"]),
+                EmbeddingTableConfig(name="item", features=["item"], num_embeddings=1000, embedding_dim=16, pooling="none"),
+                EmbeddingTableConfig(name="user", features=["uid"], num_embeddings=500, embedding_dim=16, pooling="none"),
             ]
             self.emb = TorchRecEmbeddings(specs, device=device)
             self.head = nn.Linear(32, 1, device=device)
@@ -157,8 +158,8 @@ def test_full_model_integration(rank, world_size, device):
 
     # Replace emb with sharded version
     specs = [
-        TableSpec("item", 1000, 16, "none", ["item"]),
-        TableSpec("user", 500, 16, "none", ["uid"]),
+        EmbeddingTableConfig(name="item", features=["item"], num_embeddings=1000, embedding_dim=16, pooling="none"),
+        EmbeddingTableConfig(name="user", features=["uid"], num_embeddings=500, embedding_dim=16, pooling="none"),
     ]
     plan = assign_sharding(specs, world_size, strategy="table_wise")
     model.emb = ShardedEmbeddingCollection(specs, plan, device=device)

@@ -11,7 +11,6 @@ from torch.utils.data import DataLoader
 from primus_dlrm.config import Config
 from primus_dlrm.data.dataset import YambdaTrainDataset, YambdaEvalDataset, collate_to_dict
 from primus_dlrm.evaluation.metrics import evaluate_ranking
-from primus_dlrm.schema import build_schema_from_config
 from primus_dlrm.training.runtime import configure_runtime
 from primus_dlrm.training.trainer import Trainer
 
@@ -24,13 +23,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def build_model(config, schema, device):
+def build_model(config, device):
     if config.model.model_type == "onetrans":
         from primus_dlrm.models.onetrans import OneTransModel
-        return OneTransModel(config=config.model, schema=schema, device=device)
+        return OneTransModel(config=config, device=device)
     else:
         from primus_dlrm.models.dlrm import DLRMBaseline
-        return DLRMBaseline(config=config.model, schema=schema, device=device)
+        return DLRMBaseline(config=config, device=device)
 
 
 def main():
@@ -64,8 +63,7 @@ def main():
     eval_dataset = YambdaEvalDataset(config.data, processed_dir)
 
     logger.info(f"Building model (type={config.model.model_type})...")
-    schema = build_schema_from_config(config, train_dataset.vocab_sizes)
-    model = build_model(config, schema=schema, device=device)
+    model = build_model(config, device=device)
     num_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model parameters: {num_params:,}")
 

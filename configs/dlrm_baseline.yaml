@@ -1,41 +1,55 @@
 data:
   dataset_size: "50m"
-  history_length: 100
+  history_length: 20
   history_mode: "last_l"
-  num_negatives: 4
-  negative_sampler: "uniform"
-  session_gap_seconds: 1800
   num_workers: 4
   enable_counters: false
   data_dir: "data"
   schema: schemas/yambda.yaml
-  schema:
-    dense_features:
-      - { name: audio_embed, dim: 128, project: true, activation: gelu }
+
+feature:
+  sequence_groups:
+    hist_lp: [hist_lp_item, hist_lp_artist, hist_lp_album]
+    hist_like: [hist_like_item, hist_like_artist, hist_like_album]
+    hist_skip: [hist_skip_item, hist_skip_artist, hist_skip_album]
+  scalar_features: [uid, item, artist, album]
+  dense_features:
+    - { name: audio_embed, dim: 128, project: true, activation: gelu }
 
 model:
+  model_type: "dlrm"
   embedding_dim: 64
-  embedding_dim_small: 16
   interaction_type: "concat_mlp"
   bottom_mlp_dims: [128]
   top_mlp_dims: [256, 128]
   dropout: 0.1
+  embedding_tables:
+    - { name: hist_item,   features: [hist_lp_item, hist_like_item, hist_skip_item],             num_embeddings: 9390624, pooling: mean }
+    - { name: item,        features: [item],                                                      num_embeddings: 9390624 }
+    - { name: hist_artist, features: [hist_lp_artist, hist_like_artist, hist_skip_artist],        num_embeddings: 1293395, pooling: mean }
+    - { name: artist,      features: [artist],                                                    num_embeddings: 1293395 }
+    - { name: hist_album,  features: [hist_lp_album, hist_like_album, hist_skip_album],           num_embeddings: 3367692, pooling: mean }
+    - { name: album,       features: [album],                                                     num_embeddings: 3367692 }
+    - { name: uid,         features: [uid],                                                       num_embeddings: 1000001 }
 
 train:
-  batch_size: 256
+  batch_size: 32768
   lr: 0.001
   embedding_lr: 0.01
   weight_decay: 0.00001
-  epochs: 10
+  epochs: 1
   warmup_steps: 1000
   bf16: true
   grad_clip: 1.0
-  log_interval: 100
+  log_interval: 10
   eval_interval: 1
-  checkpoint_dir: "checkpoints"
+  checkpoint_dir: "results"
   seed: 42
   loss_weights:
     listen_plus: 1.0
-    like: 0.5
-    dislike: 0.5
-    listen_pct: 0.1
+
+distributed:
+  enabled: true
+  dense_strategy: "ddp"
+  num_nodes: 1
+  gpus_per_node: 8

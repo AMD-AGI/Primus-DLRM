@@ -22,7 +22,6 @@ from primus_dlrm.data.dataset import YambdaEvalDataset, YambdaTrainDataset
 from primus_dlrm.evaluation.metrics import evaluate_ranking, evaluate_ranking_peruser
 from primus_dlrm.models.dlrm import DLRMBaseline
 from primus_dlrm.models.onetrans import OneTransModel
-from primus_dlrm.schema import build_schema_from_config
 
 # force=True required: imported modules configure the root logger first,
 # making a second basicConfig() a no-op without it.
@@ -52,12 +51,13 @@ def main():
     processed_dir = Path(args.processed_dir)
 
     train_dataset = YambdaTrainDataset(config.data, processed_dir)
-    schema = build_schema_from_config(config, train_dataset.vocab_sizes)
 
     if config.model.model_type == "onetrans":
-        model = OneTransModel(config=config.model, schema=schema, device=device)
+        model = OneTransModel(config=config, device=device)
+    elif config.model.model_type == "dlrm":
+        model = DLRMBaseline(config=config, device=device)
     else:
-        model = DLRMBaseline(config=config.model, schema=schema, device=device)
+        raise ValueError(f"Invalid model type: {config.model.model_type}")
 
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
@@ -75,13 +75,14 @@ def main():
         f"{len(candidate_items)} candidates, ks=[10, 50, 100]"
     )
 
+    task = config.task_names[0]
     logger.info("Starting global ranking eval...")
     t0 = time.time()
     with torch.no_grad():
         rg = evaluate_ranking(
             model, eval_dataset, device,
             candidate_item_ids=candidate_items,
-            ks=[10, 50, 100], task=active_tasks[0],
+            ks=[10, 50, 100], task=task,
             log_interval=args.log_interval,
         )
     logger.info(f"Global eval done in {time.time() - t0:.1f}s")
@@ -91,7 +92,7 @@ def main():
     with torch.no_grad():
         rp = evaluate_ranking_peruser(
             model, eval_dataset, device,
-            ks=[10, 50, 100], task=active_tasks[0], top_n=100,
+            ks=[10, 50, 100], task=task, top_n=100,
             log_interval=args.log_interval,
         )
     logger.info(f"Per-user eval done in {time.time() - t0:.1f}s")

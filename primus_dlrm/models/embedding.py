@@ -6,8 +6,6 @@ the EBC/EC submodules automatically for sharding.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 import torch
 import torch.nn as nn
 from torchrec import (
@@ -19,29 +17,16 @@ from torchrec import (
 )
 from torchrec.modules.embedding_configs import PoolingType
 
-
-@dataclass
-class TableSpec:
-    """One physical embedding table, possibly serving multiple feature names."""
-    name: str
-    num_embeddings: int
-    embedding_dim: int
-    pooling: str = "none"  # "mean", "sum", "none"
-    feature_names: list[str] = field(default_factory=list)
-
-    def __post_init__(self):
-        if not self.feature_names:
-            self.feature_names = [self.name]
-
+from primus_dlrm.config import EmbeddingTableConfig
 
 _POOLING_MAP = {"mean": PoolingType.MEAN, "sum": PoolingType.SUM}
 
 
 def _build_torchrec_configs(
-    table_specs: list[TableSpec],
+    table_specs: list[EmbeddingTableConfig],
     embedding_init: str = "uniform",
 ) -> tuple[list[EmbeddingBagConfig], list[EmbeddingConfig], list[str], list[str], dict[str, int]]:
-    """Build TorchRec EBC/EC configs from TableSpecs.
+    """Build TorchRec EBC/EC configs from EmbeddingTableConfigs.
 
     Returns (pooled_configs, unpooled_configs, pooled_features, unpooled_features, feature_dims).
     """
@@ -57,7 +42,7 @@ def _build_torchrec_configs(
     feature_dims: dict[str, int] = {}
 
     for spec in table_specs:
-        for feat in spec.feature_names:
+        for feat in spec.features:
             feature_dims[feat] = spec.embedding_dim
 
         extra = {"init_fn": init_fn} if init_fn is not None else {}
@@ -66,20 +51,20 @@ def _build_torchrec_configs(
                 name=spec.name,
                 embedding_dim=spec.embedding_dim,
                 num_embeddings=spec.num_embeddings,
-                feature_names=list(spec.feature_names),
+                feature_names=list(spec.features),
                 pooling=_POOLING_MAP[spec.pooling],
                 **extra,
             ))
-            pooled_features.extend(spec.feature_names)
+            pooled_features.extend(spec.features)
         else:
             unpooled_configs.append(EmbeddingConfig(
                 name=spec.name,
                 embedding_dim=spec.embedding_dim,
                 num_embeddings=spec.num_embeddings,
-                feature_names=list(spec.feature_names),
+                feature_names=list(spec.features),
                 **extra,
             ))
-            unpooled_features.extend(spec.feature_names)
+            unpooled_features.extend(spec.features)
 
     return pooled_configs, unpooled_configs, pooled_features, unpooled_features, feature_dims
 
@@ -105,7 +90,7 @@ class TorchRecEmbeddings(nn.Module):
 
     def __init__(
         self,
-        table_specs: list[TableSpec],
+        table_specs: list[EmbeddingTableConfig],
         device: torch.device | None = None,
         embedding_init: str = "uniform",
         scalar_feature_names: set[str] | None = None,
