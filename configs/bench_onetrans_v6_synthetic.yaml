@@ -1,0 +1,70 @@
+# Synthetic version of bench_onetrans_v6.yaml.
+# Matches real Yambda 50M embedding table sizes, feature layout, and model.
+
+data:
+  history_length: 20
+  history_mode: "last_l"
+  num_workers: 4
+  enable_counters: true
+  counter_windows_days: [7, 30]
+  schema: schemas/yambda.yaml
+  synthetic:
+    enabled: true
+    seed: 42
+    num_samples: -1
+    num_prebatched: 16
+    label_positive_rate: 0.3
+
+model:
+  model_type: "onetrans"
+  embedding_dim: 64
+  embedding_init: "uniform"
+  onetrans:
+    d_model: 256
+    n_heads: 8
+    n_layers: 4
+    ffn_mult: 4
+    n_ns_tokens: 8
+    use_pyramid: true
+    dropout: 0.1
+    pos_embed: true
+  embedding_tables:
+    - { name: item,   features: [item, hist_lp_item, hist_like_item, hist_skip_item],       num_embeddings: 9390624 }
+    - { name: artist, features: [artist, hist_lp_artist, hist_like_artist, hist_skip_artist], num_embeddings: 1293395 }
+    - { name: album,  features: [album, hist_lp_album, hist_like_album, hist_skip_album],    num_embeddings: 3367692 }
+    - { name: uid,    features: [uid],                                                        num_embeddings: 1000001 }
+
+feature:
+  sequence_groups:
+    hist_lp: [hist_lp_item, hist_lp_artist, hist_lp_album]
+    hist_like: [hist_like_item, hist_like_artist, hist_like_album]
+    hist_skip: [hist_skip_item, hist_skip_artist, hist_skip_album]
+  scalar_features: [uid, item, artist, album]
+  dense_features:
+    - { name: audio_embed, dim: 128, project: true, activation: gelu }
+    - { name: user_counters, dim: 6, project: false }
+    - { name: item_counters, dim: 6, project: false }
+    - { name: cross_counters, dim: 18, project: true, activation: relu }
+
+train:
+  batch_size: 32768
+  lr: 0.0003
+  weight_decay: 0.00001
+  epochs: 1
+  warmup_steps: 2000
+  bf16: true
+  grad_clip: 1.0
+  log_interval: 10
+  eval_interval: 1
+  checkpoint_dir: "results"
+  seed: 42
+  loss_weights:
+    listen_plus: 1.0
+  contrastive_weight: 0.0
+  contrastive_temperature: 0.1
+
+distributed:
+  enabled: true
+  dense_strategy: "ddp"
+  num_nodes: 1
+  gpus_per_node: 8
