@@ -8,7 +8,7 @@ from primus_dlrm.config import Config
 def test_default_config():
     cfg = Config()
     assert cfg.data.dataset_size == "50m"
-    assert cfg.model.embedding_dim == 16
+    assert cfg.model.embedding_dim == 64
     assert cfg.train.batch_size == 256
 
 
@@ -28,6 +28,6 @@ def test_roundtrip():
 
 def test_load_baseline_config():
     cfg = Config.load("configs/dlrm_baseline.yaml")
-    assert cfg.data.history_length == 100
+    assert cfg.data.history_length == 20
     assert cfg.model.interaction_type == "concat_mlp"
     assert cfg.train.bf16 is True

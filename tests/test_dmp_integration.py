@@ -12,10 +12,14 @@ import os
 import sys
 import traceback
 
+import pytest
 import torch
 import torch.distributed as dist
 
-from primus_dlrm.config import ModelConfig
+from primus_dlrm.config import (
+    Config, DenseFeatureSpec, EmbeddingTableConfig, FeatureConfig,
+    ModelConfig, SchemaConfig,
+)
 from primus_dlrm.distributed.wrapper import wrap_model, is_dmp
 from primus_dlrm.models.dlrm import DLRMBaseline
 
@@ -35,20 +39,46 @@ def log(rank, msg):
 
 def _build_model(device):
     """Build a small DLRMBaseline with meta device for embeddings."""
-    config = ModelConfig(
+    model_config = ModelConfig(
         model_type="dlrm",
         embedding_dim=16,
         bottom_mlp_dims=[64],
         top_mlp_dims=[64, 32],
         interaction_type="concat_mlp",
         dropout=0.0,
+        embedding_tables=[
+            EmbeddingTableConfig("hist_item", ["hist_lp_item", "hist_like_item", "hist_skip_item"], num_embeddings=200, pooling="mean"),
+            EmbeddingTableConfig("item", ["item"], num_embeddings=200),
+            EmbeddingTableConfig("hist_artist", ["hist_lp_artist", "hist_like_artist", "hist_skip_artist"], num_embeddings=50, pooling="mean"),
+            EmbeddingTableConfig("artist", ["artist"], num_embeddings=50),
+            EmbeddingTableConfig("hist_album", ["hist_lp_album", "hist_like_album", "hist_skip_album"], num_embeddings=80, pooling="mean"),
+            EmbeddingTableConfig("album", ["album"], num_embeddings=80),
+            EmbeddingTableConfig("uid", ["uid"], num_embeddings=100),
+        ],
     )
-    return DLRMBaseline(
-        config=config,
-        num_users=100, num_items=200, num_artists=50, num_albums=80,
-        audio_input_dim=32, device=torch.device("cpu"),
-        tasks=["listen_plus"], meta_device=True,
+    full_config = Config()
+    full_config.model = model_config
+    full_config.feature = FeatureConfig(
+        sequence_groups={
+            "hist_lp": ["hist_lp_item", "hist_lp_artist", "hist_lp_album"],
+            "hist_like": ["hist_like_item", "hist_like_artist", "hist_like_album"],
+            "hist_skip": ["hist_skip_item", "hist_skip_artist", "hist_skip_album"],
+        },
+        scalar_features=["uid", "item", "artist", "album"],
+        dense_features=[DenseFeatureSpec("audio_embed", 32, project=True, activation="gelu")],
     )
+    full_config.data.schema = SchemaConfig(
+        batch_to_feature={
+            "item_id": "item", "artist_id": "artist", "album_id": "album",
+            "hist_lp_item_ids": "hist_lp_item", "hist_lp_artist_ids": "hist_lp_artist",
+            "hist_lp_album_ids": "hist_lp_album", "hist_like_item_ids": "hist_like_item",
+            "hist_like_artist_ids": "hist_like_artist", "hist_like_album_ids": "hist_like_album",
+            "hist_skip_item_ids": "hist_skip_item", "hist_skip_artist_ids": "hist_skip_artist",
+            "hist_skip_album_ids": "hist_skip_album",
+        },
+    )
+    full_config.train.loss_weights = {"listen_plus": 1.0}
+    return DLRMBaseline(full_config, device=torch.device("cpu"), meta_device=True)
 
 
 def _make_batch(B, device):
@@ -75,6 +105,7 @@ def _make_batch(B, device):
     return batch
 
 
+@pytest.mark.parametrize("sharding_strategy", ["auto", "table_wise", "row_wise", "data_parallel"])
 def test_dmp_dlrm(rank, world_size, device, sharding_strategy):
     """Test DLRMBaseline wrapped with DMP for a given sharding strategy."""
     model = _build_model(device)

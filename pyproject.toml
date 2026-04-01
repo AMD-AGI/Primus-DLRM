@@ -24,3 +24,6 @@ dev = [
 
 [tool.setuptools.packages.find]
 include = ["primus_dlrm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

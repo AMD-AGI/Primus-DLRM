@@ -78,12 +78,23 @@ class FeatureConfig:
     scalar_features: list[str] = field(default_factory=list)
     dense_features: list[DenseFeatureSpec] = field(default_factory=list)
 
+    # The scalar feature representing the user ID. Used by contrastive loss
+    # to separate user-side vs item-side features. When empty, defaults to
+    # the first entry in scalar_features.
+    user_id_feature: str = ""
+
     def all_ec_feature_names(self) -> list[str]:
         """All EC feature names in deterministic order (scalars first)."""
         names = list(self.scalar_features)
         for feats in self.sequence_groups.values():
             names.extend(feats)
         return names
+
+    @property
+    def item_scalar_features(self) -> list[str]:
+        """Scalar features excluding the user ID (for contrastive item repr)."""
+        uid = self.user_id_feature or (self.scalar_features[0] if self.scalar_features else "")
+        return [f for f in self.scalar_features if f != uid]
 
 
 @dataclass

@@ -308,11 +308,12 @@ class OneTransModel(BaseModel):
             for task in self.tasks
         })
 
-        # Contrastive heads (uses scalar features for item representation)
-        n_scalar = len(fc.scalar_features)
+        # Contrastive heads: item representation uses only item-side scalars
+        # (excludes user_id_feature) to avoid leaking user identity
+        self._item_scalar_features = fc.item_scalar_features
         self.contrastive_user_proj = nn.Linear(ot.d_model, ot.d_model, device=device)
         self.contrastive_item_proj = nn.Sequential(
-            nn.Linear(n_scalar * D, ot.d_model, device=device),
+            nn.Linear(len(self._item_scalar_features) * D, ot.d_model, device=device),
             nn.ReLU(inplace=True),
         )
 
@@ -459,7 +460,7 @@ class OneTransModel(BaseModel):
         preds = {task: head(h).squeeze(-1) for task, head in self.heads.items()}
 
         user_emb = self.contrastive_user_proj(s_repr)
-        item_raw = torch.cat([embs[f] for f in self.config.feature.scalar_features], dim=-1)
+        item_raw = torch.cat([embs[f] for f in self._item_scalar_features], dim=-1)
         item_emb = self.contrastive_item_proj(item_raw)
 
         cross_scores = user_emb @ item_emb.T

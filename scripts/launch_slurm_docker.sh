@@ -94,7 +94,6 @@ cat > "$SBATCH_SCRIPT" << SBATCH_EOF
 #SBATCH --partition=$PARTITION
 #SBATCH --nodes=$NNODES
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=$GPUS
 #SBATCH --cpus-per-task=32
 #SBATCH --time=$TIME
 #SBATCH --output=$LOG_DIR/slurm_%j.out

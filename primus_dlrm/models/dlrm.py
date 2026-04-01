@@ -213,9 +213,11 @@ class DLRMBaseline(BaseModel):
         user_features = self._user_tower(embs, batch)
         item_features = self._item_tower(embs, batch)
 
+        item_cross_parts = self._get_cross_features(batch, item_features)
+
         interaction_out = self.interaction(
             user_features=[user_features],
-            item_features=self._get_cross_features(batch, item_features),
+            item_features=item_cross_parts,
         )
         preds = {t: h(interaction_out).squeeze(-1) for t, h in self.heads.items()}
 
@@ -224,6 +226,11 @@ class DLRMBaseline(BaseModel):
         item_exp = item_features.unsqueeze(0).expand(B, B, -1)
 
         cross_item_feats = [item_exp.reshape(B * B, -1)]
+        for extra in item_cross_parts[1:]:
+            D = extra.shape[-1]
+            cross_item_feats.append(
+                torch.zeros(B * B, D, device=extra.device, dtype=extra.dtype)
+            )
         task = cross_task or self.tasks[0]
         cross_interaction = self.interaction(
             user_features=[user_exp.reshape(B * B, -1)],
