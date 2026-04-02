@@ -65,7 +65,7 @@ class SyntheticDataset(Dataset):
         feat_to_key = self.config.feature_to_batch_key()
         sample: dict[str, torch.Tensor] = {}
 
-        for feat in fc.scalar_features:
+        for feat in fc.scalar_feature_names:
             vocab = self._table_sizes[feat]
             key = feat_to_key.get(feat, feat)
             sample[key] = torch.randint(0, vocab, (1,), generator=rng).squeeze(0)
@@ -216,7 +216,7 @@ def generate_batch(
     L = config.data.history_length
     use_var_len = sparse_len_min > 0 or sparse_len_max > 0
 
-    for feat in fc.scalar_features:
+    for feat in fc.scalar_feature_names:
         id_max = sparse_id_max if sparse_id_max > 0 else table_sizes[feat]
         key = feat_to_key.get(feat, feat)
         batch[key] = torch.randint(sparse_id_min, id_max, (B,), generator=rng)

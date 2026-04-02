@@ -71,30 +71,98 @@ class EmbeddingTableConfig:
     embedding_dim: int = 0
     pooling: str = "none"
 
+# Tower routing constants (shared by ScalarFeatureSpec and DenseFeatureSpec)
+TOWER_BOTH = "both"
+TOWER_USER = "user"
+TOWER_ITEM = "item"
+
+
+@dataclass
+class ScalarFeatureSpec:
+    """One scalar (embedding) feature with tower routing.
+
+    DLRM uses ``tower`` to route scalars to user or item towers.
+    OneTrans ignores ``tower`` (all scalars go to the NS tokenizer).
+
+    In YAML, scalar_features accepts both formats:
+      scalar_features: [uid, item, artist, album]          # plain strings
+      scalar_features:                                      # explicit specs
+        - { name: uid, tower: user }
+        - { name: item, tower: item }
+    """
+    name: str = ""
+    tower: str = TOWER_BOTH
+
+    def in_user_tower(self) -> bool:
+        return self.tower in (TOWER_USER, TOWER_BOTH)
+
+    def in_item_tower(self) -> bool:
+        return self.tower in (TOWER_ITEM, TOWER_BOTH)
+
+@dataclass
+class DenseFeatureSpec:
+    """One dense (non-embedding) feature.
+
+    When ``project`` is True, the feature is projected to ``embedding_dim``
+    via a learned Linear+GELU before concatenation into NS tokens.  When
+    False, the raw values are concatenated directly (lower parameter count,
+    but contributes ``dim`` instead of ``embedding_dim`` to the NS input).
+
+    The ``tower`` field controls which DLRM tower receives this feature:
+      "both" (default) — included in both user and item towers
+      "user" — user tower only
+      "item" — item tower only
+    OneTrans ignores this field (all dense features go to the NS tokenizer).
+    """
+    name: str = ""
+    dim: int = 0
+    value_range_min: float = 0.0
+    value_range_max: float = 1.0
+    project: bool = True
+    activation: str = "gelu"
+    tower: str = TOWER_BOTH
+
+    def in_user_tower(self) -> bool:
+        return self.tower in (TOWER_USER, TOWER_BOTH)
+
+    def in_item_tower(self) -> bool:
+        return self.tower in (TOWER_ITEM, TOWER_BOTH)
+
+
 @dataclass
 class FeatureConfig:
     """Feature definitions: what features exist and how they are grouped."""
     sequence_groups: dict[str, list[str]] = field(default_factory=dict)
-    scalar_features: list[str] = field(default_factory=list)
+    scalar_features: list[ScalarFeatureSpec] = field(default_factory=list)
     dense_features: list[DenseFeatureSpec] = field(default_factory=list)
 
-    # The scalar feature representing the user ID. Used by contrastive loss
-    # to separate user-side vs item-side features. When empty, defaults to
-    # the first entry in scalar_features.
-    user_id_feature: str = ""
+    def __post_init__(self):
+        self.scalar_features = [
+            ScalarFeatureSpec(name=s) if isinstance(s, str) else s
+            for s in self.scalar_features
+        ]
+
+    @property
+    def scalar_feature_names(self) -> list[str]:
+        """All scalar feature names in config order."""
+        return [sf.name for sf in self.scalar_features]
+
+    @property
+    def user_scalar_features(self) -> list[ScalarFeatureSpec]:
+        """Scalar features routed to the user tower."""
+        return [sf for sf in self.scalar_features if sf.in_user_tower()]
+
+    @property
+    def item_scalar_features(self) -> list[ScalarFeatureSpec]:
+        """Scalar features routed to the item tower."""
+        return [sf for sf in self.scalar_features if sf.in_item_tower()]
 
     def all_ec_feature_names(self) -> list[str]:
         """All EC feature names in deterministic order (scalars first)."""
-        names = list(self.scalar_features)
+        names = list(self.scalar_feature_names)
         for feats in self.sequence_groups.values():
             names.extend(feats)
         return names
-
-    @property
-    def item_scalar_features(self) -> list[str]:
-        """Scalar features excluding the user ID (for contrastive item repr)."""
-        uid = self.user_id_feature or (self.scalar_features[0] if self.scalar_features else "")
-        return [f for f in self.scalar_features if f != uid]
 
 
 @dataclass
@@ -110,23 +178,6 @@ class SchemaConfig:
 # ---------------------------------------------------------------------------
 # Synthetic data configuration
 # ---------------------------------------------------------------------------
-
-@dataclass
-class DenseFeatureSpec:
-    """One dense (non-embedding) feature.
-
-    When ``project`` is True, the feature is projected to ``embedding_dim``
-    via a learned Linear+GELU before concatenation into NS tokens.  When
-    False, the raw values are concatenated directly (lower parameter count,
-    but contributes ``dim`` instead of ``embedding_dim`` to the NS input).
-    """
-    name: str = ""
-    dim: int = 0
-    value_range_min: float = 0.0
-    value_range_max: float = 1.0
-    project: bool = True
-    activation: str = "gelu"
-
 
 @dataclass
 class SyntheticDataConfig:
@@ -441,7 +492,7 @@ def _from_dict(dc_cls: type, raw: dict[str, Any]) -> Any:
             DistributedConfig, EmbeddingShardingConfig,
             FeatureConfig, SchemaConfig, EmbeddingTableConfig,
             SyntheticDataConfig,
-            DenseFeatureSpec,
+            DenseFeatureSpec, ScalarFeatureSpec,
         ):
             _DC_REGISTRY[cls.__name__] = cls
     kwargs = {}

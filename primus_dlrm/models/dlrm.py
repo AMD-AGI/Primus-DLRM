@@ -52,7 +52,7 @@ class DLRMBaseline(BaseModel):
             mc.resolved_embedding_tables(),
             device=emb_device,
             embedding_init=mc.embedding_init,
-            scalar_feature_names=set(fc.scalar_features),
+            scalar_feature_names=set(fc.scalar_feature_names),
         )
 
         self.dense_projs = nn.ModuleDict()
@@ -64,9 +64,11 @@ class DLRMBaseline(BaseModel):
                 )
 
         n_seq_features = sum(len(f) for f in fc.sequence_groups.values())
-        n_raw_dense = sum(df.dim for df in fc.dense_features if not df.project)
+        n_user_raw = sum(df.dim for df in fc.dense_features
+                         if not df.project and df.in_user_tower())
 
-        user_feature_dim = D + n_seq_features * D + n_raw_dense
+        n_user_scalars = len(fc.user_scalar_features)
+        user_feature_dim = n_user_scalars * D + n_seq_features * D + n_user_raw
         if mc.bottom_mlp_dims:
             self.user_bottom_mlp = _make_mlp(
                 [user_feature_dim] + mc.bottom_mlp_dims, mc.dropout,
@@ -76,9 +78,11 @@ class DLRMBaseline(BaseModel):
             self.user_bottom_mlp = nn.Identity()
             user_out_dim = user_feature_dim
 
-        n_item_scalars = len(fc.scalar_features) - 1
+        n_item_scalars = len(fc.item_scalar_features)
         n_proj_dense = sum(1 for df in fc.dense_features if df.project)
-        item_feature_dim = (n_item_scalars + n_proj_dense) * D + n_raw_dense
+        n_item_raw = sum(df.dim for df in fc.dense_features
+                         if not df.project and df.in_item_tower())
+        item_feature_dim = (n_item_scalars + n_proj_dense) * D + n_item_raw
         if mc.bottom_mlp_dims:
             self.item_bottom_mlp = _make_mlp(
                 [item_feature_dim] + mc.bottom_mlp_dims, mc.dropout,
@@ -122,7 +126,7 @@ class DLRMBaseline(BaseModel):
 
     def _lookup_pipeline(self, batch: dict) -> dict[str, torch.Tensor]:
         """Embedding lookup via pre-built KJT (pipeline mode)."""
-        first_ec = self.config.feature.scalar_features[0]
+        first_ec = self.config.feature.scalar_feature_names[0]
         first_key = self.config.feature_to_batch_key().get(first_ec, first_ec)
         B = batch[first_key].shape[0]
 
@@ -153,26 +157,26 @@ class DLRMBaseline(BaseModel):
     def _user_tower(
         self, embs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        """User tower: first scalar + all pooled sequences + raw dense."""
-        parts = [embs[self.config.feature.scalar_features[0]]]
+        """User tower: user scalars + all pooled sequences + raw dense."""
+        parts = [embs[sf.name] for sf in self.config.feature.user_scalar_features]
         for group_feats in self.config.feature.sequence_groups.values():
             for feat in group_feats:
                 parts.append(embs[feat])
         for df in self.config.feature.dense_features:
-            if not df.project:
+            if not df.project and df.in_user_tower():
                 parts.append(batch[df.name])
         return self.user_bottom_mlp(torch.cat(parts, dim=-1))
 
     def _item_tower(
         self, embs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        """Item tower: remaining scalars + projected dense + raw dense."""
-        parts = [embs[f] for f in self.config.feature.scalar_features[1:]]
+        """Item tower: item scalars + projected dense + raw dense."""
+        parts = [embs[sf.name] for sf in self.config.feature.item_scalar_features]
         for df in self.config.feature.dense_features:
             if df.project:
                 parts.append(self.dense_projs[df.name](batch[df.name]))
         for df in self.config.feature.dense_features:
-            if not df.project:
+            if not df.project and df.in_item_tower():
                 parts.append(batch[df.name])
         return self.item_bottom_mlp(torch.cat(parts, dim=-1))
 

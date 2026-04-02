@@ -261,7 +261,7 @@ class OneTransModel(BaseModel):
             mc.resolved_embedding_tables(),
             device=emb_device,
             embedding_init=mc.embedding_init,
-            scalar_feature_names=set(fc.scalar_features),
+            scalar_feature_names=set(fc.scalar_feature_names),
         )
 
         # Per-group sequential tokenizers
@@ -274,7 +274,7 @@ class OneTransModel(BaseModel):
 
         # Dense feature projections (project=True → Linear+activation, else raw concat)
         self.dense_projs = nn.ModuleDict()
-        ns_raw_dim = len(fc.scalar_features) * D
+        ns_raw_dim = len(fc.scalar_feature_names) * D
         for df in fc.dense_features:
             if df.project:
                 act: nn.Module = nn.ReLU(inplace=True) if df.activation == "relu" else nn.GELU()
@@ -310,10 +310,10 @@ class OneTransModel(BaseModel):
 
         # Contrastive heads: item representation uses only item-side scalars
         # (excludes user_id_feature) to avoid leaking user identity
-        self._item_scalar_features = fc.item_scalar_features
+        self._item_scalar_names = [sf.name for sf in fc.item_scalar_features]
         self.contrastive_user_proj = nn.Linear(ot.d_model, ot.d_model, device=device)
         self.contrastive_item_proj = nn.Sequential(
-            nn.Linear(len(self._item_scalar_features) * D, ot.d_model, device=device),
+            nn.Linear(len(self._item_scalar_names) * D, ot.d_model, device=device),
             nn.ReLU(inplace=True),
         )
 
@@ -338,7 +338,7 @@ class OneTransModel(BaseModel):
         TrainPipelineSparseDist can pipeline the embedding all-to-all.
         """
         ec_out = self.emb.ec(batch["unpooled_kjt"])
-        first_ec_feat = self.config.feature.scalar_features[0]
+        first_ec_feat = self.config.feature.scalar_feature_names[0]
         first_batch_key = self.config.feature_to_batch_key().get(first_ec_feat, first_ec_feat)
         B = batch[first_batch_key].shape[0]
         embs: dict[str, Tensor] = {}
@@ -367,7 +367,7 @@ class OneTransModel(BaseModel):
         self, embs: dict[str, Tensor], batch: dict[str, Tensor],
     ) -> Tensor:
         """Build NS raw vector: scalar embeddings + dense features."""
-        parts = [embs[f] for f in self.config.feature.scalar_features]
+        parts = [embs[f] for f in self.config.feature.scalar_feature_names]
         for df in self.config.feature.dense_features:
             if df.name in self.dense_projs:
                 parts.append(self.dense_projs[df.name](batch[df.name]))
@@ -389,7 +389,7 @@ class OneTransModel(BaseModel):
                 only, no candidate item info -- used for contrastive loss).
         """
         ot = self.config.model.onetrans
-        first_ec = self.config.feature.scalar_features[0]
+        first_ec = self.config.feature.scalar_feature_names[0]
         first_key = self.config.feature_to_batch_key().get(first_ec, first_ec)
         B = batch[first_key].shape[0]
         L_NS = ot.n_ns_tokens
@@ -460,7 +460,7 @@ class OneTransModel(BaseModel):
         preds = {task: head(h).squeeze(-1) for task, head in self.heads.items()}
 
         user_emb = self.contrastive_user_proj(s_repr)
-        item_raw = torch.cat([embs[f] for f in self._item_scalar_features], dim=-1)
+        item_raw = torch.cat([embs[f] for f in self._item_scalar_names], dim=-1)
         item_emb = self.contrastive_item_proj(item_raw)
 
         cross_scores = user_emb @ item_emb.T

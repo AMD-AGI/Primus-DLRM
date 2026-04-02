@@ -16,8 +16,8 @@ feature:
   scalar_features: [uid, item, artist, album]
   dense_features:
     - { name: audio_embed, dim: 128, project: true, activation: gelu }
-    - { name: user_counters, dim: 6, project: false }
-    - { name: item_counters, dim: 6, project: false }
+    - { name: user_counters, dim: 6, project: false, tower: user }
+    - { name: item_counters, dim: 6, project: false, tower: item }
     - { name: cross_counters, dim: 18, project: true, activation: relu }
 
 model:
