@@ -78,7 +78,7 @@ def _build_model(device):
         },
     )
     full_config.train.loss_weights = {"listen_plus": 1.0}
-    return DLRMBaseline(full_config, device=torch.device("cpu"), meta_device=True)
+    return DLRMBaseline(full_config, device=torch.device("cpu"), meta_device=True), full_config
 
 
 def _make_batch(B, device):
@@ -108,9 +108,10 @@ def _make_batch(B, device):
 @pytest.mark.parametrize("sharding_strategy", ["auto", "table_wise", "row_wise", "data_parallel"])
 def test_dmp_dlrm(rank, world_size, device, sharding_strategy):
     """Test DLRMBaseline wrapped with DMP for a given sharding strategy."""
-    model = _build_model(device)
-    wrapped = wrap_model(model, device, dense_strategy="dmp",
-                         embedding_sharding=sharding_strategy)
+    model, config = _build_model(device)
+    config.distributed.dense_strategy = "dmp"
+    config.distributed.embedding_sharding.strategy = sharding_strategy
+    wrapped = wrap_model(model, device, config)
 
     assert is_dmp(wrapped), "Model should be DMP-wrapped"
 
@@ -133,9 +134,10 @@ def test_dmp_optimizer_step(rank, world_size, device):
     """Full train step: forward + backward + optimizer step with DMP."""
     from torch.optim import AdamW
 
-    model = _build_model(device)
-    wrapped = wrap_model(model, device, dense_strategy="dmp",
-                         embedding_sharding="auto")
+    model, config = _build_model(device)
+    config.distributed.dense_strategy = "dmp"
+    config.distributed.embedding_sharding.strategy = "auto"
+    wrapped = wrap_model(model, device, config)
 
     dense_params = [
         p for n, p in wrapped.named_parameters()

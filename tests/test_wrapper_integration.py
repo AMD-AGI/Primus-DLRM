@@ -69,8 +69,11 @@ def main():
             print(f"\n[TEST] wrap_model dmp, strategy={strategy}", flush=True)
 
         test_model = ToyDLRM()
-        wrapped = wrap_model(test_model, device, dense_strategy="dmp",
-                             embedding_sharding=strategy)
+        from primus_dlrm.config import Config
+        dummy_config = Config()
+        dummy_config.distributed.dense_strategy = "dmp"
+        dummy_config.distributed.embedding_sharding.strategy = strategy
+        wrapped = wrap_model(test_model, device, dummy_config)
 
         B, L = 4, 5
         batch = {

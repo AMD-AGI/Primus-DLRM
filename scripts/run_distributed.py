@@ -46,7 +46,7 @@ from primus_dlrm.distributed.wrapper import wrap_model
 from primus_dlrm.evaluation.metrics import evaluate_ranking, evaluate_ranking_peruser
 from primus_dlrm.models.dlrm import DLRMBaseline
 from primus_dlrm.training.dist_trainer import DistributedTrainer
-from primus_dlrm.training.runtime import configure_runtime
+from primus_dlrm.training.runtime import apply_cli_overrides, configure_runtime
 from primus_dlrm.models.onetrans import OneTransModel
 
 
@@ -232,6 +232,7 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
 
     config = Config.load(args.config)
+    apply_cli_overrides(config, args)
     configure_runtime(config.train)
     torch.manual_seed(config.train.seed + rank)
 
@@ -283,17 +284,9 @@ def main():
         logger.info(f"Model: {num_params:,} params (dense), wrapping with {strategy_label} "
                     f"for {world_size} GPUs...")
 
-    logger.info(f"Calling wrap_model with {args.dense_strategy} on rank {rank}")
-    model = wrap_model(
-        model, device,
-        dense_strategy=args.dense_strategy,
-        embedding_sharding=args.embedding_sharding,
-        embedding_lr=config.train.embedding_lr,
-        embedding_weight_decay=config.train.weight_decay,
-        embedding_optimizer=config.train.embedding_optimizer,
-        embedding_eps=config.train.embedding_eps,
-    )
-    logger.info(f"Model wrapped with {args.dense_strategy} on rank {rank}")
+    logger.info(f"Calling wrap_model with {config.distributed.dense_strategy} on rank {rank}")
+    model = wrap_model(model, device, config)
+    logger.info(f"Model wrapped with {config.distributed.dense_strategy} on rank {rank}")
 
     # Eval function (rank 0 only, unless skipped; always skipped for synthetic)
     eval_fn = None

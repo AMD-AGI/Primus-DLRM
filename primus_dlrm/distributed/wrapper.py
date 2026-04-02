@@ -25,31 +25,32 @@ logger = logging.getLogger(__name__)
 def wrap_model(
     model: nn.Module,
     device: torch.device,
-    dense_strategy: Literal["ddp", "fsdp", "dmp"] = "ddp",
-    embedding_sharding: str = "auto",
-    embedding_lr: float = 1e-2,
-    embedding_weight_decay: float = 1e-5,
-    embedding_optimizer: str = "adam",
-    embedding_eps: float = 1e-8,
+    config,
 ) -> nn.Module:
     """Wrap a model for distributed training.
+
+    All settings are read from ``config``:
+    - ``config.distributed.dense_strategy``: ``"ddp"`` | ``"fsdp"`` | ``"dmp"``
+    - ``config.distributed.embedding_sharding.strategy``: DMP sharding strategy
+    - ``config.train``: embedding optimizer settings (lr, eps, etc.)
+
+    Call ``apply_cli_overrides(config, args)`` before this to merge CLI flags.
 
     Args:
         model: Model to wrap. For DMP, embedding modules must be on meta device.
         device: CUDA device for this rank.
-        dense_strategy:
-            ``"ddp"``  -- Full model replication via DDP (default).
-            ``"fsdp"`` -- Full model sharding via FSDP (stress test).
-            ``"dmp"``  -- TorchRec DMP for embedding sharding + DDP for dense.
-        embedding_sharding: Sharding strategy for DMP. One of
-            ``"auto"``, ``"table_wise"``, ``"row_wise"``, ``"data_parallel"``.
-            Only used when ``dense_strategy="dmp"``.
-        embedding_lr: Learning rate for the fused TBE embedding optimizer (DMP only).
-        embedding_weight_decay: Weight decay for the fused TBE embedding optimizer.
+        config: Config object (use ``apply_cli_overrides`` to merge CLI args first).
 
     Returns:
         Wrapped model ready for distributed training.
     """
+    dense_strategy = config.distributed.dense_strategy
+    embedding_sharding = config.distributed.embedding_sharding.strategy
+    tc = config.train
+    embedding_lr = tc.embedding_lr
+    embedding_weight_decay = tc.weight_decay
+    embedding_optimizer = tc.embedding_optimizer
+    embedding_eps = tc.embedding_eps
     world_size = get_world_size()
 
     if world_size <= 1 and dense_strategy != "dmp":
