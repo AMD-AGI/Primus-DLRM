@@ -47,17 +47,18 @@ def main():
     )
 
     logger.info("Building model...")
-    num_users = int(train_dataset.store.unique_uids.max()) + 1
-    active_tasks = [k for k, v in config.train.loss_weights.items() if v > 0]
-    model = DLRMBaseline(
-        config=config.model, num_users=num_users, num_items=train_dataset.num_items,
-        num_artists=train_dataset.num_artists, num_albums=train_dataset.num_albums,
-        audio_input_dim=train_dataset.audio_dim, device=device, tasks=active_tasks,
-    )
+    if config.model.model_type == "onetrans":
+        from primus_dlrm.models.onetrans import OneTransModel
+        model = OneTransModel(config=config, device=device)
+    else:
+        model = DLRMBaseline(config=config, device=device)
     logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     optimizer = AdamW(model.parameters(), lr=config.train.lr, weight_decay=config.train.weight_decay)
-    loss_fn = MultiTaskLoss(weights=config.train.loss_weights)
+    loss_fn = MultiTaskLoss(
+        weights=config.train.loss_weights,
+        regression_tasks=config.train.regression_tasks,
+    )
 
     # --- Train ---
     logger.info(f"Training for {args.max_steps} steps...")

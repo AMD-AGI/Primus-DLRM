@@ -316,7 +316,10 @@ class DistributedTrainer:
             self.optimizer, [warmup, cosine], milestones=[tc.warmup_steps],
         )
 
-        self.loss_fn = MultiTaskLoss(weights=tc.loss_weights)
+        self.loss_fn = MultiTaskLoss(
+            weights=tc.loss_weights,
+            regression_tasks=tc.regression_tasks,
+        )
 
         self.use_amp = tc.bf16
         self.scaler = torch.amp.GradScaler(enabled=tc.bf16)

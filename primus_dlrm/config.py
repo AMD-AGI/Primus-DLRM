@@ -356,10 +356,13 @@ class TrainConfig:
 
     # Per-task loss weights.  Task names are defined by the YAML config
     # (e.g. "listen_plus", "like", "task0").  BCE loss is used by default;
-    # tasks named "listen_pct" or "played_ratio" use MSE.
+    # tasks listed in regression_tasks use MSE instead.
     loss_weights: dict[str, float] = field(default_factory=lambda: {
         "task0": 1.0,
     })
+
+    # Tasks that use MSE loss instead of BCE. All other tasks use BCE.
+    regression_tasks: list[str] = field(default_factory=list)
 
     # Dense optimizer: "adamw" or "shampoo"
     # Shampoo is a 2nd-order optimizer that uses matrix preconditioning
