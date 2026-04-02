@@ -13,7 +13,11 @@ feature:
     hist_lp: [hist_lp_item, hist_lp_artist, hist_lp_album]
     hist_like: [hist_like_item, hist_like_artist, hist_like_album]
     hist_skip: [hist_skip_item, hist_skip_artist, hist_skip_album]
-  scalar_features: [uid, item, artist, album]
+  scalar_features:
+    - { name: uid, tower: user }
+    - { name: item, tower: item }
+    - { name: artist, tower: item }
+    - { name: album, tower: item }
   dense_features:
     - { name: audio_embed, dim: 128, project: true, activation: gelu }
     - { name: user_counters, dim: 6, project: false, tower: user }

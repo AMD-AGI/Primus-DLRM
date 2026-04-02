@@ -71,14 +71,32 @@ class EmbeddingTableConfig:
     embedding_dim: int = 0
     pooling: str = "none"
 
-# Tower routing constants (shared by ScalarFeatureSpec and DenseFeatureSpec)
-TOWER_BOTH = "both"
+# Tower routing constants (DLRM only; OneTrans ignores tower)
 TOWER_USER = "user"
 TOWER_ITEM = "item"
 
 
+class TowerRoutingMixin:
+    """Shared tower routing for DLRM feature specs.
+
+    The ``tower`` field controls which DLRM tower receives this feature:
+      "" (default) — included in both towers
+      "user" — user tower only
+      "item" — item tower only
+    OneTrans ignores this field.
+    """
+    tower: str = ""
+
+    def in_user_tower(self) -> bool:
+        return self.tower == TOWER_USER
+
+
+    def in_item_tower(self) -> bool:
+        return self.tower == TOWER_ITEM
+
+
 @dataclass
-class ScalarFeatureSpec:
+class ScalarFeatureSpec(TowerRoutingMixin):
     """One scalar (embedding) feature with tower routing.
 
     DLRM uses ``tower`` to route scalars to user or item towers.
@@ -91,28 +109,16 @@ class ScalarFeatureSpec:
         - { name: item, tower: item }
     """
     name: str = ""
-    tower: str = TOWER_BOTH
 
-    def in_user_tower(self) -> bool:
-        return self.tower in (TOWER_USER, TOWER_BOTH)
-
-    def in_item_tower(self) -> bool:
-        return self.tower in (TOWER_ITEM, TOWER_BOTH)
 
 @dataclass
-class DenseFeatureSpec:
+class DenseFeatureSpec(TowerRoutingMixin):
     """One dense (non-embedding) feature.
 
     When ``project`` is True, the feature is projected to ``embedding_dim``
     via a learned Linear+GELU before concatenation into NS tokens.  When
     False, the raw values are concatenated directly (lower parameter count,
     but contributes ``dim`` instead of ``embedding_dim`` to the NS input).
-
-    The ``tower`` field controls which DLRM tower receives this feature:
-      "both" (default) — included in both user and item towers
-      "user" — user tower only
-      "item" — item tower only
-    OneTrans ignores this field (all dense features go to the NS tokenizer).
     """
     name: str = ""
     dim: int = 0
@@ -120,13 +126,6 @@ class DenseFeatureSpec:
     value_range_max: float = 1.0
     project: bool = True
     activation: str = "gelu"
-    tower: str = TOWER_BOTH
-
-    def in_user_tower(self) -> bool:
-        return self.tower in (TOWER_USER, TOWER_BOTH)
-
-    def in_item_tower(self) -> bool:
-        return self.tower in (TOWER_ITEM, TOWER_BOTH)
 
 
 @dataclass
