@@ -18,6 +18,12 @@ from primus_dlrm.config import Config
 from primus_dlrm.models.base import BaseModel
 from primus_dlrm.models.embedding import TorchRecEmbeddings
 
+try:
+    from primus_turbo.pytorch.ops import flash_attn_func as _turbo_flash_attn
+    _HAS_TURBO_ATTN = True
+except ImportError:
+    _HAS_TURBO_ATTN = False
+
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -63,12 +69,14 @@ class MixedAttention(nn.Module):
     """Multi-head attention with shared S-token projections and
     batched token-specific NS-token projections."""
 
-    def __init__(self, d_model: int, n_heads: int, n_ns_tokens: int, dropout: float = 0.0):
+    def __init__(self, d_model: int, n_heads: int, n_ns_tokens: int,
+                 dropout: float = 0.0, attention_impl: str = "sdpa"):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
         self.n_ns = n_ns_tokens
+        self.attention_impl = attention_impl
 
         self.s_qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.ns_qkv_weight = nn.Parameter(torch.empty(n_ns_tokens, 3 * d_model, d_model))
@@ -95,20 +103,35 @@ class MixedAttention(nn.Module):
         ns_qkv = ns_qkv.reshape(B, self.n_ns, 3, self.n_heads, self.d_head)
         ns_q, ns_k, ns_v = ns_qkv.unbind(2)
 
-        q = torch.cat([s_q, ns_q], dim=1).transpose(1, 2)
-        k = torch.cat([s_k, ns_k], dim=1).transpose(1, 2)
-        v = torch.cat([s_v, ns_v], dim=1).transpose(1, 2)
+        # Q/K/V in BSHD: [B, seq, n_heads, d_head]
+        q = torch.cat([s_q, ns_q], dim=1)
+        k = torch.cat([s_k, ns_k], dim=1)
+        v = torch.cat([s_v, ns_v], dim=1)
 
         if mask is not None:
             q_len = mask.shape[0]
             if q_len < T:
-                q = q[:, :, T - q_len:]
+                q = q[:, T - q_len:]
 
-        attn_mask = mask.unsqueeze(0).unsqueeze(0) if mask is not None else None
         drop_p = self.attn_drop if self.training else 0.0
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop_p)
 
-        out = out.transpose(1, 2).reshape(B, out.shape[2], self.d_model)
+        if self.attention_impl == "turbo":
+            if not _HAS_TURBO_ATTN:
+                raise RuntimeError(
+                    "attention_impl='turbo' requires primus_turbo package. "
+                    "Install it or set attention_impl='sdpa' in config."
+                )
+            out = _turbo_flash_attn(q, k, v, causal=True, dropout_p=drop_p)
+        else:
+            q_t = q.transpose(1, 2)
+            k_t = k.transpose(1, 2)
+            v_t = v.transpose(1, 2)
+            attn_mask = mask.unsqueeze(0).unsqueeze(0) if mask is not None else None
+            out = F.scaled_dot_product_attention(
+                q_t, k_t, v_t, attn_mask=attn_mask, dropout_p=drop_p,
+            ).transpose(1, 2)
+
+        out = out.reshape(B, out.shape[1], self.d_model)
         return self.out_proj(out)
 
 
@@ -151,10 +174,12 @@ class OneTransBlock(nn.Module):
     """Pre-norm causal Transformer block with mixed parameterization."""
 
     def __init__(self, d_model: int, n_heads: int, n_ns_tokens: int,
-                 ffn_mult: int = 4, dropout: float = 0.0):
+                 ffn_mult: int = 4, dropout: float = 0.0,
+                 attention_impl: str = "sdpa"):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
-        self.attn = MixedAttention(d_model, n_heads, n_ns_tokens, dropout)
+        self.attn = MixedAttention(d_model, n_heads, n_ns_tokens, dropout,
+                                   attention_impl=attention_impl)
         self.norm2 = RMSNorm(d_model)
         self.ffn = MixedFFN(d_model, d_model * ffn_mult, n_ns_tokens, dropout)
 
@@ -248,7 +273,7 @@ class OneTransModel(BaseModel):
         self.config = config
         mc = config.model
         fc = config.feature
-        ot = mc.onetrans
+        ot = mc.transformer
 
         if device is None:
             device = torch.device("cpu")
@@ -291,7 +316,8 @@ class OneTransModel(BaseModel):
 
         # Transformer stack
         self.blocks = nn.ModuleList([
-            OneTransBlock(ot.d_model, ot.n_heads, ot.n_ns_tokens, ot.ffn_mult, ot.dropout)
+            OneTransBlock(ot.d_model, ot.n_heads, ot.n_ns_tokens, ot.ffn_mult, ot.dropout,
+                         attention_impl=ot.attention_impl)
             for _ in range(ot.n_layers)
         ]).to(device)
         self.final_norm = RMSNorm(ot.d_model).to(device)
@@ -388,7 +414,7 @@ class OneTransModel(BaseModel):
         s_repr: [B, d_model] mean-pooled S-token representation (user history
                 only, no candidate item info -- used for contrastive loss).
         """
-        ot = self.config.model.onetrans
+        ot = self.config.model.transformer
         first_ec = self.config.feature.scalar_feature_names[0]
         first_key = self.config.feature_to_batch_key().get(first_ec, first_ec)
         B = batch[first_key].shape[0]

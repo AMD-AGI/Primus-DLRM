@@ -2,7 +2,7 @@
 import torch
 import pytest
 
-from primus_dlrm.config import Config, DenseFeatureSpec, FeatureConfig, ModelConfig, OneTransConfig, SchemaConfig, EmbeddingTableConfig
+from primus_dlrm.config import Config, DenseFeatureSpec, FeatureConfig, ModelConfig, TransformerConfig, SchemaConfig, EmbeddingTableConfig
 from primus_dlrm.models.dlrm import DLRMBaseline
 from primus_dlrm.models.onetrans import OneTransModel, pyramid_schedule
 from primus_dlrm.training.losses import MultiTaskLoss
@@ -263,11 +263,11 @@ def test_forward_multi_window_counters():
 # ---------------------------------------------------------------------------
 
 def _onetrans_config(**overrides):
-    ot_kw = {k: overrides.pop(k) for k in list(overrides) if k in OneTransConfig.__dataclass_fields__}
+    ot_kw = {k: overrides.pop(k) for k in list(overrides) if k in TransformerConfig.__dataclass_fields__}
     return ModelConfig(
         model_type="onetrans", embedding_dim=16,
-        onetrans=OneTransConfig(d_model=32, n_heads=2, n_layers=2, ffn_mult=2,
-                                n_ns_tokens=4, **ot_kw),
+        transformer=TransformerConfig(d_model=32, n_heads=2, n_layers=2, ffn_mult=2,
+                                      n_ns_tokens=4, **ot_kw),
         **overrides,
     )
 
