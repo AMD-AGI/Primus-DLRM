@@ -238,6 +238,7 @@ class TransformerConfig:
 
     # Attention implementation:
     #   "sdpa"  — PyTorch scaled_dot_product_attention (default, works everywhere)
+    #   "flash" — flash_attn library (requires flash_attn package)
     #   "turbo" — Primus-Turbo flash attention (requires primus_turbo package)
     attention_impl: str = "sdpa"
 
@@ -360,6 +361,9 @@ class TrainConfig:
     # Directory for checkpoints and results
     checkpoint_dir: str = "results"
     save_checkpoint: bool = True
+
+    # Whether to save checkpoints at end of each epoch
+    save_checkpoint: bool = False
 
     # Random seed for reproducibility
     seed: int = 42

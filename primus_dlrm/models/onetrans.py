@@ -24,6 +24,12 @@ try:
 except ImportError:
     _HAS_TURBO_ATTN = False
 
+try:
+    from flash_attn import flash_attn_func as _flash_attn
+    _HAS_FLASH_ATTN = True
+except ImportError:
+    _HAS_FLASH_ATTN = False
+
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -122,6 +128,13 @@ class MixedAttention(nn.Module):
                     "Install it or set attention_impl='sdpa' in config."
                 )
             out = _turbo_flash_attn(q, k, v, causal=True, dropout_p=drop_p)
+        elif self.attention_impl == "flash":
+            if not _HAS_FLASH_ATTN:
+                raise RuntimeError(
+                    "attention_impl='flash' requires flash_attn package. "
+                    "Install it or set attention_impl='sdpa' in config."
+                )
+            out = _flash_attn(q, k, v, causal=True, dropout_p=drop_p)
         else:
             q_t = q.transpose(1, 2)
             k_t = k.transpose(1, 2)
