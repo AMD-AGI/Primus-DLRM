@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from primus_dlrm.config import Config
-from primus_dlrm.data.dataset import YambdaTrainDataset, YambdaEvalDataset, collate_scoring_pairs
+from primus_dlrm.data.dataset import YambdaTrainDataset, YambdaEvalDataset, collate_to_dict
 from primus_dlrm.evaluation.metrics import evaluate_ranking
 from primus_dlrm.training.runtime import configure_runtime
 from primus_dlrm.training.trainer import Trainer
@@ -23,21 +23,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def build_model(config, num_users, num_items, num_artists, num_albums, audio_input_dim, device):
+def build_model(config, device):
     if config.model.model_type == "onetrans":
         from primus_dlrm.models.onetrans import OneTransModel
-        return OneTransModel(
-            config=config.model, num_users=num_users, num_items=num_items,
-            num_artists=num_artists, num_albums=num_albums,
-            audio_input_dim=audio_input_dim, device=device,
-        )
+        return OneTransModel(config=config, device=device)
     else:
         from primus_dlrm.models.dlrm import DLRMBaseline
-        return DLRMBaseline(
-            config=config.model, num_users=num_users, num_items=num_items,
-            num_artists=num_artists, num_albums=num_albums,
-            audio_input_dim=audio_input_dim, device=device,
-        )
+        return DLRMBaseline(config=config, device=device)
 
 
 def main():
@@ -62,7 +54,7 @@ def main():
         batch_size=config.train.batch_size,
         shuffle=True,
         num_workers=config.data.num_workers,
-        collate_fn=collate_scoring_pairs,
+        collate_fn=collate_to_dict,
         pin_memory=True,
         drop_last=True,
     )
@@ -71,15 +63,7 @@ def main():
     eval_dataset = YambdaEvalDataset(config.data, processed_dir)
 
     logger.info(f"Building model (type={config.model.model_type})...")
-    num_users = int(train_dataset.store.unique_uids.max()) + 1
-    model = build_model(
-        config, num_users=num_users,
-        num_items=train_dataset.num_items,
-        num_artists=train_dataset.num_artists,
-        num_albums=train_dataset.num_albums,
-        audio_input_dim=train_dataset.audio_dim,
-        device=device,
-    )
+    model = build_model(config, device=device)
     num_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model parameters: {num_params:,}")
 

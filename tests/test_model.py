@@ -2,10 +2,66 @@
 import torch
 import pytest
 
-from primus_dlrm.config import ModelConfig, OneTransConfig
+from primus_dlrm.config import Config, DenseFeatureSpec, FeatureConfig, ModelConfig, OneTransConfig, SchemaConfig, EmbeddingTableConfig
 from primus_dlrm.models.dlrm import DLRMBaseline
 from primus_dlrm.models.onetrans import OneTransModel, pyramid_schedule
 from primus_dlrm.training.losses import MultiTaskLoss
+
+
+_YAMBDA_EMBEDDING_TABLES = [
+    EmbeddingTableConfig("item", ["item", "hist_lp_item", "hist_like_item", "hist_skip_item"], num_embeddings=100),
+    EmbeddingTableConfig("artist", ["artist", "hist_lp_artist", "hist_like_artist", "hist_skip_artist"], num_embeddings=50),
+    EmbeddingTableConfig("album", ["album", "hist_lp_album", "hist_like_album", "hist_skip_album"], num_embeddings=30),
+    EmbeddingTableConfig("uid", ["uid"], num_embeddings=200),
+]
+
+_DLRM_EMBEDDING_TABLES = [
+    EmbeddingTableConfig("hist_item", ["hist_lp_item", "hist_like_item", "hist_skip_item"], num_embeddings=100, pooling="mean"),
+    EmbeddingTableConfig("item", ["item"], num_embeddings=100),
+    EmbeddingTableConfig("hist_artist", ["hist_lp_artist", "hist_like_artist", "hist_skip_artist"], num_embeddings=50, pooling="mean"),
+    EmbeddingTableConfig("artist", ["artist"], num_embeddings=50),
+    EmbeddingTableConfig("hist_album", ["hist_lp_album", "hist_like_album", "hist_skip_album"], num_embeddings=30, pooling="mean"),
+    EmbeddingTableConfig("album", ["album"], num_embeddings=30),
+    EmbeddingTableConfig("uid", ["uid"], num_embeddings=200),
+]
+
+
+_YAMBDA_SCHEMA = SchemaConfig(
+    batch_to_feature={
+        "item_id": "item", "artist_id": "artist", "album_id": "album",
+        "hist_lp_item_ids": "hist_lp_item", "hist_lp_artist_ids": "hist_lp_artist",
+        "hist_lp_album_ids": "hist_lp_album", "hist_like_item_ids": "hist_like_item",
+        "hist_like_artist_ids": "hist_like_artist", "hist_like_album_ids": "hist_like_album",
+        "hist_skip_item_ids": "hist_skip_item", "hist_skip_artist_ids": "hist_skip_artist",
+        "hist_skip_album_ids": "hist_skip_album",
+    },
+    kjt_feature_order=[
+        "item", "artist", "album",
+        "hist_lp_item", "hist_like_item", "hist_skip_item",
+        "hist_lp_artist", "hist_like_artist", "hist_skip_artist",
+        "hist_lp_album", "hist_like_album", "hist_skip_album",
+        "uid",
+    ],
+)
+
+
+def _yambda_feature_config(audio_dim=32, enable_counters=False, counter_windows=None):
+    """Build a FeatureConfig matching the Yambda layout for tests."""
+    dense = [DenseFeatureSpec("audio_embed", audio_dim, project=True, activation="gelu")]
+    if enable_counters and counter_windows:
+        W = len(counter_windows)
+        dense.append(DenseFeatureSpec("user_counters", 3 * W, project=False))
+        dense.append(DenseFeatureSpec("item_counters", 3 * W, project=False))
+        dense.append(DenseFeatureSpec("cross_counters", 9 * W, project=True, activation="relu"))
+    return FeatureConfig(
+        sequence_groups={
+            "hist_lp": ["hist_lp_item", "hist_lp_artist", "hist_lp_album"],
+            "hist_like": ["hist_like_item", "hist_like_artist", "hist_like_album"],
+            "hist_skip": ["hist_skip_item", "hist_skip_artist", "hist_skip_album"],
+        },
+        scalar_features=["uid", "item", "artist", "album"],
+        dense_features=dense,
+    )
 
 
 def _make_dummy_batch(batch_size: int = 4, hist_len: int = 10, device: str = "cpu",
@@ -38,10 +94,29 @@ def _make_dummy_batch(batch_size: int = 4, hist_len: int = 10, device: str = "cp
     return batch
 
 
-def test_forward_cpu():
-    config = ModelConfig(embedding_dim=16, top_mlp_dims=[32, 16], bottom_mlp_dims=[32], audio_embed_dim=32)
-    model = DLRMBaseline(config, num_users=200, num_items=100, num_artists=50, num_albums=30, audio_input_dim=32)
+def _build_dlrm(model_config=None, device="cpu", tasks=None, num_counter_windows=0):
+    """Build a DLRMBaseline from a full Config, matching the Yambda layout."""
+    if tasks is None:
+        tasks = ["listen_plus"]
+    model_config = model_config or ModelConfig(
+        embedding_dim=16, top_mlp_dims=[32, 16], bottom_mlp_dims=[32],
+    )
+    model_config.embedding_tables = list(_DLRM_EMBEDDING_TABLES)
+    counter_days = list(range(1, num_counter_windows + 1)) if num_counter_windows > 0 else []
+    full_config = Config()
+    full_config.model = model_config
+    full_config.feature = _yambda_feature_config(
+        audio_dim=32,
+        enable_counters=num_counter_windows > 0,
+        counter_windows=counter_days if num_counter_windows > 0 else None,
+    )
+    full_config.data.schema = _YAMBDA_SCHEMA
+    full_config.train.loss_weights = {t: 1.0 for t in tasks}
+    return DLRMBaseline(full_config, device=torch.device(device))
 
+
+def test_forward_cpu():
+    model = _build_dlrm()
     batch = _make_dummy_batch()
     out = model(batch)
 
@@ -50,9 +125,8 @@ def test_forward_cpu():
 
 
 def test_forward_multi_task():
-    config = ModelConfig(embedding_dim=16, top_mlp_dims=[32, 16], bottom_mlp_dims=[32], audio_embed_dim=32)
     tasks = ["listen_plus", "like", "dislike", "listen_pct"]
-    model = DLRMBaseline(config, num_users=200, num_items=100, num_artists=50, num_albums=30, audio_input_dim=32, tasks=tasks)
+    model = _build_dlrm(tasks=tasks)
 
     batch = _make_dummy_batch()
     out = model(batch)
@@ -63,13 +137,12 @@ def test_forward_multi_task():
 
 
 def test_backward_cpu():
-    config = ModelConfig(embedding_dim=16, top_mlp_dims=[32, 16], bottom_mlp_dims=[32], audio_embed_dim=32)
-    model = DLRMBaseline(config, num_users=200, num_items=100, num_artists=50, num_albums=30, audio_input_dim=32)
+    model = _build_dlrm()
 
     batch = _make_dummy_batch()
     out = model(batch)
 
-    loss_fn = MultiTaskLoss()
+    loss_fn = MultiTaskLoss(weights={"listen_plus": 1.0})
     labels = {"listen_plus": batch["listen_plus"]}
     total_loss, task_losses = loss_fn(out, labels)
 
@@ -81,10 +154,9 @@ def test_backward_cpu():
 
 
 def test_backward_multi_task():
-    config = ModelConfig(embedding_dim=16, top_mlp_dims=[32, 16], bottom_mlp_dims=[32], audio_embed_dim=32)
     tasks = ["listen_plus", "like", "dislike", "listen_pct"]
     weights = {"listen_plus": 1.0, "like": 0.5, "dislike": 0.5, "listen_pct": 0.1}
-    model = DLRMBaseline(config, num_users=200, num_items=100, num_artists=50, num_albums=30, audio_input_dim=32, tasks=tasks)
+    model = _build_dlrm(tasks=tasks)
 
     batch = _make_dummy_batch()
     out = model(batch)
@@ -100,9 +172,7 @@ def test_backward_multi_task():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No GPU")
 def test_forward_gpu():
-    config = ModelConfig(embedding_dim=16, top_mlp_dims=[32, 16], bottom_mlp_dims=[32], audio_embed_dim=32)
-    device = torch.device("cuda:0")
-    model = DLRMBaseline(config, num_users=200, num_items=100, num_artists=50, num_albums=30, audio_input_dim=32, device=device)
+    model = _build_dlrm(device="cuda:0")
 
     batch = _make_dummy_batch(device="cuda:0")
     out = model(batch)
@@ -113,10 +183,8 @@ def test_forward_gpu():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No GPU")
 def test_backward_gpu_bf16():
-    config = ModelConfig(embedding_dim=16, top_mlp_dims=[32, 16], bottom_mlp_dims=[32], audio_embed_dim=32)
-    device = torch.device("cuda:0")
     tasks = ["listen_plus", "like"]
-    model = DLRMBaseline(config, num_users=200, num_items=100, num_artists=50, num_albums=30, audio_input_dim=32, device=device, tasks=tasks)
+    model = _build_dlrm(device="cuda:0", tasks=tasks)
 
     batch = _make_dummy_batch(device="cuda:0")
 
@@ -133,12 +201,11 @@ def test_backward_gpu_bf16():
 def test_interaction_types():
     """Test all three interaction types produce valid output."""
     for itype in ["concat_mlp", "dcnv2"]:
-        config = ModelConfig(
-            embedding_dim=16,
+        mc = ModelConfig(
             top_mlp_dims=[32, 16], bottom_mlp_dims=[32],
-            interaction_type=itype, audio_embed_dim=32,
+            interaction_type=itype,
         )
-        model = DLRMBaseline(config, num_users=200, num_items=100, num_artists=50, num_albums=30, audio_input_dim=32)
+        model = _build_dlrm(model_config=mc)
         batch = _make_dummy_batch()
         out = model(batch)
         assert out["listen_plus"].shape == (4,)
@@ -147,11 +214,7 @@ def test_interaction_types():
 
 
 def test_forward_with_counters():
-    config = ModelConfig(embedding_dim=16, top_mlp_dims=[32, 16], bottom_mlp_dims=[32], audio_embed_dim=32)
-    model = DLRMBaseline(
-        config, num_users=200, num_items=100, num_artists=50, num_albums=30,
-        audio_input_dim=32, num_counter_windows=1,
-    )
+    model = _build_dlrm(num_counter_windows=1)
     batch = _make_dummy_batch(num_counter_windows=1)
     out = model(batch)
     assert "listen_plus" in out
@@ -159,15 +222,11 @@ def test_forward_with_counters():
 
 
 def test_backward_with_counters():
-    config = ModelConfig(embedding_dim=16, top_mlp_dims=[32, 16], bottom_mlp_dims=[32], audio_embed_dim=32)
-    model = DLRMBaseline(
-        config, num_users=200, num_items=100, num_artists=50, num_albums=30,
-        audio_input_dim=32, num_counter_windows=1,
-    )
+    model = _build_dlrm(num_counter_windows=1)
     batch = _make_dummy_batch(num_counter_windows=1)
     out = model(batch)
 
-    loss_fn = MultiTaskLoss()
+    loss_fn = MultiTaskLoss(weights={"listen_plus": 1.0})
     labels = {"listen_plus": batch["listen_plus"]}
     total_loss, _ = loss_fn(out, labels)
     total_loss.backward()
@@ -178,11 +237,7 @@ def test_backward_with_counters():
 
 
 def test_forward_cross_with_counters():
-    config = ModelConfig(embedding_dim=16, top_mlp_dims=[32, 16], bottom_mlp_dims=[32], audio_embed_dim=32)
-    model = DLRMBaseline(
-        config, num_users=200, num_items=100, num_artists=50, num_albums=30,
-        audio_input_dim=32, num_counter_windows=2,
-    )
+    model = _build_dlrm(num_counter_windows=2)
     batch = _make_dummy_batch(num_counter_windows=2)
     preds, cross_scores = model.forward_with_cross_scores(batch)
 
@@ -192,11 +247,7 @@ def test_forward_cross_with_counters():
 
 
 def test_forward_multi_window_counters():
-    config = ModelConfig(embedding_dim=16, top_mlp_dims=[32, 16], bottom_mlp_dims=[32], audio_embed_dim=32)
-    model = DLRMBaseline(
-        config, num_users=200, num_items=100, num_artists=50, num_albums=30,
-        audio_input_dim=32, num_counter_windows=3,
-    )
+    model = _build_dlrm(num_counter_windows=3)
     batch = _make_dummy_batch(num_counter_windows=3)
     out = model(batch)
     assert out["listen_plus"].shape == (4,)
@@ -210,18 +261,28 @@ def test_forward_multi_window_counters():
 def _onetrans_config(**overrides):
     ot_kw = {k: overrides.pop(k) for k in list(overrides) if k in OneTransConfig.__dataclass_fields__}
     return ModelConfig(
-        model_type="onetrans", embedding_dim=16, audio_embed_dim=32,
+        model_type="onetrans", embedding_dim=16,
         onetrans=OneTransConfig(d_model=32, n_heads=2, n_layers=2, ffn_mult=2,
                                 n_ns_tokens=4, **ot_kw),
         **overrides,
     )
 
 
-def _build_onetrans(config=None, device="cpu", tasks=None, num_counter_windows=0):
-    config = config or _onetrans_config()
-    return OneTransModel(config, num_users=200, num_items=100, num_artists=50,
-                         num_albums=30, audio_input_dim=32, device=torch.device(device),
-                         tasks=tasks, num_counter_windows=num_counter_windows)
+def _build_onetrans(model_config=None, device="cpu", tasks=None, num_counter_windows=0):
+    model_config = model_config or _onetrans_config()
+    model_config.embedding_tables = list(_YAMBDA_EMBEDDING_TABLES)
+    counter_days = list(range(1, num_counter_windows + 1)) if num_counter_windows > 0 else []
+    full_config = Config()
+    full_config.model = model_config
+    full_config.feature = _yambda_feature_config(
+        audio_dim=32,
+        enable_counters=num_counter_windows > 0,
+        counter_windows=counter_days if num_counter_windows > 0 else None,
+    )
+    full_config.data.schema = _YAMBDA_SCHEMA
+    if tasks:
+        full_config.train.loss_weights = {t: 1.0 for t in tasks}
+    return OneTransModel(full_config, device=torch.device(device))
 
 
 def test_onetrans_forward_cpu():
@@ -311,14 +372,11 @@ def test_onetrans_forward_cross_with_counters():
 
 def test_dot_interaction_with_counters():
     """DotInteraction should handle variable feature dims from cross_proj."""
-    config = ModelConfig(
-        embedding_dim=16, top_mlp_dims=[32, 16], bottom_mlp_dims=[32],
-        interaction_type="dot", audio_embed_dim=32,
+    mc = ModelConfig(
+        top_mlp_dims=[32, 16], bottom_mlp_dims=[32],
+        interaction_type="dot",
     )
-    model = DLRMBaseline(
-        config, num_users=200, num_items=100, num_artists=50, num_albums=30,
-        audio_input_dim=32, num_counter_windows=1,
-    )
+    model = _build_dlrm(model_config=mc, num_counter_windows=1)
     batch = _make_dummy_batch(num_counter_windows=1)
     out = model(batch)
     assert out["listen_plus"].shape == (4,)

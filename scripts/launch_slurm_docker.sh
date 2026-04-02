@@ -42,6 +42,8 @@ NCCL_IF=""
 SKIP_EVAL=""
 TRACE=""
 TRACE_STEPS=""
+TRACE_WARMUP=5
+TRACE_ACTIVE=10
 PIPELINE=""
 USE_AINIC=""
 NODELIST=""
@@ -65,6 +67,8 @@ while [[ $# -gt 0 ]]; do
         --skip-eval)      SKIP_EVAL="--skip-eval"; shift;;
         --trace)          TRACE="--trace"; shift;;
         --trace-steps)    TRACE_STEPS="$2"; shift 2;;
+        --trace-warmup)   TRACE_WARMUP="$2"; shift 2;;
+        --trace-active)   TRACE_ACTIVE="$2"; shift 2;;
         --pipeline)       PIPELINE="--pipeline"; shift;;
         --ainic)          USE_AINIC=1; shift;;
         --nodelist)       NODELIST="$2"; shift 2;;
@@ -79,8 +83,16 @@ if [[ -z "$CONFIG" ]]; then
     exit 1
 fi
 
+# Pre-create output dirs and set permissions before Docker launch.
+# NFS root_squash maps container root to nobody, so dirs must be
+# world-writable and train.log must be pre-created for the
+# FileHandler inside the container to open it.
 LOG_DIR="$PROJECT_DIR/$RESULTS_DIR/$RUN_NAME/logs"
-mkdir -p "$LOG_DIR"
+CHECKPOINT_DIR="$PROJECT_DIR/$RESULTS_DIR/$RUN_NAME/checkpoints"
+mkdir -p "$LOG_DIR" "$CHECKPOINT_DIR"
+touch "$LOG_DIR/train.log"
+chmod 666 "$LOG_DIR/train.log"
+chmod 777 "$LOG_DIR" "$CHECKPOINT_DIR"
 
 SBATCH_SCRIPT=$(mktemp /tmp/dlrm_docker_sbatch_XXXXXX.sh)
 
@@ -90,7 +102,6 @@ cat > "$SBATCH_SCRIPT" << SBATCH_EOF
 #SBATCH --partition=$PARTITION
 #SBATCH --nodes=$NNODES
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=$GPUS
 #SBATCH --cpus-per-task=32
 #SBATCH --time=$TIME
 #SBATCH --output=$LOG_DIR/slurm_%j.out
@@ -257,6 +268,8 @@ srun --kill-on-bad-exit=1 --export=ALL bash -c '
                 --run-name \"$RUN_NAME\" \
                 --results-dir \"$RESULTS_DIR\" \
                 --trace-steps \"$TRACE_STEPS\" \
+                --trace-warmup $TRACE_WARMUP \
+                --trace-active $TRACE_ACTIVE \
                 $SKIP_EVAL $TRACE $PIPELINE
         "
 '

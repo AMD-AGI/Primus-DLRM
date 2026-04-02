@@ -454,6 +454,16 @@ class YambdaTrainDataset(Dataset):
 
         self.num_items = len(self.item_popularity)
 
+    @property
+    def vocab_sizes(self) -> list[int]:
+        """Vocab sizes in schema table order (item, artist, album, uid)."""
+        return [
+            self.num_items,
+            self.num_artists,
+            self.num_albums,
+            int(self.store.unique_uids.max()) + 1,
+        ]
+
     def _build_sample_positions(self) -> None:
         """Build flat array of valid training positions."""
         L = self.config.history_length
@@ -799,7 +809,7 @@ class YambdaEvalDataset(Dataset):
         }
 
 
-def collate_scoring_pairs(batch: list[ScoringPair]) -> dict[str, torch.Tensor]:
+def collate_to_dict(batch: list[ScoringPair]) -> dict[str, torch.Tensor]:
     """Collate ScoringPairs into batched tensors."""
     result = {
         "hist_lp_item_ids": torch.stack([b.hist_lp_item_ids for b in batch]),

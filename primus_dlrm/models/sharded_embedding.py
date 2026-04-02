@@ -20,7 +20,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch import Tensor
 
-from primus_dlrm.models.embedding import TableSpec
+from primus_dlrm.config import EmbeddingTableConfig
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ class ShardedEmbeddingCollection(nn.Module):
 
     def __init__(
         self,
-        table_specs: list[TableSpec],
+        table_specs: list[EmbeddingTableConfig],
         shard_configs: dict[str, ShardConfig],
         pg: dist.ProcessGroup | None = None,
         device: torch.device | None = None,
@@ -116,12 +116,12 @@ class ShardedEmbeddingCollection(nn.Module):
         self._shard_configs: dict[str, ShardConfig] = shard_configs
 
         self.local_embeddings = nn.ModuleDict()
-        self._table_specs: dict[str, TableSpec] = {}
+        self._table_specs: dict[str, EmbeddingTableConfig] = {}
         self._local_num_rows: dict[str, int] = {}
 
         for spec in table_specs:
             self._table_specs[spec.name] = spec
-            for feat in spec.feature_names:
+            for feat in spec.features:
                 self._feature_to_table[feat] = spec.name
                 self._feature_dims[feat] = spec.embedding_dim
             self._table_pooling[spec.name] = spec.pooling
@@ -304,7 +304,7 @@ class ShardedEmbeddingCollection(nn.Module):
 
 
 def assign_sharding(
-    table_specs: list[TableSpec],
+    table_specs: list[EmbeddingTableConfig],
     world_size: int,
     strategy: str = "auto",
 ) -> dict[str, ShardConfig]:

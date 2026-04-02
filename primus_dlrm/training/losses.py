@@ -9,23 +9,24 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
-CLASSIFICATION_TASKS = {"listen_plus", "like", "dislike"}
-REGRESSION_TASKS = {"listen_pct"}
-
 
 class MultiTaskLoss(nn.Module):
     """Weighted combination of per-task losses.
 
     Active tasks and their weights are driven by the weights dict.
-    Classification tasks (listen_plus, like, dislike) use BCE with logits.
-    Regression tasks (listen_pct) use MSE.
+    Tasks in ``regression_tasks`` use MSE loss; all others use BCE with logits.
     """
 
-    def __init__(self, weights: dict[str, float] | None = None):
+    def __init__(
+        self,
+        weights: dict[str, float] | None = None,
+        regression_tasks: list[str] | None = None,
+    ):
         super().__init__()
         if weights is None:
-            weights = {"listen_plus": 1.0}
+            weights = {"task0": 1.0}
         self.weights = {k: v for k, v in weights.items() if v > 0}
+        self._regression_tasks: set[str] = set(regression_tasks or [])
 
     def forward(
         self,
@@ -38,12 +39,12 @@ class MultiTaskLoss(nn.Module):
         for task, weight in self.weights.items():
             if task not in predictions or task not in labels:
                 continue
-            if task in CLASSIFICATION_TASKS:
+            if task in self._regression_tasks:
+                task_losses[task] = F.mse_loss(predictions[task], labels[task])
+            else:
                 task_losses[task] = F.binary_cross_entropy_with_logits(
                     predictions[task], labels[task]
                 )
-            elif task in REGRESSION_TASKS:
-                task_losses[task] = F.mse_loss(predictions[task], labels[task])
 
         total = sum(self.weights[k] * v for k, v in task_losses.items())
         return total, task_losses

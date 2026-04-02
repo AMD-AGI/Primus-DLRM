@@ -1,12 +1,19 @@
+# Synthetic version of bench_onetrans_v6.yaml.
+# Matches real Yambda 50M embedding table sizes, feature layout, and model.
+
 data:
-  dataset_size: "50m"
   history_length: 20
   history_mode: "last_l"
   num_workers: 4
   enable_counters: true
   counter_windows_days: [7, 30]
-  data_dir: "data"
   schema: schemas/yambda.yaml
+  synthetic:
+    enabled: true
+    seed: 42
+    num_samples: -1
+    num_prebatched: 16
+    label_positive_rate: 0.3
 
 model:
   model_type: "onetrans"
@@ -38,7 +45,6 @@ feature:
     - { name: user_counters, dim: 6, project: false }
     - { name: item_counters, dim: 6, project: false }
     - { name: cross_counters, dim: 18, project: true, activation: relu }
-
 
 train:
   batch_size: 32768

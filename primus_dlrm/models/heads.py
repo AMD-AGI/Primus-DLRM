@@ -11,7 +11,7 @@ class MultiTaskHead(nn.Module):
     def __init__(self, input_dim: int, tasks: list[str] | None = None):
         super().__init__()
         if tasks is None:
-            tasks = ["listen_plus", "like", "dislike", "played_ratio"]
+            tasks = ["task0"]
         self.tasks = tasks
         self.heads = nn.ModuleDict({
             task: nn.Linear(input_dim, 1) for task in tasks

@@ -14,9 +14,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from primus_dlrm.config import ModelConfig
+from primus_dlrm.config import Config
 from primus_dlrm.models.base import BaseModel
-from primus_dlrm.models.embedding import TableSpec, TorchRecEmbeddings
+from primus_dlrm.models.embedding import TorchRecEmbeddings
 
 
 # ---------------------------------------------------------------------------
@@ -217,97 +217,73 @@ class AutoSplitTokenizer(nn.Module):
         return self.proj(ns_features).view(-1, self.n_ns_tokens, self.d_model)
 
 
-# ---------------------------------------------------------------------------
-# Table specs
-# ---------------------------------------------------------------------------
-
-def _onetrans_table_specs(
-    num_users: int, num_items: int, num_artists: int, num_albums: int,
-    embedding_dim: int,
-) -> list[TableSpec]:
-    """Table specs for OneTrans: all unpooled, shared tables for hist + candidate."""
-    return [
-        TableSpec("item", num_items, embedding_dim, "none",
-                  ["item", "hist_lp_item", "hist_like_item", "hist_skip_item"]),
-        TableSpec("artist", num_artists, embedding_dim, "none",
-                  ["artist", "hist_lp_artist", "hist_like_artist", "hist_skip_artist"]),
-        TableSpec("album", num_albums, embedding_dim, "none",
-                  ["album", "hist_lp_album", "hist_like_album", "hist_skip_album"]),
-        TableSpec("uid", num_users, embedding_dim, "none", ["uid"]),
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Full model
-# ---------------------------------------------------------------------------
-
 class OneTransModel(BaseModel):
-    """OneTrans: unified Transformer for ranking.
+    """OneTrans: schema-driven Transformer for ranking.
 
-    Uses split-history pools with per-behavior MLP tokenizers.
-    All categorical embeddings backed by TorchRec EmbeddingCollection.
+    All architecture decisions are driven by ``Config``:
+
+    - **Embedding tables**: from ``config.model.embedding_tables``
+    - **Sequence groups**: from ``config.feature.sequence_groups`` — each group gets
+      its own ``SequentialTokenizer``
+    - **Scalar features**: from ``config.feature.scalar_features`` — concatenated
+      into the NS-token input
+    - **Dense features**: from ``config.feature.dense_features`` — projected to D
+      (``project=True``, activation from ``df.activation``) or concatenated
+      raw (``project=False``)
+    - **Task heads**: from ``config.task_names``
 
     Pipeline mode (``_pipeline_mode=True``): forward() passes a pre-built KJT
     directly to ``emb.ec``, giving FX a traceable getitem→call_module path so
     TrainPipelineSparseDist can pipeline the embedding all-to-all.
     """
 
-    BEHAVIOR_POOLS = ("hist_lp", "hist_like", "hist_skip")
-
     def __init__(
         self,
-        config: ModelConfig,
-        num_users: int,
-        num_items: int,
-        num_artists: int,
-        num_albums: int,
-        audio_input_dim: int = 256,
+        config: Config,
         device: torch.device | None = None,
-        tasks: list[str] | None = None,
-        num_counter_windows: int = 0,
         meta_device: bool = False,
     ):
         super().__init__()
         self._pipeline_mode = False
         self.config = config
-        self.tasks = tasks or ["listen_plus"]
-        self.num_counter_windows = num_counter_windows
-        ot = config.onetrans
-        D = config.embedding_dim
+        mc = config.model
+        fc = config.feature
+        ot = mc.onetrans
 
         if device is None:
             device = torch.device("cpu")
-
         emb_device = torch.device("meta") if meta_device else device
+        self.tasks = list(config.task_names)
+        D = mc.embedding_dim
+
+        # Embeddings
         self.emb = TorchRecEmbeddings(
-            _onetrans_table_specs(num_users, num_items, num_artists, num_albums, D),
+            mc.resolved_embedding_tables(),
             device=emb_device,
-            embedding_init=config.embedding_init,
+            embedding_init=mc.embedding_init,
+            scalar_feature_names=set(fc.scalar_feature_names),
         )
 
-        self.audio_proj = nn.Sequential(
-            nn.Linear(audio_input_dim, D, device=device),
-            nn.GELU(),
-        )
-
-        # Per-behavior sequential tokenizers (separate MLPs, shared embeddings)
-        s_raw_dim = 3 * D  # item + artist + album per position
+        # Per-group sequential tokenizers
         self.seq_tokenizers = nn.ModuleDict({
-            pool: SequentialTokenizer(
-                s_raw_dim, ot.d_model, max_len=2048, use_pos_embed=ot.pos_embed,
+            group_name: SequentialTokenizer(
+                len(feats) * D, ot.d_model, max_len=2048, use_pos_embed=ot.pos_embed,
             ).to(device)
-            for pool in self.BEHAVIOR_POOLS
+            for group_name, feats in fc.sequence_groups.items()
         })
 
-        # NS-token tokenizer: base features + optional counters
-        ns_raw_dim = 5 * D
-        if num_counter_windows > 0:
-            W = num_counter_windows
-            self.cross_proj = nn.Sequential(
-                nn.Linear(9 * W, D, device=device),
-                nn.ReLU(inplace=True),
-            )
-            ns_raw_dim += 3 * W + 3 * W + D
+        # Dense feature projections (project=True → Linear+activation, else raw concat)
+        self.dense_projs = nn.ModuleDict()
+        ns_raw_dim = len(fc.scalar_feature_names) * D
+        for df in fc.dense_features:
+            if df.project:
+                act: nn.Module = nn.ReLU(inplace=True) if df.activation == "relu" else nn.GELU()
+                self.dense_projs[df.name] = nn.Sequential(
+                    nn.Linear(df.dim, D, device=device), act,
+                )
+                ns_raw_dim += D
+            else:
+                ns_raw_dim += df.dim
 
         self.ns_tokenizer = AutoSplitTokenizer(
             ns_raw_dim, ot.d_model, ot.n_ns_tokens,
@@ -320,7 +296,7 @@ class OneTransModel(BaseModel):
         ]).to(device)
         self.final_norm = RMSNorm(ot.d_model).to(device)
 
-        # Head bridge: concat NS-tokens -> projection -> task heads
+        # Head bridge
         head_input_dim = ot.n_ns_tokens * ot.d_model
         self.head_proj = nn.Sequential(
             nn.Linear(head_input_dim, ot.d_model, device=device),
@@ -332,10 +308,12 @@ class OneTransModel(BaseModel):
             for task in self.tasks
         })
 
-        # Lightweight contrastive head
+        # Contrastive heads: item representation uses only item-side scalars
+        # (excludes user_id_feature) to avoid leaking user identity
+        self._item_scalar_names = [sf.name for sf in fc.item_scalar_features]
         self.contrastive_user_proj = nn.Linear(ot.d_model, ot.d_model, device=device)
         self.contrastive_item_proj = nn.Sequential(
-            nn.Linear(3 * D, ot.d_model, device=device),
+            nn.Linear(len(self._item_scalar_names) * D, ot.d_model, device=device),
             nn.ReLU(inplace=True),
         )
 
@@ -344,22 +322,14 @@ class OneTransModel(BaseModel):
     # ------------------------------------------------------------------
 
     def _lookup_all(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        """Single batched TorchRec lookup for all features."""
-        return self.emb({
-            "uid": batch["uid"],
-            "item": batch["item_id"],
-            "artist": batch["artist_id"],
-            "album": batch["album_id"],
-            "hist_lp_item": batch["hist_lp_item_ids"],
-            "hist_like_item": batch["hist_like_item_ids"],
-            "hist_skip_item": batch["hist_skip_item_ids"],
-            "hist_lp_artist": batch["hist_lp_artist_ids"],
-            "hist_like_artist": batch["hist_like_artist_ids"],
-            "hist_skip_artist": batch["hist_skip_artist_ids"],
-            "hist_lp_album": batch["hist_lp_album_ids"],
-            "hist_like_album": batch["hist_like_album_ids"],
-            "hist_skip_album": batch["hist_skip_album_ids"],
-        })
+        """Schema-driven TorchRec lookup: maps batch keys to EC feature names."""
+        feat_to_key = self.config.feature_to_batch_key()
+        lookup_dict = {}
+        for feat_name in self.config.feature.all_ec_feature_names():
+            batch_key = feat_to_key.get(feat_name, feat_name)
+            if batch_key in batch:
+                lookup_dict[feat_name] = batch[batch_key]
+        return self.emb(lookup_dict)
 
     def _lookup_pipeline(self, batch: dict) -> dict[str, Tensor]:
         """Embedding lookup via pre-built KJT (pipeline mode).
@@ -368,7 +338,9 @@ class OneTransModel(BaseModel):
         TrainPipelineSparseDist can pipeline the embedding all-to-all.
         """
         ec_out = self.emb.ec(batch["unpooled_kjt"])
-        B = batch["uid"].shape[0]
+        first_ec_feat = self.config.feature.scalar_feature_names[0]
+        first_batch_key = self.config.feature_to_batch_key().get(first_ec_feat, first_ec_feat)
+        B = batch[first_batch_key].shape[0]
         embs: dict[str, Tensor] = {}
         for feat in self.emb._unpooled_features:
             jt = ec_out[feat]
@@ -385,30 +357,22 @@ class OneTransModel(BaseModel):
     # ------------------------------------------------------------------
 
     def _build_pool_raw(
-        self, embs: dict[str, Tensor], prefix: str,
+        self, embs: dict[str, Tensor], group_name: str,
     ) -> Tensor:
-        """Build raw feature tensor for one behavior pool: [B, L, 3D]."""
-        return torch.cat([
-            embs[f"{prefix}_item"],
-            embs[f"{prefix}_artist"],
-            embs[f"{prefix}_album"],
-        ], dim=-1)
+        """Concatenate embeddings for one sequence group: [B, L, N*D]."""
+        feats = self.config.feature.sequence_groups[group_name]
+        return torch.cat([embs[f] for f in feats], dim=-1)
 
     def _build_ns_raw(
         self, embs: dict[str, Tensor], batch: dict[str, Tensor],
     ) -> Tensor:
-        """Build the NS raw feature vector, including optional counters."""
-        parts = [
-            embs["uid"],
-            embs["item"],
-            embs["artist"],
-            embs["album"],
-            self.audio_proj(batch["audio_embed"]),
-        ]
-        if self.num_counter_windows > 0:
-            parts.append(batch["user_counters"])
-            parts.append(batch["item_counters"])
-            parts.append(self.cross_proj(batch["cross_counters"]))
+        """Build NS raw vector: scalar embeddings + dense features."""
+        parts = [embs[f] for f in self.config.feature.scalar_feature_names]
+        for df in self.config.feature.dense_features:
+            if df.name in self.dense_projs:
+                parts.append(self.dense_projs[df.name](batch[df.name]))
+            else:
+                parts.append(batch[df.name])
         return torch.cat(parts, dim=-1)
 
     # ------------------------------------------------------------------
@@ -424,15 +388,17 @@ class OneTransModel(BaseModel):
         s_repr: [B, d_model] mean-pooled S-token representation (user history
                 only, no candidate item info -- used for contrastive loss).
         """
-        ot = self.config.onetrans
-        B = batch["uid"].shape[0]
+        ot = self.config.model.onetrans
+        first_ec = self.config.feature.scalar_feature_names[0]
+        first_key = self.config.feature_to_batch_key().get(first_ec, first_ec)
+        B = batch[first_key].shape[0]
         L_NS = ot.n_ns_tokens
 
-        # S-token construction: per-behavior tokenization
+        # S-token construction: per-group tokenization
         pool_tokens = []
-        for pool in self.BEHAVIOR_POOLS:
-            raw = self._build_pool_raw(embs, pool)
-            pool_tokens.append(self.seq_tokenizers[pool](raw))
+        for group_name in self.config.feature.sequence_groups:
+            raw = self._build_pool_raw(embs, group_name)
+            pool_tokens.append(self.seq_tokenizers[group_name](raw))
         s_tokens = torch.cat(pool_tokens, dim=1)
         L_S = s_tokens.shape[1]
 
@@ -487,17 +453,14 @@ class OneTransModel(BaseModel):
         return preds
 
     def forward_with_cross_scores(
-        self, batch: dict[str, Tensor], cross_task: str = "listen_plus",
+        self, batch: dict[str, Tensor], cross_task: str = "",
     ) -> tuple[dict[str, Tensor], Tensor]:
-        # See BaseModel.forward_with_cross_scores for why this is separate.
         embs = self._lookup_all(batch)
         h, s_repr = self._backbone(embs, batch)
         preds = {task: head(h).squeeze(-1) for task, head in self.heads.items()}
 
         user_emb = self.contrastive_user_proj(s_repr)
-        item_raw = torch.cat([
-            embs["item"], embs["artist"], embs["album"],
-        ], dim=-1)
+        item_raw = torch.cat([embs[f] for f in self._item_scalar_names], dim=-1)
         item_emb = self.contrastive_item_proj(item_raw)
 
         cross_scores = user_emb @ item_emb.T

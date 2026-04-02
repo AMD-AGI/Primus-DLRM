@@ -21,7 +21,7 @@ class BaseModel(nn.Module):
         ...
 
     def forward_with_cross_scores(
-        self, batch: dict[str, torch.Tensor], cross_task: str = "listen_plus",
+        self, batch: dict[str, torch.Tensor], cross_task: str = "",
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """Forward that also returns a [B,B] cross-batch contrastive score matrix.
 

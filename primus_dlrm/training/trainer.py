@@ -52,7 +52,10 @@ class Trainer:
         cosine = CosineAnnealingLR(self.optimizer, T_max=max(total_steps - tc.warmup_steps, 1))
         self.scheduler = SequentialLR(self.optimizer, [warmup, cosine], milestones=[tc.warmup_steps])
 
-        self.loss_fn = MultiTaskLoss(weights=tc.loss_weights)
+        self.loss_fn = MultiTaskLoss(
+            weights=tc.loss_weights,
+            regression_tasks=tc.regression_tasks,
+        )
         self.scaler = torch.amp.GradScaler(enabled=tc.bf16)
         self.use_amp = tc.bf16
 
