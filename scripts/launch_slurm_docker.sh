@@ -83,8 +83,16 @@ if [[ -z "$CONFIG" ]]; then
     exit 1
 fi
 
+# Pre-create output dirs and set permissions before Docker launch.
+# NFS root_squash maps container root to nobody, so dirs must be
+# world-writable and train.log must be pre-created for the
+# FileHandler inside the container to open it.
 LOG_DIR="$PROJECT_DIR/$RESULTS_DIR/$RUN_NAME/logs"
-mkdir -p "$LOG_DIR"
+CHECKPOINT_DIR="$PROJECT_DIR/$RESULTS_DIR/$RUN_NAME/checkpoints"
+mkdir -p "$LOG_DIR" "$CHECKPOINT_DIR"
+touch "$LOG_DIR/train.log"
+chmod 666 "$LOG_DIR/train.log"
+chmod 777 "$LOG_DIR" "$CHECKPOINT_DIR"
 
 SBATCH_SCRIPT=$(mktemp /tmp/dlrm_docker_sbatch_XXXXXX.sh)
 
