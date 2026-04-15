@@ -338,7 +338,12 @@ class DistributedTrainer:
 
     # -- Step generators ------------------------------------------------------
     def _dataloader_stats(self) -> str:
-        """Return dataloader queue depth and worker stats for monitoring."""
+        """Return dataloader queue depth and worker stats for monitoring.
+
+        Only works with PyTorch's multi-process DataLoader (real data path).
+        Returns empty string for synthetic data since it uses an
+        _InfiniteDataLoader wrapper without internal queue tracking.
+        """
         try:
             it = getattr(self._dataloader, '_iterator', None)
             if it is None:
