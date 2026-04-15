@@ -537,8 +537,7 @@ class DistributedTrainer:
                 num_batches += 1
 
                 if self.global_step % self.log_interval == 0:
-                    # All ranks participate in all_gather for max GPU memory
-                    max_mem_str = _gather_max_gpu_memory()
+                    max_mem_str = _gather_max_gpu_memory() if tc.log_max_gpu_memory else ""
 
                     if is_main_process():
                         current_time = time.time()

@@ -346,6 +346,10 @@ class TrainConfig:
     # Log training metrics every N steps
     log_interval: int = 100
 
+    # Log maximum GPU memory over all ranks via all_gather at each log_interval.
+    # Adds a collective sync, disable for perf runs.
+    log_max_gpu_memory: bool = False
+
     # Run evaluation every N epochs
     eval_interval: int = 1
 
