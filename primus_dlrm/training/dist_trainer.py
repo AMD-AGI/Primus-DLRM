@@ -413,10 +413,11 @@ class DistributedTrainer:
                 break
 
             if isinstance(task_losses, dict) and task_losses:
-                loss_val = sum(
-                    v.item() if isinstance(v, torch.Tensor) else v
+                loss_tensor = sum(
+                    v if isinstance(v, torch.Tensor) else torch.tensor(v, device=self.device)
                     for v in task_losses.values()
                 )
+                loss_val = loss_tensor.detach()
             else:
                 loss_val = 0.0
             yield loss_val, task_losses if isinstance(task_losses, dict) else {}
@@ -516,7 +517,7 @@ class DistributedTrainer:
                 sampler.set_epoch(epoch)
 
             self.model.train()
-            epoch_loss = 0.0
+            epoch_loss = torch.tensor(0.0, device=self.device)
             current_time = time.time()
             epoch_start = current_time
             window_start = current_time
@@ -533,10 +534,14 @@ class DistributedTrainer:
                 if self.tracer:
                     self.tracer.step()
 
-                epoch_loss += loss_val
+                if isinstance(loss_val, torch.Tensor):
+                    epoch_loss += loss_val.detach()
+                else:
+                    epoch_loss += loss_val
                 num_batches += 1
 
                 if self.global_step % self.log_interval == 0:
+                    loss_scalar = loss_val.item() if isinstance(loss_val, torch.Tensor) else loss_val
                     max_mem_str = _gather_max_gpu_memory() if tc.log_max_gpu_memory else ""
 
                     if is_main_process():
@@ -550,7 +555,7 @@ class DistributedTrainer:
                         dl_stats = self._dataloader_stats()
                         logger.info(
                             f"epoch={epoch} step={self.global_step} | "
-                            f"loss={loss_val:.4f} | lr={lr:.6f} | "
+                            f"loss={loss_scalar:.4f} | lr={lr:.6f} | "
                             f"global_throughput={throughput:.0f} samples/s | "
                             f"window_throughput={window_throughput:.0f} samples/s (over {self.log_interval} steps) | "
                             + " | ".join(
@@ -569,7 +574,7 @@ class DistributedTrainer:
                     break
 
             epoch_time = time.time() - epoch_start
-            avg_loss = epoch_loss / max(num_batches, 1)
+            avg_loss = (epoch_loss.item() if isinstance(epoch_loss, torch.Tensor) else epoch_loss) / max(num_batches, 1)
             throughput = num_batches * per_gpu_batch * get_world_size() / epoch_time
 
             if is_main_process():
