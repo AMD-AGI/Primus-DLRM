@@ -165,6 +165,8 @@ def _setup_synthetic(config, world_size, rank, pipeline):
         collate_fn=collate_fn,
         pin_memory=True,
         drop_last=True,
+        prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else None,
+        persistent_workers=config.data.num_workers > 0,
     )
 
     if dataset._infinite:
@@ -196,6 +198,8 @@ def _setup_real_data(config, processed_dir, world_size, rank, pipeline):
         collate_fn=collate_fn,
         pin_memory=True,
         drop_last=True,
+        prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else None,
+        persistent_workers=config.data.num_workers > 0,
     )
     return dataset, loader
 
