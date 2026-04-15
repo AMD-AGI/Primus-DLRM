@@ -259,7 +259,7 @@ class DistributedTrainer:
         trace_active: int = 10,
     ):
         self.model = model
-        self.train_loader = train_loader
+        self._dataloader = train_loader
         self.config = config
         self.device = device
         self.eval_fn = eval_fn
@@ -337,6 +337,22 @@ class DistributedTrainer:
             self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # -- Step generators ------------------------------------------------------
+    def _dataloader_stats(self) -> str:
+        """Return dataloader queue depth and worker stats for monitoring."""
+        try:
+            it = getattr(self._dataloader, '_iterator', None)
+            if it is None:
+                return ""
+            rcvd = getattr(it, '_rcvd_idx', None)
+            send = getattr(it, '_send_idx', None)
+            if rcvd is not None and send is not None:
+                queued = send - rcvd
+                workers = getattr(it, '_num_workers', '?')
+                return f"dl_queued={queued} dl_workers={workers}"
+        except Exception as e:
+            logger.warning(f"Failed to read dataloader stats: {e}")
+        return ""
+
     # Each generator yields (loss_val: float, task_losses: dict) per step,
     # abstracting away the difference between manual fwd/bwd/optim and
     # TorchRec's pipelined progress().
@@ -345,7 +361,7 @@ class DistributedTrainer:
         """Manual forward/backward/optimizer loop over the dataloader."""
         amp_dtype = torch.bfloat16 if self.use_amp else torch.float32
 
-        for batch in self.train_loader:
+        for batch in self._dataloader:
             batch = {
                 k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
@@ -490,7 +506,7 @@ class DistributedTrainer:
             pipeline_obj = self._setup_pipeline(tc, active_tasks)
 
         for epoch in range(tc.epochs):
-            sampler = self.train_loader.sampler
+            sampler = self._dataloader.sampler
             if isinstance(sampler, DistributedSampler):
                 sampler.set_epoch(epoch)
 
@@ -502,7 +518,7 @@ class DistributedTrainer:
             num_batches = 0
 
             if pipeline:
-                steps = self._pipelined_steps(pipeline_obj, iter(self.train_loader))
+                steps = self._pipelined_steps(pipeline_obj, iter(self._dataloader))
             else:
                 steps = self._sequential_steps(tc, active_tasks)
 
@@ -527,6 +543,7 @@ class DistributedTrainer:
                         window_elapsed = current_time - window_start
                         window_throughput = self.log_interval * per_gpu_batch * get_world_size() / window_elapsed if window_elapsed > 0 else 0
                         sys_metrics = _get_system_metrics()
+                        dl_stats = self._dataloader_stats()
                         logger.info(
                             f"epoch={epoch} step={self.global_step} | "
                             f"loss={loss_val:.4f} | lr={lr:.6f} | "
@@ -539,6 +556,7 @@ class DistributedTrainer:
                             )
                             + f" | {sys_metrics}"
                             + (f" | {max_mem_str}" if max_mem_str else "")
+                            + (f" | {dl_stats}" if dl_stats else "")
                         )
                         window_start = current_time
 
