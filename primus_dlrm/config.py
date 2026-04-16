@@ -36,6 +36,8 @@ class DataConfig:
 
     # DataLoader worker processes (0 = main process only, required for CSAN)
     num_workers: int = 4
+    # Number of batches each worker pre-loads ahead of consumption
+    prefetch_factor: int = 2
 
     # Enable user/item/cross counter features (log-transformed, multi-window)
     enable_counters: bool = False
@@ -343,6 +345,10 @@ class TrainConfig:
 
     # Log training metrics every N steps
     log_interval: int = 100
+
+    # Log maximum GPU memory over all ranks via all_gather at each log_interval.
+    # Adds a collective sync, disable for perf runs.
+    log_max_gpu_memory: bool = False
 
     # Run evaluation every N epochs
     eval_interval: int = 1

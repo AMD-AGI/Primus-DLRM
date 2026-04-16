@@ -2,7 +2,8 @@ data:
   dataset_size: "50m"
   history_length: 20
   history_mode: "last_l"
-  num_workers: 4
+  num_workers: 8
+  prefetch_factor: 4
   enable_counters: true
   counter_windows_days: [7, 30]
   data_dir: "data"
