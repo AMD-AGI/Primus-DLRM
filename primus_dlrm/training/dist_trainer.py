@@ -322,6 +322,11 @@ class DistributedTrainer:
         )
 
         self.use_amp = tc.bf16
+        # GradScaler improves BF16 gradient precision by scaling loss before
+        # backward (preserving mantissa bits) then unscaling gradients before
+        # the optimizer step.  Only used on the sequential path; the pipeline
+        # path cannot use it because TorchRec's TrainPipelineSparseDist calls
+        # backward() and optimizer.step() internally with no insertion point.
         self.scaler = torch.amp.GradScaler(enabled=tc.bf16)
 
         self.use_contrastive = tc.contrastive_weight > 0
@@ -358,9 +363,45 @@ class DistributedTrainer:
             logger.warning(f"Failed to read dataloader stats: {e}")
         return ""
 
-    # Each generator yields (loss_val: float, task_losses: dict) per step,
-    # abstracting away the difference between manual fwd/bwd/optim and
-    # TorchRec's pipelined progress().
+    # -- Forward + loss (shared by sequential and pipeline paths) -----------
+
+    def _compute_loss(self, batch_dict, active_tasks):
+        """Forward pass + loss computation.
+
+        Shared by both sequential and pipeline training paths.
+        Must be called inside torch.amp.autocast context.
+        Returns (total_loss, task_losses) with total_loss as a GPU tensor.
+        """
+        if self.use_contrastive:
+            inner = self.model.module if hasattr(self.model, "module") else self.model
+            preds, cross_scores = inner.forward_with_cross_scores(
+                batch_dict, cross_task=active_tasks[0],
+            )
+        else:
+            preds = self.model(batch_dict)
+            cross_scores = None
+
+        labels = {t: batch_dict[t] for t in active_tasks}
+        total_loss, task_losses = self.loss_fn(preds, labels)
+
+        if cross_scores is not None:
+            tc = self.config.train
+            bpr_loss = self.contrastive_loss_fn(
+                cross_scores, batch_dict[active_tasks[0]],
+            )
+            total_loss = total_loss + tc.contrastive_weight * bpr_loss
+            task_losses["bpr"] = bpr_loss
+
+        return total_loss, task_losses
+
+    def _clip_gradients(self):
+        """Clip dense parameter gradients by global norm."""
+        params = [p for g in self.optimizer.param_groups for p in g["params"]]
+        nn.utils.clip_grad_norm_(params, self.config.train.grad_clip)
+
+    # -- Step generators ---------------------------------------------------
+    # Each generator yields (loss_val: Tensor, task_losses: dict) per step.
+    # loss_val is a detached GPU tensor; .item() is deferred to log intervals.
 
     def _sequential_steps(self, tc, active_tasks):
         """Manual forward/backward/optimizer loop over the dataloader."""
@@ -374,35 +415,17 @@ class DistributedTrainer:
 
             self.optimizer.zero_grad()
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=self.use_amp):
-                if self.use_contrastive:
-                    inner = self.model.module if hasattr(self.model, "module") else self.model
-                    preds, cross_scores = inner.forward_with_cross_scores(
-                        batch, cross_task=active_tasks[0],
-                    )
-                else:
-                    preds = self.model(batch)
-                labels = {t: batch[t] for t in active_tasks}
-                total_loss, task_losses = self.loss_fn(preds, labels)
-
-                if self.use_contrastive:
-                    bpr_loss = self.contrastive_loss_fn(
-                        cross_scores, batch[active_tasks[0]],
-                    )
-                    total_loss = total_loss + tc.contrastive_weight * bpr_loss
-                    task_losses["bpr"] = bpr_loss
+                total_loss, task_losses = self._compute_loss(batch, active_tasks)
 
             self.scaler.scale(total_loss).backward()
 
             if tc.grad_clip > 0:
                 self.scaler.unscale_(self.optimizer)
-                params_to_clip = (
-                    [p for g in self.optimizer.param_groups for p in g["params"]]
-                )
-                nn.utils.clip_grad_norm_(params_to_clip, tc.grad_clip)
+                self._clip_gradients()
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            yield total_loss.item(), task_losses
+            yield total_loss.detach(), task_losses
 
     def _pipelined_steps(self, pipeline, dataloader_iter):
         """Yield steps from TorchRec TrainPipelineSparseDist.progress()."""
@@ -419,7 +442,7 @@ class DistributedTrainer:
                 )
                 loss_val = loss_tensor.detach()
             else:
-                loss_val = 0.0
+                loss_val = torch.tensor(0.0, device=self.device)
             yield loss_val, task_losses if isinstance(task_losses, dict) else {}
 
     def _setup_pipeline(self, tc, active_tasks):
@@ -451,29 +474,17 @@ class DistributedTrainer:
         amp_dtype = torch.bfloat16 if self.use_amp else torch.float32
 
         wrapped_model = PipelineModelWrapper(
-            model=self.model,
-            loss_fn=self.loss_fn,
-            active_tasks=active_tasks,
-            contrastive_loss_fn=self.contrastive_loss_fn,
-            contrastive_weight=tc.contrastive_weight,
+            compute_loss_fn=lambda batch_dict: self._compute_loss(batch_dict, active_tasks),
             amp_dtype=amp_dtype,
             use_amp=self.use_amp,
         )
 
-        # In non-pipelined training we clip between backward() and step().
         # The pipeline calls backward+step atomically inside progress(), so we
-        # register a full-backward hook that fires right after autograd
+        # register a full-backward hook to clip gradients right after autograd
         # finishes, before the optimizer step.
         if tc.grad_clip > 0:
-            _clip_value = tc.grad_clip
-            _optimizer = self.optimizer
-
-            def _post_backward_grad_clip(*_args):
-                params = [p for g in _optimizer.param_groups for p in g["params"]]
-                nn.utils.clip_grad_norm_(params, _clip_value)
-
             self.model.register_full_backward_hook(
-                lambda _m, _gi, _go: _post_backward_grad_clip()
+                lambda _m, _gi, _go: self._clip_gradients()
             )
 
         # When _pipeline_mode=True the model reads embeddings from the
@@ -534,14 +545,11 @@ class DistributedTrainer:
                 if self.tracer:
                     self.tracer.step()
 
-                if isinstance(loss_val, torch.Tensor):
-                    epoch_loss += loss_val.detach()
-                else:
-                    epoch_loss += loss_val
+                epoch_loss += loss_val.detach()
                 num_batches += 1
 
                 if self.global_step % self.log_interval == 0:
-                    loss_scalar = loss_val.item() if isinstance(loss_val, torch.Tensor) else loss_val
+                    loss_scalar = loss_val.item()
                     max_mem_str = _gather_max_gpu_memory() if tc.log_max_gpu_memory else ""
 
                     if is_main_process():
@@ -574,13 +582,15 @@ class DistributedTrainer:
                     break
 
             epoch_time = time.time() - epoch_start
-            avg_loss = (epoch_loss.item() if isinstance(epoch_loss, torch.Tensor) else epoch_loss) / max(num_batches, 1)
+            avg_loss = epoch_loss.item() / max(num_batches, 1)
             throughput = num_batches * per_gpu_batch * get_world_size() / epoch_time
 
+            last_loss = loss_val.item()
             if is_main_process():
                 logger.info(
                     f"=== Epoch {epoch} done === "
-                    f"avg_loss={avg_loss:.4f} | time={epoch_time:.1f}s | "
+                    f"avg_loss={avg_loss:.4f} | last_loss={last_loss:.4f} | "
+                    f"time={epoch_time:.1f}s | "
                     f"global_throughput={throughput:.0f} samples/s"
                 )
 
