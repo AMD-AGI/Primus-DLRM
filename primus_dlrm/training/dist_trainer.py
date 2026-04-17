@@ -646,6 +646,10 @@ class DistributedTrainer:
             logger.info(f"Eval metrics: {metrics}")
 
     def _save_checkpoint(self, epoch: int) -> None:
+        if not self.config.train.save_checkpoint:
+            if is_main_process():
+                logger.info("Checkpoint saving is disabled (save_checkpoint=False)")
+            return
         path = self.ckpt_dir / f"epoch_{epoch}.pt"
         if _is_fsdp(self.model):
             cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
