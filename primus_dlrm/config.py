@@ -355,6 +355,7 @@ class TrainConfig:
 
     # Directory for checkpoints and results
     checkpoint_dir: str = "results"
+    save_checkpoint: bool = True
 
     # Random seed for reproducibility
     seed: int = 42
