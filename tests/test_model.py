@@ -53,7 +53,7 @@ def _yambda_feature_config(audio_dim=32, enable_counters=False, counter_windows=
         dense.append(DenseFeatureSpec("user_counters", 3 * W, project=False))
         dense.append(DenseFeatureSpec("item_counters", 3 * W, project=False))
         dense.append(DenseFeatureSpec("cross_counters", 9 * W, project=True, activation="relu"))
-    return FeatureConfig(
+    fc = FeatureConfig(
         sequence_groups={
             "hist_lp": ["hist_lp_item", "hist_lp_artist", "hist_lp_album"],
             "hist_like": ["hist_like_item", "hist_like_artist", "hist_like_album"],
@@ -62,6 +62,10 @@ def _yambda_feature_config(audio_dim=32, enable_counters=False, counter_windows=
         scalar_features=["uid", "item", "artist", "album"],
         dense_features=dense,
     )
+    tower_map = {"uid": "user", "item": "item", "artist": "item", "album": "item"}
+    for sf in fc.scalar_features:
+        sf.tower = tower_map.get(sf.name, "")
+    return fc
 
 
 def _make_dummy_batch(batch_size: int = 4, hist_len: int = 10, device: str = "cpu",
