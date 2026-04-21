@@ -648,7 +648,7 @@ class DistributedTrainer:
     def _save_checkpoint(self, epoch: int) -> None:
         if not self.config.train.save_checkpoint:
             if is_main_process():
-                logger.warning("Checkpoint saving is disabled (save_checkpoint=False)")
+                logger.info("Checkpoint saving is disabled (save_checkpoint=False)")
             return
         path = self.ckpt_dir / f"epoch_{epoch}.pt"
         if _is_fsdp(self.model):
