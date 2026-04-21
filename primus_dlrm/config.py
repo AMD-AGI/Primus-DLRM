@@ -240,7 +240,7 @@ class TransformerConfig:
     #   "sdpa"  — PyTorch scaled_dot_product_attention (default, works everywhere)
     #   "flash" — flash_attn library (requires flash_attn package)
     #   "turbo" — Primus-Turbo flash attention (requires primus_turbo package)
-    attention_impl: str = "sdpa"
+    attention_impl: str = "turbo"
 
 
 @dataclass
