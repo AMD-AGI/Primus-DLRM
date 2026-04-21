@@ -78,6 +78,14 @@ class MixedAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int, n_ns_tokens: int,
                  dropout: float = 0.0, attention_impl: str = "sdpa"):
         super().__init__()
+        if attention_impl == "turbo" and not _HAS_TURBO_ATTN:
+            raise RuntimeError(
+                "attention_impl='turbo' requires primus_turbo package. "
+            )
+        if attention_impl == "flash" and not _HAS_FLASH_ATTN:
+            raise RuntimeError(
+                "attention_impl='flash' requires flash_attn package. "
+            )
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
@@ -122,18 +130,8 @@ class MixedAttention(nn.Module):
         drop_p = self.attn_drop if self.training else 0.0
 
         if self.attention_impl == "turbo":
-            if not _HAS_TURBO_ATTN:
-                raise RuntimeError(
-                    "attention_impl='turbo' requires primus_turbo package. "
-                    "Install it or set attention_impl='sdpa' in config."
-                )
             out = _turbo_flash_attn(q, k, v, causal=True, dropout_p=drop_p)
         elif self.attention_impl == "flash":
-            if not _HAS_FLASH_ATTN:
-                raise RuntimeError(
-                    "attention_impl='flash' requires flash_attn package. "
-                    "Install it or set attention_impl='sdpa' in config."
-                )
             out = _flash_attn(q, k, v, causal=True, dropout_p=drop_p)
         else:
             q_t = q.transpose(1, 2)
