@@ -90,11 +90,10 @@ class TowerRoutingMixin:
     tower: str = ""
 
     def in_user_tower(self) -> bool:
-        return self.tower == TOWER_USER
-
+        return self.tower != TOWER_ITEM
 
     def in_item_tower(self) -> bool:
-        return self.tower == TOWER_ITEM
+        return self.tower != TOWER_USER
 
 
 @dataclass
@@ -208,8 +207,8 @@ class SyntheticDataConfig:
 
 
 @dataclass
-class OneTransConfig:
-    """OneTrans Transformer architecture hyperparameters."""
+class TransformerConfig:
+    """Transformer architecture hyperparameters."""
 
     # Hidden dimension throughout the Transformer stack
     d_model: int = 128
@@ -217,7 +216,7 @@ class OneTransConfig:
     # Number of attention heads (d_model must be divisible by n_heads)
     n_heads: int = 4
 
-    # Number of stacked OneTrans blocks
+    # Number of stacked Transformer blocks
     n_layers: int = 4
 
     # FFN hidden dim multiplier: ffn_dim = d_model * ffn_mult
@@ -236,6 +235,12 @@ class OneTransConfig:
 
     # Learnable positional embeddings for S-tokens (one per position per pool)
     pos_embed: bool = True
+
+    # Attention implementation:
+    #   "sdpa"  — PyTorch scaled_dot_product_attention (default, works everywhere)
+    #   "flash" — flash_attn library (requires flash_attn package)
+    #   "turbo" — Primus-Turbo flash attention (requires primus_turbo package)
+    attention_impl: str = "turbo"
 
 
 @dataclass
@@ -271,8 +276,8 @@ class ModelConfig:
     # Embedding tables: table names, features, sizes, and per-table pooling.
     embedding_tables: list[EmbeddingTableConfig] = field(default_factory=list)
 
-    # OneTrans-specific hyperparameters (only used when model_type="onetrans")
-    onetrans: OneTransConfig = field(default_factory=OneTransConfig)
+    # Transformer hyperparameters (used when model_type="onetrans")
+    transformer: TransformerConfig = field(default_factory=TransformerConfig)
 
     def resolved_embedding_tables(self) -> list[EmbeddingTableConfig]:
         """Return embedding tables with embedding_dim resolved to model default."""
@@ -356,6 +361,9 @@ class TrainConfig:
     # Directory for checkpoints and results
     checkpoint_dir: str = "results"
     save_checkpoint: bool = True
+
+    # Whether to save checkpoints at end of each epoch
+    save_checkpoint: bool = False
 
     # Random seed for reproducibility
     seed: int = 42
@@ -497,7 +505,7 @@ def _from_dict(dc_cls: type, raw: dict[str, Any]) -> Any:
         return dc_cls()
     if not _DC_REGISTRY:
         for cls in (
-            DataConfig, ModelConfig, TrainConfig, OneTransConfig,
+            DataConfig, ModelConfig, TrainConfig, TransformerConfig,
             DistributedConfig, EmbeddingShardingConfig,
             FeatureConfig, SchemaConfig, EmbeddingTableConfig,
             SyntheticDataConfig,

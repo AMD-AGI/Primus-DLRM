@@ -1,10 +1,15 @@
-# Synthetic version of bench_onetrans_v6.yaml.
-# Matches real Yambda 50M embedding table sizes, feature layout, and model.
+# OneTransL config matching the paper (arXiv:2510.26104):
+#   d_model=384, n_heads=6 (head_dim=64), n_layers=8
+#   L_S=1500 S-tokens (history_length=500 x 3 groups = 1500)
+#   L_NS=16 NS-tokens
+#   Pyramid: shrinks S-tokens from 1500 to 16 across 8 layers
+#   Per-GPU batch=2048, global batch=16384
 
 data:
-  history_length: 20
+  history_length: 500
   history_mode: "last_l"
-  num_workers: 4
+  num_workers: 8
+  prefetch_factor: 4
   enable_counters: true
   counter_windows_days: [7, 30]
   schema: schemas/yambda.yaml
@@ -20,14 +25,15 @@ model:
   embedding_dim: 64
   embedding_init: "uniform"
   transformer:
-    d_model: 256
-    n_heads: 8
-    n_layers: 4
+    d_model: 384
+    n_heads: 6
+    n_layers: 8
     ffn_mult: 4
-    n_ns_tokens: 8
+    n_ns_tokens: 16
     use_pyramid: true
     dropout: 0.1
     pos_embed: true
+    attention_impl: turbo
   embedding_tables:
     - { name: item,   features: [item, hist_lp_item, hist_like_item, hist_skip_item],       num_embeddings: 9390624 }
     - { name: artist, features: [artist, hist_lp_artist, hist_like_artist, hist_skip_artist], num_embeddings: 1293395 }
@@ -47,16 +53,17 @@ feature:
     - { name: cross_counters, dim: 18, project: true, activation: relu }
 
 train:
-  batch_size: 32768
+  batch_size: 16384
   lr: 0.0003
   weight_decay: 0.00001
   epochs: 1
-  warmup_steps: 2000
+  warmup_steps: 100
   bf16: true
   grad_clip: 1.0
   log_interval: 10
   eval_interval: 1
   checkpoint_dir: "results"
+  save_checkpoint: false
   seed: 42
   loss_weights:
     listen_plus: 1.0

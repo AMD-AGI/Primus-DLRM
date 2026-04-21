@@ -2,7 +2,7 @@
 import torch
 import pytest
 
-from primus_dlrm.config import Config, DenseFeatureSpec, FeatureConfig, ModelConfig, OneTransConfig, SchemaConfig, EmbeddingTableConfig
+from primus_dlrm.config import Config, DenseFeatureSpec, FeatureConfig, ModelConfig, TransformerConfig, SchemaConfig, EmbeddingTableConfig
 from primus_dlrm.models.dlrm import DLRMBaseline
 from primus_dlrm.models.onetrans import OneTransModel, pyramid_schedule
 from primus_dlrm.training.losses import MultiTaskLoss
@@ -263,11 +263,11 @@ def test_forward_multi_window_counters():
 # ---------------------------------------------------------------------------
 
 def _onetrans_config(**overrides):
-    ot_kw = {k: overrides.pop(k) for k in list(overrides) if k in OneTransConfig.__dataclass_fields__}
+    ot_kw = {k: overrides.pop(k) for k in list(overrides) if k in TransformerConfig.__dataclass_fields__}
     return ModelConfig(
         model_type="onetrans", embedding_dim=16,
-        onetrans=OneTransConfig(d_model=32, n_heads=2, n_layers=2, ffn_mult=2,
-                                n_ns_tokens=4, **ot_kw),
+        transformer=TransformerConfig(d_model=32, n_heads=2, n_layers=2, ffn_mult=2,
+                                      n_ns_tokens=4, **ot_kw),
         **overrides,
     )
 
@@ -290,7 +290,7 @@ def _build_onetrans(model_config=None, device="cpu", tasks=None, num_counter_win
 
 
 def test_onetrans_forward_cpu():
-    model = _build_onetrans(tasks=["listen_plus"])
+    model = _build_onetrans(model_config=_onetrans_config(attention_impl="sdpa"), tasks=["listen_plus"])
     batch = _make_dummy_batch()
     out = model(batch)
     assert "listen_plus" in out
@@ -298,7 +298,7 @@ def test_onetrans_forward_cpu():
 
 
 def test_onetrans_backward_cpu():
-    model = _build_onetrans(tasks=["listen_plus"])
+    model = _build_onetrans(model_config=_onetrans_config(attention_impl="sdpa"), tasks=["listen_plus"])
     batch = _make_dummy_batch()
     out = model(batch)
     loss = sum(v.mean() for v in out.values())
@@ -309,7 +309,7 @@ def test_onetrans_backward_cpu():
 
 
 def test_onetrans_no_pyramid():
-    config = _onetrans_config(use_pyramid=False)
+    config = _onetrans_config(use_pyramid=False, attention_impl="sdpa")
     model = _build_onetrans(config)
     batch = _make_dummy_batch(batch_size=2, hist_len=5)
     out = model(batch)
@@ -335,7 +335,7 @@ def test_onetrans_gpu_bf16():
 
 
 def test_onetrans_forward_with_counters():
-    model = _build_onetrans(tasks=["listen_plus"], num_counter_windows=1)
+    model = _build_onetrans(model_config=_onetrans_config(attention_impl="sdpa"), tasks=["listen_plus"], num_counter_windows=1)
     batch = _make_dummy_batch(num_counter_windows=1)
     out = model(batch)
     assert "listen_plus" in out
@@ -343,7 +343,7 @@ def test_onetrans_forward_with_counters():
 
 
 def test_onetrans_backward_with_counters():
-    model = _build_onetrans(tasks=["listen_plus"], num_counter_windows=1)
+    model = _build_onetrans(model_config=_onetrans_config(attention_impl="sdpa"), tasks=["listen_plus"], num_counter_windows=1)
     batch = _make_dummy_batch(num_counter_windows=1)
     out = model(batch)
     loss = out["listen_plus"].sum()
@@ -354,7 +354,7 @@ def test_onetrans_backward_with_counters():
 
 
 def test_onetrans_forward_cross():
-    model = _build_onetrans(tasks=["listen_plus"])
+    model = _build_onetrans(model_config=_onetrans_config(attention_impl="sdpa"), tasks=["listen_plus"])
     batch = _make_dummy_batch()
     preds, cross_scores = model.forward_with_cross_scores(batch)
     assert "listen_plus" in preds
@@ -363,7 +363,7 @@ def test_onetrans_forward_cross():
 
 
 def test_onetrans_forward_cross_with_counters():
-    model = _build_onetrans(tasks=["listen_plus"], num_counter_windows=2)
+    model = _build_onetrans(model_config=_onetrans_config(attention_impl="sdpa"), tasks=["listen_plus"], num_counter_windows=2)
     batch = _make_dummy_batch(num_counter_windows=2)
     preds, cross_scores = model.forward_with_cross_scores(batch)
     assert "listen_plus" in preds
