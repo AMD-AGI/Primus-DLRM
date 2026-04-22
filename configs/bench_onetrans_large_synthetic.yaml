@@ -53,6 +53,7 @@ feature:
     - { name: cross_counters, dim: 18, project: true, activation: relu }
 
 train:
+  torch_compile: true
   batch_size: 16384
   lr: 0.0003
   weight_decay: 0.00001

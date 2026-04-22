@@ -265,6 +265,7 @@ class DistributedTrainer:
         self.eval_fn = eval_fn
         self.max_steps = max_steps
         self.log_interval = log_interval
+        self._num_flops_per_sample = self._estimate_flops(model)
         self.tracer: Tracer | None = None
         if trace and is_main_process():
             trace_dir = Path(config.train.checkpoint_dir) / "trace"
@@ -340,6 +341,45 @@ class DistributedTrainer:
         self.ckpt_dir = Path(tc.checkpoint_dir) / "checkpoints"
         if is_main_process():
             self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+            if self._num_flops_per_sample > 0:
+                peak_dtype = "bf16" if tc.bf16 else ("tf32" if tc.allow_tf32 else "fp32")
+                logger.info(f"Estimated {self._num_flops_per_sample/1e9:.1f} GFLOP/sample "
+                            f"(fwd+bwd), GPU peak ({peak_dtype}): "
+                            f"{self._get_gpu_peak_flops(peak_dtype)/1e12:.0f} TFLOPS")
+
+    @staticmethod
+    def _estimate_flops(model: nn.Module) -> float:
+        """Extract per-sample FLOP estimate from the inner model (if available)."""
+        inner = model.module if hasattr(model, "module") else model
+        if hasattr(inner, "get_num_flops_per_sample"):
+            return inner.get_num_flops_per_sample()
+        return 0.0
+
+    @staticmethod
+    def _get_gpu_peak_flops(dtype: str = "bf16") -> float:
+        """Peak FLOPS for the current GPU at the given precision.
+
+        Args:
+            dtype: one of "bf16", "tf32", "fp32".
+        """
+        if not torch.cuda.is_available():
+            return 0.0
+        name = torch.cuda.get_device_name(0)
+        # {device_substring: {dtype: peak_flops}}
+        peak_table: dict[str, dict[str, float]] = {
+            "MI355X": {"bf16": 2300e12, "tf32": 2300e12, "fp32": 575e12},
+            "MI350X": {"bf16": 2300e12, "tf32": 2300e12, "fp32": 575e12},
+            "MI300X": {"bf16": 1300e12, "tf32": 1300e12, "fp32": 653e12},
+            "MI325X": {"bf16": 1300e12, "tf32": 1300e12, "fp32": 653e12},
+            "B200":   {"bf16": 2250e12, "tf32": 2250e12, "fp32": 1125e12},
+            "H100":   {"bf16": 990e12,  "tf32": 495e12,  "fp32": 67e12},
+            "A100":   {"bf16": 312e12,  "tf32": 156e12,  "fp32": 19.5e12},
+        }
+        for gpu_key, flops in peak_table.items():
+            if gpu_key in name:
+                return flops.get(dtype, flops["bf16"])
+        logger.info(f"Unknown GPU for peak FLOPS: {name}, using MI355X default")
+        return peak_table["MI355X"].get(dtype, 2300e12)
 
     # -- Step generators ------------------------------------------------------
     def _dataloader_stats(self) -> str:
@@ -559,6 +599,14 @@ class DistributedTrainer:
                         throughput = num_batches * per_gpu_batch * get_world_size() / elapsed
                         window_elapsed = current_time - window_start
                         window_throughput = self.log_interval * per_gpu_batch * get_world_size() / window_elapsed if window_elapsed > 0 else 0
+                        # TFLOPS/MFU per GPU
+                        tflops_str = ""
+                        if self._num_flops_per_sample > 0:
+                            samples_per_sec_per_gpu = window_throughput / get_world_size()
+                            tflops = self._num_flops_per_sample * samples_per_sec_per_gpu / 1e12
+                            gpu_peak = self._get_gpu_peak_flops("bf16" if tc.bf16 else ("tf32" if tc.allow_tf32 else "fp32"))
+                            mfu = 100 * self._num_flops_per_sample * samples_per_sec_per_gpu / gpu_peak if gpu_peak > 0 else 0
+                            tflops_str = f" | tflops/gpu={tflops:.1f} mfu={mfu:.1f}%"
                         sys_metrics = _get_system_metrics()
                         dl_stats = self._dataloader_stats()
                         logger.info(
@@ -571,6 +619,7 @@ class DistributedTrainer:
                                 for k, v in task_losses.items()
                                 if hasattr(v, "__float__")
                             )
+                            + tflops_str
                             + f" | {sys_metrics}"
                             + (f" | {max_mem_str}" if max_mem_str else "")
                             + (f" | {dl_stats}" if dl_stats else "")

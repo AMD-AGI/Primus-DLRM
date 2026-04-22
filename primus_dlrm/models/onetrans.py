@@ -366,6 +366,90 @@ class OneTransModel(BaseModel):
             self.blocks[i] = torch.compile(
                 block, fullgraph=False, dynamic=True, backend=self._compile_backend)
 
+    def get_num_flops_per_sample(self) -> float:
+        """Estimate FLOPs per sample for fwd+bwd (×3 matmul, ×2 FMA).
+
+        Follows TorchTitan convention: embedding lookups excluded (memory-bound),
+        all linear/einsum/attention ops counted with factor 6 for matmuls
+        (3× fwd+bwd, 2× FMA) and 12 for attention (6× matmul directions, 2× FMA).
+        Causal attention sparsity is not counted (same as PaLM/TorchTitan).
+        """
+        ot = self.config.model.transformer
+        fc = self.config.feature
+        D = ot.d_model
+        H = ot.n_heads
+        d_head = D // H
+        n_ns = ot.n_ns_tokens
+        ffn_dim = D * ot.ffn_mult
+        emb_dim = self.config.model.embedding_dim
+
+        L_hist = self.config.data.history_length
+        n_groups = len(fc.sequence_groups)
+        L_S = L_hist * n_groups
+        schedule = pyramid_schedule(L_S, n_ns, ot.n_layers) if ot.use_pyramid else [L_S] * ot.n_layers
+
+        flops = 0
+
+        # Sequential tokenizers: Linear(raw_dim, D) + Linear(D, D) per group
+        for group_name, feats in fc.sequence_groups.items():
+            raw_dim = len(feats) * emb_dim
+            flops += 6 * L_hist * (raw_dim * D + D * D)
+
+        # Dense feature projections
+        for df in fc.dense_features:
+            if df.project:
+                flops += 6 * df.dim * emb_dim
+
+        # NS tokenizer: Linear(ns_raw_dim, D*n_ns) + Linear(D*n_ns, D*n_ns)
+        ns_raw_dim = getattr(self.ns_tokenizer.proj[0], 'in_features', 0)
+        ns_out_dim = n_ns * D
+        if ns_raw_dim > 0:
+            flops += 6 * (ns_raw_dim * ns_out_dim + ns_out_dim * ns_out_dim)
+
+        # Transformer blocks (per layer with pyramid schedule)
+        kv_len = L_S + n_ns
+        for layer_idx in range(ot.n_layers):
+            q_s = schedule[layer_idx]
+            q_len = q_s + n_ns
+            cur_n_s = kv_len - n_ns
+
+            # S-token QKV: Linear(D, 3D) on cur_n_s tokens
+            flops += 6 * cur_n_s * D * 3 * D
+            # NS-token QKV: einsum [n_ns, 3D, D]
+            flops += 6 * n_ns * 3 * D * D
+            # Causal attention: Q*K^T + attn*V (full, not discounting causal sparsity)
+            flops += 12 * H * d_head * q_len * kv_len
+            # Output projection: Linear(D, D) on q_len tokens
+            flops += 6 * q_len * D * D
+
+            # FFN: S-tokens
+            n_s_out = q_len - n_ns
+            flops += 6 * n_s_out * D * ffn_dim * 2
+            # FFN: NS-tokens (two einsums)
+            flops += 6 * n_ns * D * ffn_dim * 2
+
+            kv_len = q_len
+
+        # Head projection: Linear(n_ns*D, D)
+        flops += 6 * n_ns * D * D
+        # Task heads: Linear(D, 1) per task
+        flops += 6 * len(self.tasks) * D
+
+        # Contrastive heads (only when contrastive_weight > 0)
+        if self.config.train.contrastive_weight > 0:
+            # contrastive_user_proj: Linear(D, D)
+            flops += 6 * D * D
+            # contrastive_item_proj: Linear(n_item_scalars*emb_dim, D)
+            n_item_scalars = len(self._item_scalar_names)
+            flops += 6 * n_item_scalars * emb_dim * D
+            # cross_scores: user_emb @ item_emb.T  [B, D] @ [D, B] -> [B, B]
+            # per-sample amortized: 2 * D * B (fwd only, ×3 for bwd = 6)
+            batch_size = self.config.train.batch_size // (
+                self.config.distributed.num_nodes * self.config.distributed.gpus_per_node)
+            flops += 6 * D * batch_size
+
+        return float(flops)
+
     # ------------------------------------------------------------------
     # Embedding lookup
     # ------------------------------------------------------------------
