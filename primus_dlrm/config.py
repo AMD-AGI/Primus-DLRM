@@ -243,6 +243,7 @@ class TransformerConfig:
     attention_impl: str = "turbo"
 
 
+
 @dataclass
 class ModelConfig:
     """Model architecture selection and shared hyperparameters."""
@@ -404,6 +405,14 @@ class TrainConfig:
 
     # Shampoo: use decoupled weight decay (like AdamW)
     shampoo_use_decoupled_weight_decay: bool = False
+
+    # torch.compile: compile each transformer block with Inductor (or other backend)
+    torch_compile: bool = False
+    # Backend for torch.compile: "inductor" (default) or "aot_eager".
+    # NOTE: inductor crashes with attention_impl="sdpa" on ROCm due to a
+    # workspace sizing bug in SDPA's backward pass.  Use "flash" or "turbo"
+    # attention when compiling with inductor.
+    torch_compile_backend: str = "inductor"
 
     # Weight for in-batch BPR contrastive loss (0.0 = disabled)
     contrastive_weight: float = 0.0

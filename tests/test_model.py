@@ -272,7 +272,8 @@ def _onetrans_config(**overrides):
     )
 
 
-def _build_onetrans(model_config=None, device="cpu", tasks=None, num_counter_windows=0):
+def _build_onetrans(model_config=None, device="cpu", tasks=None, num_counter_windows=0,
+                    torch_compile=False, torch_compile_backend="inductor"):
     model_config = model_config or _onetrans_config()
     model_config.embedding_tables = list(_YAMBDA_EMBEDDING_TABLES)
     counter_days = list(range(1, num_counter_windows + 1)) if num_counter_windows > 0 else []
@@ -284,6 +285,8 @@ def _build_onetrans(model_config=None, device="cpu", tasks=None, num_counter_win
         counter_windows=counter_days if num_counter_windows > 0 else None,
     )
     full_config.data.schema = _YAMBDA_SCHEMA
+    full_config.train.torch_compile = torch_compile
+    full_config.train.torch_compile_backend = torch_compile_backend
     if tasks:
         full_config.train.loss_weights = {t: 1.0 for t in tasks}
     return OneTransModel(full_config, device=torch.device(device))
@@ -385,3 +388,40 @@ def test_dot_interaction_with_counters():
     out = model(batch)
     assert out["listen_plus"].shape == (4,)
     out["listen_plus"].sum().backward()
+
+
+# ---------------------------------------------------------------------------
+# torch.compile tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="No GPU")
+def test_onetrans_compile_turbo_inductor_gpu():
+    """torch.compile with inductor + turbo attention should produce valid fwd+bwd."""
+    model = _build_onetrans(
+        device="cuda:0", tasks=["listen_plus"],
+        torch_compile=True, torch_compile_backend="inductor",
+    )
+    model.apply_compile()
+    batch = _make_dummy_batch(device="cuda:0")
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        out = model(batch)
+        loss = sum(v.mean() for v in out.values())
+    loss.backward()
+    assert not torch.isnan(loss)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="No GPU")
+def test_onetrans_compile_flash_inductor_gpu():
+    """torch.compile with inductor + flash attention should produce valid fwd+bwd."""
+    model = _build_onetrans(
+        model_config=_onetrans_config(attention_impl="flash"),
+        device="cuda:0", tasks=["listen_plus"],
+        torch_compile=True, torch_compile_backend="inductor",
+    )
+    model.apply_compile()
+    batch = _make_dummy_batch(device="cuda:0")
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        out = model(batch)
+        loss = sum(v.mean() for v in out.values())
+    loss.backward()
+    assert not torch.isnan(loss)

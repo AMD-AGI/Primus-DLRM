@@ -292,6 +292,12 @@ def main():
     model = wrap_model(model, device, config)
     logger.info(f"Model wrapped with {config.distributed.dense_strategy} on rank {rank}")
 
+    inner = model.module if hasattr(model, "module") else model
+    if hasattr(inner, "apply_compile") and config.train.torch_compile:
+        logger.info(f"Applying torch.compile (backend={config.train.torch_compile_backend})...")
+        inner.apply_compile()
+        logger.info("torch.compile applied successfully")
+
     # Eval function (rank 0 only, unless skipped; always skipped for synthetic)
     eval_fn = None
     if not args.skip_eval and not use_synthetic and is_main_process():
