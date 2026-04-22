@@ -6,6 +6,7 @@ All categorical embeddings backed by TorchRec EmbeddingCollection.
 """
 from __future__ import annotations
 
+import logging
 import math
 
 import torch
@@ -47,7 +48,6 @@ def pyramid_schedule(l_s: int, l_ns: int, n_layers: int) -> list[int]:
     return schedule
 
 
-@torch.fx.wrap
 def build_pyramid_mask(q_len: int, kv_len: int, device: torch.device) -> Tensor:
     """Causal mask [q_len, kv_len] accounting for query offset."""
     offset = kv_len - q_len
@@ -331,6 +331,8 @@ class OneTransModel(BaseModel):
                          attention_impl=ot.attention_impl)
             for _ in range(ot.n_layers)
         ]).to(device)
+        self._compile_blocks = config.train.torch_compile
+        self._compile_backend = config.train.torch_compile_backend
         self.final_norm = RMSNorm(ot.d_model).to(device)
 
         # Head bridge
@@ -353,6 +355,16 @@ class OneTransModel(BaseModel):
             nn.Linear(len(self._item_scalar_names) * D, ot.d_model, device=device),
             nn.ReLU(inplace=True),
         )
+
+    def apply_compile(self) -> None:
+        """Compile transformer blocks with torch.compile (call after DMP wrapping)."""
+        if not self._compile_blocks:
+            return
+        logging.getLogger(__name__).info(
+            f"Compiling {len(self.blocks)} OneTransBlocks with backend={self._compile_backend}")
+        for i, block in enumerate(self.blocks):
+            self.blocks[i] = torch.compile(
+                block, fullgraph=False, dynamic=True, backend=self._compile_backend)
 
     # ------------------------------------------------------------------
     # Embedding lookup
