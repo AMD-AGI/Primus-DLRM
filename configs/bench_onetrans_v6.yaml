@@ -42,6 +42,7 @@ feature:
 
 
 train:
+  torch_compile: true
   batch_size: 32768
   lr: 0.0003
   weight_decay: 0.00001
