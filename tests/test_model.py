@@ -414,7 +414,7 @@ def test_onetrans_compile_turbo_inductor_gpu():
 def test_onetrans_compile_flash_inductor_gpu():
     """torch.compile with inductor + flash attention should produce valid fwd+bwd."""
     model = _build_onetrans(
-        model_config=_onetrans_config(attention_impl="flash"),
+        model_config=_onetrans_config(attention_impl="fav2"),
         device="cuda:0", tasks=["listen_plus"],
         torch_compile=True, torch_compile_backend="inductor",
     )

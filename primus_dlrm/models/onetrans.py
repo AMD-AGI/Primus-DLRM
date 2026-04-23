@@ -31,6 +31,17 @@ try:
 except ImportError:
     _HAS_FLASH_ATTN = False
 
+try:
+    from flash_attn.cute import flash_attn_func as _flash_attn_4_raw
+    import torch._dynamo
+    @torch._dynamo.disable
+    def _flash_attn_4(q, k, v, causal=True):
+        return _flash_attn_4_raw(q, k, v, causal=causal)[0]
+    _HAS_FLASH_ATTN_4 = True
+except ImportError:
+    _HAS_FLASH_ATTN_4 = False
+
+
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -82,9 +93,14 @@ class MixedAttention(nn.Module):
             raise RuntimeError(
                 "attention_impl='turbo' requires primus_turbo package. "
             )
-        if attention_impl == "flash" and not _HAS_FLASH_ATTN:
+        if attention_impl == "fav2" and not _HAS_FLASH_ATTN:
             raise RuntimeError(
-                "attention_impl='flash' requires flash_attn package. "
+                "attention_impl='fav2' requires flash_attn package. "
+            )
+        if attention_impl == "fav4" and not _HAS_FLASH_ATTN_4:
+            raise RuntimeError(
+                "attention_impl='fav4' requires flash-attn-4 package "
+                "(pip install flash-attn-4). Optimized for Blackwell GPUs."
             )
         self.d_model = d_model
         self.n_heads = n_heads
@@ -131,9 +147,11 @@ class MixedAttention(nn.Module):
 
         if self.attention_impl == "turbo":
             out = _turbo_flash_attn(q, k, v, causal=True, dropout_p=drop_p)
-        elif self.attention_impl == "flash":
+        elif self.attention_impl == "fav4":
+            out = _flash_attn_4(q, k, v, causal=True)
+        elif self.attention_impl == "fav2":
             out = _flash_attn(q, k, v, causal=True, dropout_p=drop_p)
-        else:
+        elif self.attention_impl == "sdpa":
             q_t = q.transpose(1, 2)
             k_t = k.transpose(1, 2)
             v_t = v.transpose(1, 2)
@@ -141,6 +159,11 @@ class MixedAttention(nn.Module):
             out = F.scaled_dot_product_attention(
                 q_t, k_t, v_t, attn_mask=attn_mask, dropout_p=drop_p,
             ).transpose(1, 2)
+        else:
+            raise ValueError(
+                f"Unknown attention_impl: {self.attention_impl!r}. "
+                f"Supported: 'sdpa', 'fav2', 'fav4', 'turbo'"
+            )
 
         out = out.reshape(B, out.shape[1], self.d_model)
         return self.out_proj(out)
