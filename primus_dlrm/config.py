@@ -238,8 +238,9 @@ class TransformerConfig:
 
     # Attention implementation:
     #   "sdpa"  — PyTorch scaled_dot_product_attention (default, works everywhere)
-    #   "flash" — flash_attn library (requires flash_attn package)
-    #   "turbo" — Primus-Turbo flash attention (requires primus_turbo package)
+    #   "fav2"  — FlashAttention-2 (requires flash_attn package)
+    #   "fav4"  — FlashAttention-4 / CuTeDSL (requires flash-attn-4, Blackwell optimized)
+    #   "turbo" — Primus-Turbo flash attention (requires primus_turbo package, ROCm)
     attention_impl: str = "turbo"
 
 
@@ -410,7 +411,7 @@ class TrainConfig:
     torch_compile: bool = False
     # Backend for torch.compile: "inductor" (default) or "aot_eager".
     # NOTE: inductor crashes with attention_impl="sdpa" on ROCm due to a
-    # workspace sizing bug in SDPA's backward pass.  Use "flash" or "turbo"
+    # workspace sizing bug in SDPA's backward pass.  Use "fav2" or "turbo"
     # attention when compiling with inductor.
     torch_compile_backend: str = "inductor"
 
