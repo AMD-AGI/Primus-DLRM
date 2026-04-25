@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -27,7 +28,7 @@ def preprocess(
     train_days: int = 300,
     gap_minutes: int = 30,
     test_days: int = 1,
-    chunked: bool = False,
+    chunked: bool = True,
 ) -> Path:
     """Run full preprocessing pipeline.
 
@@ -107,9 +108,14 @@ def preprocess(
 
 
 def _encode_event_types(events: pl.DataFrame) -> pl.DataFrame:
-    if events["event_type"].dtype == pl.Utf8:
+    dt = events["event_type"].dtype
+    if dt == pl.Utf8 or isinstance(dt, (pl.Categorical, pl.Enum)):
         events = events.with_columns(
-            pl.col("event_type").replace_strict(EVENT_TYPE_MAP).cast(pl.UInt8).alias("event_type")
+            pl.col("event_type")
+            .cast(pl.Utf8)
+            .replace_strict(EVENT_TYPE_MAP)
+            .cast(pl.UInt8)
+            .alias("event_type")
         )
     return events
 
@@ -148,10 +154,12 @@ def _build_sessions(events: pl.DataFrame, session_gap_units: int) -> pl.DataFram
     sessions = (
         sorted_events
         .with_columns(
-            (pl.col("timestamp").diff().over("uid").fill_null(0) > session_gap_units)
-            .cum_sum()
+            (
+                (pl.col("timestamp").diff().fill_null(0) > session_gap_units)
+                .cast(pl.UInt32)
+                .cum_sum()
+            )
             .over("uid")
-            .cast(pl.UInt32)
             .alias("session_id")
         )
         .group_by(["uid", "session_id"])
@@ -200,22 +208,83 @@ def _compute_item_popularity(train_events: pl.DataFrame) -> np.ndarray:
     return popularity
 
 
-def _load_and_save_metadata(raw_dir: Path, out_dir: Path) -> None:
-    """Copy/transform metadata files (artist/album mappings, embeddings)."""
-    for name in ["artist_item_mapping", "album_item_mapping"]:
-        src = raw_dir / f"{name}.parquet"
-        dst = out_dir / f"{name}.parquet"
-        if src.exists() and not dst.exists():
-            df = pl.read_parquet(src)
-            df.write_parquet(dst)
-            logger.info(f"Copied {name}: {len(df):,} rows")
+_SHARED_METADATA_FILES = (
+    "embeddings.parquet",
+    "artist_item_mapping.parquet",
+    "album_item_mapping.parquet",
+)
 
-    emb_src = raw_dir / "embeddings.parquet"
-    emb_dst = out_dir / "embeddings.parquet"
-    if emb_src.exists() and not emb_dst.exists():
-        df = pl.read_parquet(emb_src)
-        df.write_parquet(emb_dst)
-        logger.info(f"Copied embeddings: {len(df):,} rows")
+
+def _load_and_save_metadata(raw_dir: Path, out_dir: Path) -> None:
+    """Materialise size-invariant catalog metadata at
+    ``<data_root>/shared_metadata/`` so all per-size processed dirs share one
+    physical copy.
+
+    Yambda's three catalog metadata files — ``embeddings.parquet`` (~14 GB),
+    ``artist_item_mapping.parquet`` (~52 MB), ``album_item_mapping.parquet``
+    (~66 MB) — are identical across the 50m / 500m / 5b variants because they
+    describe the *catalog* of items, not the events. We move them once into
+    ``data/shared_metadata/`` and have all loaders read them from that
+    canonical location (see ``primus_dlrm.data.dataset.resolve_metadata_dir``).
+
+    Resulting layout::
+
+        data/shared_metadata/
+            embeddings.parquet              # real, ~14 GB, materialised once
+            artist_item_mapping.parquet
+            album_item_mapping.parquet
+
+        data/raw/
+            50m/multi_event.parquet         # size-specific events only
+            5b/multi_event.parquet
+            # No metadata files here -- moved to shared_metadata/ by this fn.
+
+        data/processed/                     # 50m
+            train_sessions.parquet          # size-specific output
+            test_events.parquet
+            session_index.parquet
+            item_popularity.npy
+            split_meta.json
+
+        data/processed_5b/                  # 5b: same set of size-specific files
+
+    Bootstrap: if a metadata file is not yet in ``shared_metadata/`` but exists
+    at ``raw_dir/`` (the location ``download_yambda`` writes to) or at the
+    legacy ``raw_dir.parent / 'processed' / <name>`` location (an earlier
+    run's materialised copy), this function **moves** it (atomic ``rename``,
+    no duplication, no I/O cost beyond directory entries) into
+    ``shared_metadata/``.
+
+    No symlinks are created in ``out_dir`` -- loaders pick up the metadata
+    via ``resolve_metadata_dir`` instead.
+    """
+    raw_dir = Path(raw_dir)
+    out_dir = Path(out_dir)
+
+    shared_dir = out_dir.parent / "shared_metadata"
+    shared_dir.mkdir(parents=True, exist_ok=True)
+
+    legacy_processed_dir = out_dir.parent / "processed"
+    for name in _SHARED_METADATA_FILES:
+        shared_path = shared_dir / name
+        if shared_path.is_file() and not shared_path.is_symlink():
+            continue  # already materialised
+
+        candidates = [raw_dir / name, legacy_processed_dir / name]
+        chosen: Path | None = None
+        for c in candidates:
+            if c.is_file() and not c.is_symlink():
+                chosen = c
+                break
+
+        if chosen is None:
+            logger.info(f"no metadata source found for {name}; skipping")
+            continue
+
+        if shared_path.is_symlink():
+            shared_path.unlink()
+        os.rename(str(chosen), str(shared_path))
+        logger.info(f"moved {chosen} -> {shared_path}")
 
 
 def _load_chunked(parquet_path: Path) -> pl.DataFrame:

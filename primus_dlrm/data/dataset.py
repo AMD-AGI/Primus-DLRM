@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import logging
-from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -14,6 +13,58 @@ from torch.utils.data import Dataset
 
 from primus_dlrm.config import DataConfig
 from primus_dlrm.data.preprocessing import EVENT_TYPE_MAP
+
+
+# ---------------------------------------------------------------------------
+# Path layout convention
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DataPaths:
+    """All on-disk locations for one dataset variant, derived from the data
+    root and dataset size.
+
+    The convention is::
+
+        <data_root>/raw/<size>/multi_event.parquet           (size-specific raw events)
+        <data_root>/shared_metadata/embeddings.parquet       (size-invariant catalog)
+        <data_root>/shared_metadata/{artist,album}_item_mapping.parquet
+        <data_root>/processed[_<size>]/                      (size-specific processed outputs)
+        <data_root>/cache[_<size>]/                          (size-specific FlatEventStore cache)
+
+    The 50m variant uses the legacy unsuffixed ``processed/`` and ``cache/``
+    paths to stay backward compatible with existing on-disk data; 500m and 5b
+    use ``processed_500m/`` / ``cache_500m/`` etc.
+    """
+    data_root: Path
+    dataset_size: str
+
+    @classmethod
+    def from_config(cls, config: DataConfig, data_root: Path | str | None = None) -> "DataPaths":
+        """Build paths from a DataConfig. ``data_root`` (CLI) overrides
+        ``config.data_dir`` when provided."""
+        root = Path(data_root) if data_root is not None else Path(config.data_dir)
+        return cls(data_root=root, dataset_size=config.dataset_size)
+
+    @property
+    def raw(self) -> Path:
+        return self.data_root / "raw" / self.dataset_size
+
+    @property
+    def metadata(self) -> Path:
+        return self.data_root / "shared_metadata"
+
+    @property
+    def processed(self) -> Path:
+        if self.dataset_size == "50m":
+            return self.data_root / "processed"
+        return self.data_root / f"processed_{self.dataset_size}"
+
+    @property
+    def cache(self) -> Path:
+        if self.dataset_size == "50m":
+            return self.data_root / "cache"
+        return self.data_root / f"cache_{self.dataset_size}"
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +167,10 @@ class FlatEventStore:
     def _precompute_counters(
         self, item_to_artist: np.ndarray, item_to_album: np.ndarray,
     ) -> None:
-        """Fully precompute all windowed counters using two-pointer sliding window."""
+        """Fully precompute all windowed counters using the numba-parallel
+        sliding-window kernels in ``primus_dlrm.data.counters``."""
+        from primus_dlrm.data import counters  # noqa: WPS433  (lazy import for numba)
+
         W = len(self.counter_windows_days)
         N = self.total_events
         logger.info(
@@ -124,13 +178,22 @@ class FlatEventStore:
             f"{self.counter_windows_days}"
         )
 
-        self.user_counters = np.zeros((N, 3 * W), dtype=np.float32)
-        self.item_counters = np.zeros((N, 3 * W), dtype=np.float32)
-        self.cross_counters = np.zeros((N, 9 * W), dtype=np.float32)
-
-        self._precompute_user_counters(W)
-        self._precompute_item_counters(W)
-        self._precompute_cross_counters(item_to_artist, item_to_album, W)
+        self.user_counters = counters.precompute_user_counters(
+            self.flat_uid, self.flat_timestamps,
+            self.flat_is_listen_plus, self.flat_is_like, self.flat_is_skip,
+            self.counter_windows_days,
+        )
+        self.item_counters = counters.precompute_item_counters(
+            self.flat_item_ids, self.flat_timestamps,
+            self.flat_is_listen_plus, self.flat_is_like, self.flat_is_skip,
+            self.counter_windows_days,
+        )
+        self.cross_counters = counters.precompute_cross_counters(
+            self.flat_uid, self.flat_item_ids, self.flat_timestamps,
+            self.flat_is_listen_plus, self.flat_is_like, self.flat_is_skip,
+            item_to_artist, item_to_album,
+            self.counter_windows_days,
+        )
 
         logger.info(
             f"Counter precomputation done. Memory: "
@@ -138,144 +201,6 @@ class FlatEventStore:
             f"item={self.item_counters.nbytes / 1e9:.2f}GB, "
             f"cross={self.cross_counters.nbytes / 1e9:.2f}GB"
         )
-
-    def _precompute_user_counters(self, W: int) -> None:
-        """Two-pointer per user, per window."""
-        logger.info("  Precomputing user counters...")
-        is_lp = self.flat_is_listen_plus
-        is_like = self.flat_is_like
-        is_skip = self.flat_is_skip
-        timestamps = self.flat_timestamps
-
-        for w_idx, w_days in enumerate(self.counter_windows_days):
-            window_sec = w_days * SECONDS_PER_DAY
-            col_lp = w_idx * 3
-            col_like = w_idx * 3 + 1
-            col_skip = w_idx * 3 + 2
-
-            for uid in self.unique_uids:
-                s, e = int(self.user_start[uid]), int(self.user_end[uid])
-                left = s
-                cum_lp = 0
-                cum_like = 0
-                cum_skip = 0
-
-                for pos in range(s, e):
-                    window_start_ts = timestamps[pos] - window_sec
-                    while left < pos and timestamps[left] < window_start_ts:
-                        cum_lp -= int(is_lp[left])
-                        cum_like -= int(is_like[left])
-                        cum_skip -= int(is_skip[left])
-                        left += 1
-
-                    self.user_counters[pos, col_lp] = np.log1p(cum_lp)
-                    self.user_counters[pos, col_like] = np.log1p(cum_like)
-                    self.user_counters[pos, col_skip] = np.log1p(cum_skip)
-
-                    cum_lp += int(is_lp[pos])
-                    cum_like += int(is_like[pos])
-                    cum_skip += int(is_skip[pos])
-
-    def _precompute_item_counters(self, W: int) -> None:
-        """Sort by (item_id, timestamp), two-pointer per item, scatter back."""
-        logger.info("  Precomputing item counters...")
-        N = self.total_events
-        sort_idx = np.lexsort((self.flat_timestamps, self.flat_item_ids))
-        sorted_items = self.flat_item_ids[sort_idx]
-        sorted_ts = self.flat_timestamps[sort_idx]
-        sorted_is_lp = self.flat_is_listen_plus[sort_idx]
-        sorted_is_like = self.flat_is_like[sort_idx]
-        sorted_is_skip = self.flat_is_skip[sort_idx]
-
-        item_changes = np.where(np.diff(sorted_items) != 0)[0] + 1
-        item_starts = np.concatenate([[0], item_changes])
-        item_ends = np.concatenate([item_changes, [N]])
-
-        item_result = np.zeros((N, 3 * W), dtype=np.float32)
-
-        for w_idx, w_days in enumerate(self.counter_windows_days):
-            window_sec = w_days * SECONDS_PER_DAY
-            col_lp = w_idx * 3
-            col_like = w_idx * 3 + 1
-            col_skip = w_idx * 3 + 2
-
-            for seg_idx in range(len(item_starts)):
-                s, e = int(item_starts[seg_idx]), int(item_ends[seg_idx])
-                left = s
-                cum_lp = 0
-                cum_like = 0
-                cum_skip = 0
-
-                for pos in range(s, e):
-                    window_start_ts = sorted_ts[pos] - window_sec
-                    while left < pos and sorted_ts[left] < window_start_ts:
-                        cum_lp -= int(sorted_is_lp[left])
-                        cum_like -= int(sorted_is_like[left])
-                        cum_skip -= int(sorted_is_skip[left])
-                        left += 1
-
-                    item_result[pos, col_lp] = np.log1p(cum_lp)
-                    item_result[pos, col_like] = np.log1p(cum_like)
-                    item_result[pos, col_skip] = np.log1p(cum_skip)
-
-                    cum_lp += int(sorted_is_lp[pos])
-                    cum_like += int(sorted_is_like[pos])
-                    cum_skip += int(sorted_is_skip[pos])
-
-        # Scatter back to original event order
-        self.item_counters[sort_idx] = item_result
-
-    def _precompute_cross_counters(
-        self, item_to_artist: np.ndarray, item_to_album: np.ndarray, W: int,
-    ) -> None:
-        """Two-pointer + running dicts per user for item/artist/album x lp/like/skip."""
-        logger.info("  Precomputing cross counters...")
-        is_lp = self.flat_is_listen_plus
-        is_like = self.flat_is_like
-        is_skip = self.flat_is_skip
-        timestamps = self.flat_timestamps
-        item_ids = self.flat_item_ids
-
-        for w_idx, w_days in enumerate(self.counter_windows_days):
-            window_sec = w_days * SECONDS_PER_DAY
-            base_col = w_idx * 9
-
-            for uid in self.unique_uids:
-                s, e = int(self.user_start[uid]), int(self.user_end[uid])
-                left = s
-                # Each dict maps entity_id -> [lp, like, skip]
-                item_counts: dict[int, list[int]] = defaultdict(lambda: [0, 0, 0])
-                artist_counts: dict[int, list[int]] = defaultdict(lambda: [0, 0, 0])
-                album_counts: dict[int, list[int]] = defaultdict(lambda: [0, 0, 0])
-
-                for pos in range(s, e):
-                    window_start_ts = timestamps[pos] - window_sec
-                    while left < pos and timestamps[left] < window_start_ts:
-                        iid = int(item_ids[left])
-                        evt = 0 if is_lp[left] else (1 if is_like[left] else 2)
-                        item_counts[iid][evt] -= 1
-                        artist_counts[int(item_to_artist[iid])][evt] -= 1
-                        album_counts[int(item_to_album[iid])][evt] -= 1
-                        left += 1
-
-                    target_iid = int(item_ids[pos])
-                    target_aid = int(item_to_artist[target_iid])
-                    target_alid = int(item_to_album[target_iid])
-
-                    ic = item_counts[target_iid]
-                    ac = artist_counts[target_aid]
-                    alc = album_counts[target_alid]
-
-                    self.cross_counters[pos, base_col:base_col + 9] = [
-                        np.log1p(ic[0]), np.log1p(ic[1]), np.log1p(ic[2]),
-                        np.log1p(ac[0]), np.log1p(ac[1]), np.log1p(ac[2]),
-                        np.log1p(alc[0]), np.log1p(alc[1]), np.log1p(alc[2]),
-                    ]
-
-                    evt = 0 if is_lp[pos] else (1 if is_like[pos] else 2)
-                    item_counts[target_iid][evt] += 1
-                    artist_counts[target_aid][evt] += 1
-                    album_counts[target_alid][evt] += 1
 
     def get_user_slice(self, uid: int) -> tuple[int, int]:
         return int(self.user_start[uid]), int(self.user_end[uid])
@@ -353,12 +278,12 @@ def _cache_key(split: str, counter_windows_days: list[int] | None) -> str:
 
 
 def _try_load_cached_store(
-    config: DataConfig, split: str,
+    config: DataConfig, paths: "DataPaths", split: str,
 ) -> FlatEventStore | None:
     """Return cached FlatEventStore if available and use_cache is enabled."""
     if not config.use_cache:
         return None
-    cache_dir = Path(config.cache_dir) / _cache_key(
+    cache_dir = paths.cache / _cache_key(
         split, config.counter_windows_days if config.enable_counters else None,
     )
     meta_path = cache_dir / "store_meta.json"
@@ -376,11 +301,11 @@ def _try_load_cached_store(
 
 
 def _save_store_cache(
-    store: FlatEventStore, config: DataConfig, split: str,
+    store: FlatEventStore, config: DataConfig, paths: "DataPaths", split: str,
 ) -> None:
     if not config.use_cache:
         return
-    cache_dir = Path(config.cache_dir) / _cache_key(
+    cache_dir = paths.cache / _cache_key(
         split, config.counter_windows_days if config.enable_counters else None,
     )
     store.save_mmap(cache_dir)
@@ -389,23 +314,26 @@ def _save_store_cache(
 class YambdaTrainDataset(Dataset):
     """Training dataset with split history pools (listen+, like, skip)."""
 
-    def __init__(self, config: DataConfig, processed_dir: str | Path):
+    def __init__(self, config: DataConfig, paths: DataPaths):
         self.config = config
-        processed_dir = Path(processed_dir)
+        self.paths = paths
 
-        logger.info("Loading preprocessed data...")
-        self.item_popularity = np.load(processed_dir / "item_popularity.npy")
+        logger.info(
+            f"Loading preprocessed data from {paths.processed} "
+            f"(metadata: {paths.metadata}, cache: {paths.cache})"
+        )
+        self.item_popularity = np.load(paths.processed / "item_popularity.npy")
 
-        with open(processed_dir / "split_meta.json") as f:
+        with open(paths.processed / "split_meta.json") as f:
             self.split_meta = json.load(f)
 
-        self._load_metadata(processed_dir)
+        self._load_metadata(paths.metadata)
 
-        cached = _try_load_cached_store(config, "train")
+        cached = _try_load_cached_store(config, paths, "train")
         if cached is not None:
             self.store = cached
         else:
-            sessions = pl.read_parquet(processed_dir / "train_sessions.parquet")
+            sessions = pl.read_parquet(paths.processed / "train_sessions.parquet")
             self.store = FlatEventStore(
                 sessions,
                 enable_counters=config.enable_counters,
@@ -413,7 +341,7 @@ class YambdaTrainDataset(Dataset):
                 item_to_album=self.item_to_album if config.enable_counters else None,
                 counter_windows_days=config.counter_windows_days if config.enable_counters else None,
             )
-            _save_store_cache(self.store, config, "train")
+            _save_store_cache(self.store, config, paths, "train")
 
         self._build_sample_positions()
 
@@ -422,20 +350,20 @@ class YambdaTrainDataset(Dataset):
             f"{self.num_items} items, {self.store.num_users} users"
         )
 
-    def _load_metadata(self, processed_dir: Path) -> None:
-        artist_map = pl.read_parquet(processed_dir / "artist_item_mapping.parquet")
+    def _load_metadata(self, metadata_dir: Path) -> None:
+        artist_map = pl.read_parquet(metadata_dir / "artist_item_mapping.parquet")
         self.item_to_artist = np.zeros(self.item_popularity.shape[0], dtype=np.int64)
         valid = artist_map.filter(pl.col("item_id") < len(self.item_to_artist))
         self.item_to_artist[valid["item_id"].to_numpy()] = valid["artist_id"].to_numpy()
         self.num_artists = int(artist_map["artist_id"].max()) + 1
 
-        album_map = pl.read_parquet(processed_dir / "album_item_mapping.parquet")
+        album_map = pl.read_parquet(metadata_dir / "album_item_mapping.parquet")
         self.item_to_album = np.zeros(self.item_popularity.shape[0], dtype=np.int64)
         valid = album_map.filter(pl.col("item_id") < len(self.item_to_album))
         self.item_to_album[valid["item_id"].to_numpy()] = valid["album_id"].to_numpy()
         self.num_albums = int(album_map["album_id"].max()) + 1
 
-        emb_path = processed_dir / "embeddings.parquet"
+        emb_path = metadata_dir / "embeddings.parquet"
         if emb_path.exists():
             emb_df = pl.read_parquet(emb_path)
             item_ids = emb_df["item_id"].to_numpy()
@@ -565,20 +493,20 @@ class YambdaTrainDataset(Dataset):
 class YambdaEvalDataset(Dataset):
     """Evaluation dataset with split history pools."""
 
-    def __init__(self, config: DataConfig, processed_dir: str | Path):
+    def __init__(self, config: DataConfig, paths: DataPaths):
         self.config = config
-        processed_dir = Path(processed_dir)
+        self.paths = paths
 
-        test_events = pl.read_parquet(processed_dir / "test_events.parquet")
-        self.item_popularity = np.load(processed_dir / "item_popularity.npy")
+        test_events = pl.read_parquet(paths.processed / "test_events.parquet")
+        self.item_popularity = np.load(paths.processed / "item_popularity.npy")
 
-        self._load_metadata(processed_dir)
+        self._load_metadata(paths.metadata)
 
-        cached = _try_load_cached_store(config, "eval")
+        cached = _try_load_cached_store(config, paths, "eval")
         if cached is not None:
             self.store = cached
         else:
-            sessions = pl.read_parquet(processed_dir / "train_sessions.parquet")
+            sessions = pl.read_parquet(paths.processed / "train_sessions.parquet")
             self.store = FlatEventStore(
                 sessions,
                 enable_counters=config.enable_counters,
@@ -586,7 +514,7 @@ class YambdaEvalDataset(Dataset):
                 item_to_album=self.item_to_album if config.enable_counters else None,
                 counter_windows_days=config.counter_windows_days if config.enable_counters else None,
             )
-            _save_store_cache(self.store, config, "eval")
+            _save_store_cache(self.store, config, paths, "eval")
 
         if config.enable_counters:
             self._precompute_eval_item_counters()
@@ -609,18 +537,18 @@ class YambdaEvalDataset(Dataset):
         self.test_uids = sorted(self.test_ground_truth.keys())
         logger.info(f"Eval dataset: {len(self.test_uids)} test users")
 
-    def _load_metadata(self, processed_dir: Path) -> None:
-        artist_map = pl.read_parquet(processed_dir / "artist_item_mapping.parquet")
+    def _load_metadata(self, metadata_dir: Path) -> None:
+        artist_map = pl.read_parquet(metadata_dir / "artist_item_mapping.parquet")
         self.item_to_artist = np.zeros(len(self.item_popularity), dtype=np.int64)
         valid = artist_map.filter(pl.col("item_id") < len(self.item_to_artist))
         self.item_to_artist[valid["item_id"].to_numpy()] = valid["artist_id"].to_numpy()
 
-        album_map = pl.read_parquet(processed_dir / "album_item_mapping.parquet")
+        album_map = pl.read_parquet(metadata_dir / "album_item_mapping.parquet")
         self.item_to_album = np.zeros(len(self.item_popularity), dtype=np.int64)
         valid = album_map.filter(pl.col("item_id") < len(self.item_to_album))
         self.item_to_album[valid["item_id"].to_numpy()] = valid["album_id"].to_numpy()
 
-        emb_path = processed_dir / "embeddings.parquet"
+        emb_path = metadata_dir / "embeddings.parquet"
         if emb_path.exists():
             emb_df = pl.read_parquet(emb_path)
             item_ids = emb_df["item_id"].to_numpy()

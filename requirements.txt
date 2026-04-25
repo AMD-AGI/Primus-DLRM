@@ -19,11 +19,18 @@
 # Core
 datasets==4.5.0
 pyarrow==23.0.1
-polars==1.38.1
+# polars-u64-idx is the polars build with 64-bit row indices, required for
+# datasets with > 2^32 rows (e.g. the Yambda 5B variant has 4.79 B rows).
+# It exposes the same `polars` import name.
+polars-u64-idx==1.33.1
 pyyaml==6.0.3
 tqdm==4.67.3
 tensorboard==2.20.0
 numpy==2.3.5
+
+# Numba is required by primus_dlrm.data.counters for the parallelised
+# two-pointer sliding-window kernels used in counter precomputation.
+numba==0.65.1
 
 # Dev / testing
 pytest==9.0.2

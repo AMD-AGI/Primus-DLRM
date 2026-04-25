@@ -2,21 +2,22 @@
 """Pre-build the FlatEventStore mmap cache for train and eval splits.
 
 Run this once after preprocessing to avoid the cold-start delay when
-launching training for the first time.  The cache is written to
-``--cache-dir`` (default ``data/cache``) and is picked up automatically
-by YambdaTrainDataset / YambdaEvalDataset when ``use_cache=True``.
+launching training for the first time. The cache is written to the
+``DataPaths.cache`` location derived from ``--data-root`` and the config's
+``dataset_size`` (e.g. ``data/cache_5b/`` for the 5B variant), and is picked
+up automatically by ``YambdaTrainDataset`` / ``YambdaEvalDataset`` when
+``use_cache=True``.
 
 Examples
 --------
 # Build all cache variants needed by every config in configs/:
-python scripts/build_cache.py --all-configs --processed-dir data/processed
+python scripts/build_cache.py --all-configs
 
-# Single config:
-python scripts/build_cache.py --config configs/bench_onetrans_v7_large.yaml
+# Single config (uses the config's dataset_size to derive paths):
+python scripts/build_cache.py --config configs/bench_onetrans_large_5b.yaml
 
-# Manual counter settings:
-python scripts/build_cache.py --processed-dir data/processed \
-    --enable-counters --counter-windows 7 30
+# Manual counter settings against the 50m default layout:
+python scripts/build_cache.py --enable-counters --counter-windows 7 30
 """
 import argparse
 import logging
@@ -26,6 +27,7 @@ from pathlib import Path
 
 from primus_dlrm.config import Config, DataConfig
 from primus_dlrm.data.dataset import (
+    DataPaths,
     FlatEventStore,
     _cache_key,
     _save_store_cache,
@@ -34,20 +36,20 @@ from primus_dlrm.data.dataset import (
 
 import numpy as np
 import polars as pl
-import yaml
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def _load_id_mappings(processed_dir: Path, num_items: int):
-    """Load item-to-artist and item-to-album lookup arrays."""
-    artist_map = pl.read_parquet(processed_dir / "artist_item_mapping.parquet")
+def _load_id_mappings(metadata_dir: Path, num_items: int):
+    """Load item-to-artist and item-to-album lookup arrays from the
+    canonical metadata dir (typically ``data/shared_metadata/``)."""
+    artist_map = pl.read_parquet(metadata_dir / "artist_item_mapping.parquet")
     item_to_artist = np.zeros(num_items, dtype=np.int64)
     valid = artist_map.filter(pl.col("item_id") < num_items)
     item_to_artist[valid["item_id"].to_numpy()] = valid["artist_id"].to_numpy()
 
-    album_map = pl.read_parquet(processed_dir / "album_item_mapping.parquet")
+    album_map = pl.read_parquet(metadata_dir / "album_item_mapping.parquet")
     item_to_album = np.zeros(num_items, dtype=np.int64)
     valid = album_map.filter(pl.col("item_id") < num_items)
     item_to_album[valid["item_id"].to_numpy()] = valid["album_id"].to_numpy()
@@ -57,7 +59,7 @@ def _load_id_mappings(processed_dir: Path, num_items: int):
 
 def build_split_cache(
     config: DataConfig,
-    processed_dir: Path,
+    paths: DataPaths,
     split: str,
     sessions: pl.DataFrame | None = None,
     item_to_artist: np.ndarray | None = None,
@@ -68,28 +70,23 @@ def build_split_cache(
     Accepts pre-loaded sessions / mappings to avoid redundant I/O when
     building multiple cache variants.
     """
-    cached = _try_load_cached_store(config, split)
+    cached = _try_load_cached_store(config, paths, split)
+    key = _cache_key(
+        split, config.counter_windows_days if config.enable_counters else None,
+    )
     if cached is not None:
-        key = _cache_key(
-            split,
-            config.counter_windows_days if config.enable_counters else None,
-        )
-        logger.info(f"[{key}] Cache already exists, skipping.")
+        logger.info(f"[{key}] Cache already exists at {paths.cache / key}, skipping.")
         return
 
-    key = _cache_key(
-        split,
-        config.counter_windows_days if config.enable_counters else None,
-    )
     logger.info(f"[{key}] Building FlatEventStore...")
     t0 = time.time()
 
     if sessions is None:
-        sessions = pl.read_parquet(processed_dir / "train_sessions.parquet")
+        sessions = pl.read_parquet(paths.processed / "train_sessions.parquet")
 
     if config.enable_counters and item_to_artist is None:
-        num_items = len(np.load(processed_dir / "item_popularity.npy"))
-        item_to_artist, item_to_album = _load_id_mappings(processed_dir, num_items)
+        num_items = len(np.load(paths.processed / "item_popularity.npy"))
+        item_to_artist, item_to_album = _load_id_mappings(paths.metadata, num_items)
 
     store = FlatEventStore(
         sessions,
@@ -98,10 +95,10 @@ def build_split_cache(
         item_to_album=item_to_album if config.enable_counters else None,
         counter_windows_days=config.counter_windows_days if config.enable_counters else None,
     )
-    _save_store_cache(store, config, split)
+    _save_store_cache(store, config, paths, split)
 
     elapsed = time.time() - t0
-    cache_dir = Path(config.cache_dir) / key
+    cache_dir = paths.cache / key
     total_bytes = sum(f.stat().st_size for f in cache_dir.iterdir())
     logger.info(
         f"[{key}] Cache built in {elapsed:.1f}s — "
@@ -123,6 +120,7 @@ def _collect_data_configs(config_dir: Path) -> list[DataConfig]:
 
         dc = cfg.data
         cache_signature = (
+            dc.dataset_size,
             dc.enable_counters,
             tuple(dc.counter_windows_days) if dc.enable_counters else (),
         )
@@ -130,14 +128,15 @@ def _collect_data_configs(config_dir: Path) -> list[DataConfig]:
             seen_keys.add(cache_signature)
             configs.append(dc)
             logger.info(
-                f"  {yaml_path.name}: counters={dc.enable_counters}, "
+                f"  {yaml_path.name}: size={dc.dataset_size}, "
+                f"counters={dc.enable_counters}, "
                 f"windows={dc.counter_windows_days if dc.enable_counters else '(none)'}"
             )
 
     return configs
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Pre-build FlatEventStore mmap cache",
     )
@@ -155,16 +154,17 @@ def main():
         help="Directory to scan with --all-configs (default: configs/)",
     )
     parser.add_argument(
-        "--processed-dir", type=str, default="data/processed",
-        help="Path to preprocessed data directory",
+        "--data-root", type=str, default=None,
+        help="Root directory for raw/processed/cache subdirs. Overrides "
+             "config.data.data_dir (default: from config, typically 'data').",
     )
     parser.add_argument(
-        "--cache-dir", type=str, default=None,
-        help="Override cache output directory (default: data/cache)",
+        "--dataset-size", type=str, default=None, choices=["50m", "500m", "5b"],
+        help="Override dataset size (default: from config.data.dataset_size).",
     )
     parser.add_argument(
         "--enable-counters", action="store_true",
-        help="Enable counter feature precomputation",
+        help="Enable counter feature precomputation (only used without --config)",
     )
     parser.add_argument(
         "--counter-windows", type=int, nargs="+", default=None,
@@ -177,14 +177,7 @@ def main():
     )
     args = parser.parse_args()
 
-    processed_dir = Path(args.processed_dir)
-    if not (processed_dir / "train_sessions.parquet").exists():
-        parser.error(
-            f"train_sessions.parquet not found in {processed_dir}. "
-            f"Run scripts/preprocess.py first."
-        )
-
-    # Collect DataConfig variants to build
+    # Resolve DataConfig variants and build a DataPaths for each.
     if args.all_configs:
         config_dir = Path(args.config_dir)
         logger.info(f"Scanning {config_dir} for unique cache variants...")
@@ -201,42 +194,58 @@ def main():
             dc.counter_windows_days = args.counter_windows
         data_configs = [dc]
 
-    # Apply cache_dir override to all variants
+    # Apply CLI overrides.
     for dc in data_configs:
         dc.use_cache = True
-        if args.cache_dir is not None:
-            dc.cache_dir = args.cache_dir
+        if args.dataset_size is not None:
+            dc.dataset_size = args.dataset_size
 
-    # Pre-load shared data once
-    logger.info("Loading sessions and metadata...")
-    sessions = pl.read_parquet(processed_dir / "train_sessions.parquet")
-
-    need_counters = any(dc.enable_counters for dc in data_configs)
-    item_to_artist, item_to_album = None, None
-    if need_counters:
-        num_items = len(np.load(processed_dir / "item_popularity.npy"))
-        item_to_artist, item_to_album = _load_id_mappings(processed_dir, num_items)
-
-    # Build each variant
-    t_total = time.time()
+    # Group configs by their DataPaths so we share session+metadata loads.
+    by_paths: dict[tuple[str, str], list[DataConfig]] = {}
     for dc in data_configs:
-        for split in args.splits:
-            build_split_cache(
-                dc, processed_dir, split,
-                sessions=sessions,
-                item_to_artist=item_to_artist,
-                item_to_album=item_to_album,
+        paths = DataPaths.from_config(dc, data_root=args.data_root)
+        by_paths.setdefault((str(paths.data_root), paths.dataset_size), []).append(dc)
+
+    t_total = time.time()
+    for (root, size), dcs in by_paths.items():
+        paths = DataPaths(data_root=Path(root), dataset_size=size)
+        if not (paths.processed / "train_sessions.parquet").exists():
+            parser.error(
+                f"train_sessions.parquet not found in {paths.processed}. "
+                f"Run scripts/preprocess.py --size {size} first."
             )
 
-    # Report total size
-    cache_root = Path(data_configs[0].cache_dir)
-    if cache_root.exists():
-        total_bytes = sum(
-            f.stat().st_size for f in cache_root.rglob("*") if f.is_file()
-        )
         logger.info(
-            f"Total cache size: {total_bytes / 1e9:.2f} GB at {cache_root}"
+            f"=== {size}: processed={paths.processed}, metadata={paths.metadata}, "
+            f"cache={paths.cache} ==="
         )
+
+        sessions = pl.read_parquet(paths.processed / "train_sessions.parquet")
+
+        need_counters = any(dc.enable_counters for dc in dcs)
+        item_to_artist, item_to_album = None, None
+        if need_counters:
+            num_items = len(np.load(paths.processed / "item_popularity.npy"))
+            item_to_artist, item_to_album = _load_id_mappings(paths.metadata, num_items)
+
+        for dc in dcs:
+            for split in args.splits:
+                build_split_cache(
+                    dc, paths, split,
+                    sessions=sessions,
+                    item_to_artist=item_to_artist,
+                    item_to_album=item_to_album,
+                )
+
+        if paths.cache.exists():
+            total_bytes = sum(
+                f.stat().st_size for f in paths.cache.rglob("*") if f.is_file()
+            )
+            logger.info(
+                f"=== {size}: total cache size {total_bytes / 1e9:.2f} GB "
+                f"at {paths.cache} ==="
+            )
+
     logger.info(f"All done in {time.time() - t_total:.1f}s.")
 
 

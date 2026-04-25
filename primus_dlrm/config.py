@@ -45,12 +45,13 @@ class DataConfig:
     # Time windows (days) for counter aggregation, e.g. [7, 30] = 7-day + 30-day
     counter_windows_days: list[int] = field(default_factory=lambda: [30])
 
-    # Root directory for raw and processed data
+    # Root directory for raw and processed data. All other paths
+    # (processed/, cache/, shared_metadata/) are derived from this and
+    # ``dataset_size`` via ``primus_dlrm.data.dataset.DataPaths``.
     data_dir: str = "data"
 
-    # Cache preprocessed collated batches to disk for faster restarts
+    # Cache preprocessed collated batches to disk for faster restarts.
     use_cache: bool = True
-    cache_dir: str = "data/cache"
 
     # Synthetic data generation (replaces real data when enabled)
     synthetic: SyntheticDataConfig = field(default_factory=lambda: SyntheticDataConfig())
