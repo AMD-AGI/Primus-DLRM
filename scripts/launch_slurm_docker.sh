@@ -30,6 +30,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 NNODES=1
 GPUS=8
 CONFIG=""
+DATA_ROOT=""
 MAX_STEPS=0
 RUN_NAME="docker_dist"
 RESULTS_DIR="results"
@@ -55,6 +56,7 @@ while [[ $# -gt 0 ]]; do
         --nnodes)         NNODES="$2"; shift 2;;
         --gpus)           GPUS="$2"; shift 2;;
         --config)         CONFIG="$2"; shift 2;;
+        --data-root)      DATA_ROOT="$2"; shift 2;;
         --max-steps)      MAX_STEPS="$2"; shift 2;;
         --run-name)       RUN_NAME="$2"; shift 2;;
         --results-dir)    RESULTS_DIR="$2"; shift 2;;
@@ -262,6 +264,7 @@ srun --kill-on-bad-exit=1 --export=ALL bash -c '
                 --master_port=\$MASTER_PORT \
                 scripts/run_distributed.py \
                 --config \"$CONFIG\" \
+                $([ -n \"$DATA_ROOT\" ] && echo --data-root \"$DATA_ROOT\") \
                 --dense-strategy \"$DENSE_STRATEGY\" \
                 --max-steps $MAX_STEPS \
                 --log-interval $LOG_INTERVAL \

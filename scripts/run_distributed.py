@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from primus_dlrm.config import Config
 from primus_dlrm.data.dataset import (
+    DataPaths,
     YambdaEvalDataset,
     YambdaTrainDataset,
     collate_to_dict,
@@ -175,11 +176,11 @@ def _setup_synthetic(config, world_size, rank, pipeline):
     return None, loader
 
 
-def _setup_real_data(config, processed_dir, world_size, rank, pipeline):
+def _setup_real_data(config, paths, world_size, rank, pipeline):
     """Build dataset and dataloader for real Yambda data."""
     if is_main_process():
         logger.info("Loading training dataset...")
-    dataset = YambdaTrainDataset(config.data, processed_dir)
+    dataset = YambdaTrainDataset(config.data, paths)
 
     per_gpu_batch = config.train.batch_size // world_size
     sampler = DistributedSampler(
@@ -207,7 +208,13 @@ def _setup_real_data(config, processed_dir, world_size, rank, pipeline):
 def main():
     parser = argparse.ArgumentParser(description="Distributed DLRM training")
     parser.add_argument("--config", required=True)
-    parser.add_argument("--processed-dir", default="data/processed")
+    parser.add_argument(
+        "--data-root", default=None,
+        help="Root directory for raw/processed/cache subdirs. Overrides "
+             "config.data.data_dir (default: from config, typically 'data'). "
+             "Subdirs are derived by convention: shared_metadata/, "
+             "processed[_<size>]/, cache[_<size>]/.",
+    )
     parser.add_argument("--dense-strategy", default="ddp", choices=["ddp", "fsdp", "dmp"])
     parser.add_argument("--embedding-sharding", default="auto",
                         choices=["auto", "table_wise", "row_wise", "data_parallel", "column_wise"],
@@ -240,7 +247,7 @@ def main():
     configure_runtime(config.train)
     torch.manual_seed(config.train.seed + rank)
 
-    processed_dir = Path(args.processed_dir)
+    paths = DataPaths.from_config(config.data, data_root=args.data_root)
     run_dir = Path(args.results_dir) / args.run_name
     if is_main_process():
         log_dir = run_dir / "logs"
@@ -262,7 +269,7 @@ def main():
         )
     else:
         train_dataset, train_loader = _setup_real_data(
-            config, processed_dir, world_size, rank, args.pipeline,
+            config, paths, world_size, rank, args.pipeline,
         )
 
     # Model
@@ -301,7 +308,7 @@ def main():
     # Eval function (rank 0 only, unless skipped; always skipped for synthetic)
     eval_fn = None
     if not args.skip_eval and not use_synthetic and is_main_process():
-        eval_dataset = YambdaEvalDataset(config.data, processed_dir)
+        eval_dataset = YambdaEvalDataset(config.data, paths)
         pop = eval_dataset.item_popularity
         candidate_items = np.argsort(-pop)[:5000]
 
