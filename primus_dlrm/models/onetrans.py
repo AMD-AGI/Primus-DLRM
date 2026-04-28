@@ -25,6 +25,16 @@ try:
 except ImportError:
     _HAS_TURBO_ATTN = False
 
+import os
+
+# flash-attention's ROCm backend is selected at import time by reading the
+# FLASH_ATTENTION_TRITON_AMD_ENABLE env var:
+#   "TRUE"        → flash_attn_func dispatches to the aiter Triton kernels
+#   unset/FALSE   → flash_attn_func dispatches to the CK C++ extension
+#                   (flash_attn_2_cuda)
+# This must be set BEFORE Python imports flash_attn (typically in the launcher).
+_USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
+
 try:
     from flash_attn import flash_attn_func as _flash_attn
     _HAS_FLASH_ATTN = True
@@ -93,10 +103,30 @@ class MixedAttention(nn.Module):
             raise RuntimeError(
                 "attention_impl='turbo' requires primus_turbo package. "
             )
-        if attention_impl == "fav2" and not _HAS_FLASH_ATTN:
-            raise RuntimeError(
-                "attention_impl='fav2' requires flash_attn package. "
-            )
+        if attention_impl == "fav2":
+            if not _HAS_FLASH_ATTN:
+                raise RuntimeError(
+                    "attention_impl='fav2' requires flash_attn package."
+                )
+            if _USE_TRITON_ROCM:
+                raise RuntimeError(
+                    "attention_impl='fav2' (CK backend) requires "
+                    "FLASH_ATTENTION_TRITON_AMD_ENABLE to be unset/FALSE, "
+                    "but flash_attn was imported with the Triton backend active. "
+                    "Either unset the env var, or use attention_impl='fav2_triton'."
+                )
+        if attention_impl == "fav2_triton":
+            if not _HAS_FLASH_ATTN:
+                raise RuntimeError(
+                    "attention_impl='fav2_triton' requires flash_attn package."
+                )
+            if not _USE_TRITON_ROCM:
+                raise RuntimeError(
+                    "attention_impl='fav2_triton' requires "
+                    "FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE in the environment "
+                    "BEFORE Python imports flash_attn. Set it in your shell or "
+                    "launcher (e.g. `export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE`)."
+                )
         if attention_impl == "fav4" and not _HAS_FLASH_ATTN_4:
             raise RuntimeError(
                 "attention_impl='fav4' requires flash-attn-4 package "
@@ -149,8 +179,14 @@ class MixedAttention(nn.Module):
             out = _turbo_flash_attn(q, k, v, causal=True, dropout_p=drop_p)
         elif self.attention_impl == "fav4":
             out = _flash_attn_4(q, k, v, causal=True)
-        elif self.attention_impl == "fav2":
-            out = _flash_attn(q, k, v, causal=True, dropout_p=drop_p)
+        elif self.attention_impl in ("fav2", "fav2_triton"):
+            # Backend (CK vs Triton) is selected at flash_attn import time
+            # via FLASH_ATTENTION_TRITON_AMD_ENABLE; validated in __init__.
+            # Note: aiter Triton backend currently asserts sd_mask is None when
+            # return_softmax=False, but allocates sd_mask whenever dropout_p>0.
+            # Force dropout_p=0 for fav2_triton until the upstream bug is fixed.
+            fa_drop_p = 0.0 if self.attention_impl == "fav2_triton" else drop_p
+            out = _flash_attn(q, k, v, causal=True, dropout_p=fa_drop_p)
         elif self.attention_impl == "sdpa":
             q_t = q.transpose(1, 2)
             k_t = k.transpose(1, 2)
@@ -162,7 +198,7 @@ class MixedAttention(nn.Module):
         else:
             raise ValueError(
                 f"Unknown attention_impl: {self.attention_impl!r}. "
-                f"Supported: 'sdpa', 'fav2', 'fav4', 'turbo'"
+                f"Supported: 'sdpa', 'fav2', 'fav2_triton', 'fav4', 'turbo'"
             )
 
         out = out.reshape(B, out.shape[1], self.d_model)

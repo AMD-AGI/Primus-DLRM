@@ -234,6 +234,9 @@ def main():
     parser.add_argument("--trace-active", type=int, default=10)
     parser.add_argument("--pipeline", action="store_true",
                         help="Use TorchRec TrainPipelineSparseDist (3-stage, DMP only)")
+    parser.add_argument("--attention-impl", default=None,
+                        choices=["sdpa", "fav2", "fav2_triton", "fav4", "turbo"],
+                        help="Override config.model.transformer.attention_impl")
     args = parser.parse_args()
 
     init_distributed()

@@ -238,10 +238,15 @@ class TransformerConfig:
     pos_embed: bool = True
 
     # Attention implementation:
-    #   "sdpa"  — PyTorch scaled_dot_product_attention (default, works everywhere)
-    #   "fav2"  — FlashAttention-2 (requires flash_attn package)
-    #   "fav4"  — FlashAttention-4 / CuTeDSL (requires flash-attn-4, Blackwell optimized)
-    #   "turbo" — Primus-Turbo flash attention (requires primus_turbo package, ROCm)
+    #   "sdpa"        — PyTorch scaled_dot_product_attention (default, works everywhere)
+    #   "fav2"        — FlashAttention-2 CK backend; requires the env var
+    #                   FLASH_ATTENTION_TRITON_AMD_ENABLE to be unset/FALSE before
+    #                   flash_attn is imported.
+    #   "fav2_triton" — FlashAttention-2 Triton AMD backend (aiter kernels); requires
+    #                   FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE before flash_attn is
+    #                   imported. Set in your shell or job launcher.
+    #   "fav4"        — FlashAttention-4 / CuTeDSL (requires flash-attn-4, Blackwell)
+    #   "turbo"       — Primus-Turbo flash attention (requires primus_turbo, ROCm)
     attention_impl: str = "turbo"
 
 

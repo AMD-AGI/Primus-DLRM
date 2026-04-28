@@ -37,6 +37,22 @@ def register_backend(name, fwd_fn, bwd_ok=True):
     BACKEND_REGISTRY[name] = {"fwd": fwd_fn, "bwd_ok": bwd_ok}
 
 
+def _make_fav2_backend(backend_module, label):
+    """Build a flash_attn_func wrapper that swaps the FA dispatcher to
+    ``backend_module`` (the CK C-extension or the aiter Triton interface)
+    just-in-time, since flash_attn.flash_attn_interface reads
+    ``flash_attn_gpu`` at call time."""
+    import flash_attn.flash_attn_interface as fa_iface
+    from flash_attn import flash_attn_func
+
+    def _fn(q, k, v):
+        fa_iface.flash_attn_gpu = backend_module
+        return flash_attn_func(q, k, v, causal=True)
+
+    _fn.__name__ = label
+    return _fn
+
+
 def _load_backends(names):
     loaded = {}
     for name in names:
@@ -45,6 +61,17 @@ def _load_backends(names):
                 from flash_attn import flash_attn_func
                 register_backend("fav2",
                     lambda q, k, v, fn=flash_attn_func: fn(q, k, v, causal=True))
+            elif name == "fav2_ck":
+                # CK C++ extension built from flash-attention source
+                import flash_attn_2_cuda as ck_backend
+                register_backend("fav2_ck",
+                    _make_fav2_backend(ck_backend, "fav2_ck"))
+            elif name == "fav2_triton":
+                # AMD Triton kernels shipped in aiter
+                from aiter.ops.triton._triton_kernels.flash_attn_triton_amd \
+                    import flash_attn_2 as triton_backend
+                register_backend("fav2_triton",
+                    _make_fav2_backend(triton_backend, "fav2_triton"))
             elif name == "fav4":
                 from flash_attn.cute import flash_attn_func as fa4_fn
                 register_backend("fav4",
