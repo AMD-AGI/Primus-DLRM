@@ -38,6 +38,9 @@ def apply_cli_overrides(config: Config, args) -> Config:
     if hasattr(args, "embedding_sharding"):
         config.distributed.embedding_sharding.strategy = args.embedding_sharding
         overrides.append(f"embedding_sharding={args.embedding_sharding}")
+    if getattr(args, "attention_impl", None):
+        config.model.transformer.attention_impl = args.attention_impl
+        overrides.append(f"attention_impl={args.attention_impl}")
     if overrides:
         logger.info(f"CLI overrides applied: {', '.join(overrides)}")
     return config
