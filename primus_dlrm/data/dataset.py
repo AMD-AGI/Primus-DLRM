@@ -130,11 +130,11 @@ class FlatEventStore:
             "is_organic", "played_ratio_pct", "track_length_seconds",
         ])
 
-        self.flat_uid = exploded["uid"].to_numpy().astype(np.int64)
-        self.flat_item_ids = exploded["item_ids"].to_numpy().astype(np.int64)
+        self.flat_uid = exploded["uid"].to_numpy().astype(np.int32)
+        self.flat_item_ids = exploded["item_ids"].to_numpy().astype(np.int32)
         self.flat_timestamps = exploded["timestamps"].to_numpy().astype(np.int64)
-        self.flat_event_types = exploded["event_types"].to_numpy().astype(np.int64)
-        self.flat_played_ratio = exploded["played_ratio_pct"].to_numpy().astype(np.float32)
+        self.flat_event_types = exploded["event_types"].to_numpy().astype(np.int8)
+        self.flat_played_ratio = exploded["played_ratio_pct"].to_numpy().astype(np.float16)
 
         np.nan_to_num(self.flat_played_ratio, copy=False, nan=0.0)
 
@@ -415,9 +415,9 @@ class YambdaTrainDataset(Dataset):
         pos_path = self.paths.cache / cache_key / f"positions_L{L}.npy"
 
         if pos_path.exists():
-            self._positions = np.load(pos_path)
+            self._positions = np.load(pos_path, mmap_mode="r")
             logger.info(
-                f"Valid training positions: {len(self._positions):,} (from cache)"
+                f"Valid training positions: {len(self._positions):,} (mmap from cache)"
             )
             return
 
