@@ -217,7 +217,7 @@ def precompute_item_counters(
     counter_windows_days = list(counter_windows_days)
     N = flat_item_ids.shape[0]
     W = len(counter_windows_days)
-    out = np.zeros((N, 3 * W), dtype=np.float16)
+    out = np.zeros((N, 3 * W), dtype=np.float32)
 
     t0 = time.time()
     sort_idx = _polars_lexsort({"item_id": flat_item_ids, "ts": flat_ts})
@@ -246,7 +246,7 @@ def precompute_item_counters(
             f"  item_counters[{w_days}d]: {time.time() - t0:.1f}s "
             f"({len(seg_s):,} segments, {N:,} events)"
         )
-    out[sort_idx] = sorted_out.astype(np.float16, copy=False)
+    out[sort_idx] = sorted_out.astype(np.float32, copy=False)
     return out
 
 
@@ -376,7 +376,7 @@ def precompute_cross_counters(
     counter_windows_days = list(counter_windows_days)
     N = flat_uid.shape[0]
     W = len(counter_windows_days)
-    out = np.zeros((N, 9 * W), dtype=np.float16)
+    out = np.zeros((N, 9 * W), dtype=np.float32)
 
     is_lp_u8 = flat_is_lp.astype(np.uint8, copy=False)
     is_like_u8 = flat_is_like.astype(np.uint8, copy=False)
