@@ -237,8 +237,15 @@ class FlatEventStore:
         logger.info(f"Saved mmap store to {mmap_dir}")
 
     @classmethod
-    def load_mmap(cls, mmap_dir: str | Path) -> "FlatEventStore":
-        """Load flat arrays from memory-mapped files (lazy reads)."""
+    def load_mmap(cls, mmap_dir: str | Path, in_memory: bool = False) -> "FlatEventStore":
+        """Load flat arrays from cache files.
+
+        Args:
+            mmap_dir: directory containing the .npy cache files.
+            in_memory: if True, load arrays fully into RAM (fast random
+                access, higher memory). If False, use memory-mapped files
+                (lazy page faults, lower memory but slower on networked FS).
+        """
         mmap_dir = Path(mmap_dir)
         import json
         with open(mmap_dir / "store_meta.json") as f:
@@ -279,6 +286,7 @@ def _cache_key(split: str, counter_windows_days: list[int] | None) -> str:
 
 def _try_load_cached_store(
     config: DataConfig, paths: "DataPaths", split: str,
+    in_memory: bool = False,
 ) -> FlatEventStore | None:
     """Return cached FlatEventStore if available and use_cache is enabled."""
     if not config.use_cache:
@@ -290,7 +298,7 @@ def _try_load_cached_store(
     if not meta_path.exists():
         return None
     try:
-        store = FlatEventStore.load_mmap(cache_dir)
+        store = FlatEventStore.load_mmap(cache_dir, in_memory=in_memory)
         if store.enable_counters != config.enable_counters:
             logger.info("Cache counter mismatch, rebuilding...")
             return None
@@ -329,7 +337,7 @@ class YambdaTrainDataset(Dataset):
 
         self._load_metadata(paths.metadata)
 
-        cached = _try_load_cached_store(config, paths, "train")
+        cached = _try_load_cached_store(config, paths, "train", in_memory=False)
         if cached is not None:
             self.store = cached
         else:
@@ -393,16 +401,47 @@ class YambdaTrainDataset(Dataset):
         ]
 
     def _build_sample_positions(self) -> None:
-        """Build flat array of valid training positions."""
+        """Build or load flat array of valid training positions.
+
+        If a cached ``positions_L{history_length}.npy`` exists in the cache
+        dir, it is memory-mapped (shared across ranks, zero computation).
+        Otherwise, positions are computed vectorised and optionally saved.
+        """
         L = self.config.history_length
-        positions = []
-        for uid in self.store.unique_uids:
-            start, end = self.store.get_user_slice(int(uid))
-            if end - start <= L:
-                continue
-            for pos in range(start + L, end):
-                positions.append(pos)
-        self._positions = np.array(positions, dtype=np.int64)
+        cache_key = _cache_key(
+            "train",
+            self.config.counter_windows_days if self.config.enable_counters else None,
+        )
+        pos_path = self.paths.cache / cache_key / f"positions_L{L}.npy"
+
+        if pos_path.exists():
+            self._positions = np.load(pos_path)
+            logger.info(
+                f"Valid training positions: {len(self._positions):,} (from cache)"
+            )
+            return
+
+        starts = self.store.user_start
+        ends = self.store.user_end
+        counts = np.maximum(ends - starts - L, 0)
+        total = int(counts.sum())
+        positions = np.empty(total, dtype=np.int64)
+        offset = 0
+        for i in range(len(starts)):
+            n = int(counts[i])
+            if n > 0:
+                positions[offset:offset + n] = np.arange(
+                    int(starts[i]) + L, int(ends[i]), dtype=np.int64,
+                )
+                offset += n
+
+        if self.config.use_cache:
+            pos_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(pos_path, positions)
+            logger.info(f"Saved positions cache: {pos_path}")
+            self._positions = positions
+        else:
+            self._positions = positions
         logger.info(f"Valid training positions: {len(self._positions):,}")
 
     def __len__(self) -> int:

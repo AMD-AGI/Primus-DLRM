@@ -250,6 +250,106 @@ def precompute_item_counters(
     return out
 
 
+def _cross_counter_one_entity(
+    flat_uid: np.ndarray,
+    entity_arr: np.ndarray,
+    flat_ts_i64: np.ndarray,
+    is_lp_u8: np.ndarray,
+    is_like_u8: np.ndarray,
+    is_skip_broad_u8: np.ndarray,
+    counter_windows_days: list[int],
+    entity_name: str,
+    entity_idx: int,
+    out: np.ndarray,
+    user_starts: np.ndarray,
+    user_ends: np.ndarray,
+    chunk_size: int,
+) -> None:
+    """Process one entity (item/artist/album) in user-chunks to limit memory."""
+    N = flat_uid.shape[0]
+    W = len(counter_windows_days)
+    n_users = len(user_starts)
+    n_chunks = (n_users + chunk_size - 1) // chunk_size
+
+    logger.info(
+        f"  cross[{entity_name}]: processing {n_users:,} users in "
+        f"{n_chunks} chunks of {chunk_size:,}"
+    )
+    t_total = time.time()
+
+    for chunk_i in range(n_chunks):
+        u_lo = chunk_i * chunk_size
+        u_hi = min(u_lo + chunk_size, n_users)
+        ev_lo = int(user_starts[u_lo])
+        ev_hi = int(user_ends[u_hi - 1])
+        chunk_n = ev_hi - ev_lo
+
+        t0 = time.time()
+        c_uid = flat_uid[ev_lo:ev_hi]
+        c_ent = entity_arr[ev_lo:ev_hi]
+        c_ts = flat_ts_i64[ev_lo:ev_hi]
+        c_lp = is_lp_u8[ev_lo:ev_hi]
+        c_like = is_like_u8[ev_lo:ev_hi]
+        c_skip = is_skip_broad_u8[ev_lo:ev_hi]
+
+        sort_idx = _polars_lexsort({
+            "uid": c_uid, "ent": c_ent, "ts": c_ts,
+        })
+        sorted_uid = c_uid[sort_idx]
+        sorted_ent = c_ent[sort_idx]
+        sorted_ts = c_ts[sort_idx]
+        sorted_lp = c_lp[sort_idx]
+        sorted_like = c_like[sort_idx]
+        sorted_skip = c_skip[sort_idx]
+        seg_s, seg_e = _compute_segments_2col(sorted_uid, sorted_ent)
+
+        sorted_out = np.zeros((chunk_n, 3 * W), dtype=np.float64)
+        for w_idx, w_days in enumerate(counter_windows_days):
+            _user_counters_kernel(
+                seg_s, seg_e,
+                sorted_ts, sorted_lp, sorted_like, sorted_skip,
+                np.int64(w_days * SECONDS_PER_DAY),
+                sorted_out,
+                np.int64(w_idx * 3 + 0),
+                np.int64(w_idx * 3 + 1),
+                np.int64(w_idx * 3 + 2),
+            )
+
+        global_idx = sort_idx + ev_lo
+        for w_idx in range(W):
+            base = w_idx * 9 + entity_idx * 3
+            out[global_idx, base + 0] = sorted_out[:, w_idx * 3 + 0].astype(
+                np.float32, copy=False
+            )
+            out[global_idx, base + 1] = sorted_out[:, w_idx * 3 + 1].astype(
+                np.float32, copy=False
+            )
+            out[global_idx, base + 2] = sorted_out[:, w_idx * 3 + 2].astype(
+                np.float32, copy=False
+            )
+
+        del sort_idx, sorted_uid, sorted_ent, sorted_ts
+        del sorted_lp, sorted_like, sorted_skip, sorted_out
+
+        elapsed_chunk = time.time() - t0
+        elapsed_total = time.time() - t_total
+        pct = (chunk_i + 1) / n_chunks * 100
+        events_done = ev_hi
+        events_per_sec = events_done / max(elapsed_total, 0.01)
+        eta = (N - events_done) / max(events_per_sec, 1)
+        if (chunk_i + 1) % max(1, n_chunks // 20) == 0 or chunk_i == n_chunks - 1:
+            logger.info(
+                f"  cross[{entity_name}]: {pct:5.1f}% chunk {chunk_i+1}/{n_chunks} "
+                f"| {chunk_n:,} events in {elapsed_chunk:.1f}s "
+                f"| {len(seg_s):,} segments "
+                f"| elapsed {elapsed_total:.0f}s, ETA {eta:.0f}s"
+            )
+
+    logger.info(
+        f"  cross[{entity_name}]: done in {time.time() - t_total:.1f}s"
+    )
+
+
 def precompute_cross_counters(
     flat_uid: np.ndarray,
     flat_item_ids: np.ndarray,
@@ -260,36 +360,18 @@ def precompute_cross_counters(
     item_to_artist: np.ndarray,
     item_to_album: np.ndarray,
     counter_windows_days: Iterable[int],
+    chunk_users: int = 100_000,
 ) -> np.ndarray:
-    """Bit-exact, multi-threaded replacement for
-    ``FlatEventStore._precompute_cross_counters``.
+    """Bit-exact, multi-threaded cross counter computation.
 
-    The original Python implementation iterates per user and uses three
-    parallel ``defaultdict`` to track per-item / per-artist / per-album
-    counts within the user's sliding window. Equivalently, we can split the
-    work into three independent passes:
+    Processes users in chunks to limit peak memory. Each chunk sorts and
+    computes counters for a subset of users independently (cross counters
+    are per-(user, entity) so chunks are independent).
 
-      pass A: for each event, count user's prior events (in window) with the
-              SAME item as this event's target  -> sort by (uid, item_id, ts),
-              two-pointer per (uid, item_id) segment.
-      pass B: same, for artist  -> sort by (uid, artist_id, ts),
-              two-pointer per (uid, artist_id) segment.
-      pass C: same, for album  -> sort by (uid, album_id, ts),
-              two-pointer per (uid, album_id) segment.
-
-    Each pass can be parallelised across segments. Because all three passes
-    use the same per-segment two-pointer logic with the same ``is_lp``,
-    ``is_like``, broader-``is_skip`` indicator buckets, this matches the
-    original Python output bit-for-bit.
-
-    NOTE: the original ``_precompute_cross_counters`` uses ``evt = 0 if is_lp
-    else (1 if is_like else 2)``, putting EVERY event that is not a
-    listen-plus and not a like into the "skip" bucket -- including unlikes,
-    dislikes, and undislikes. This is broader than the standalone ``is_skip``
-    flag (which is only listens with played < 50%). We replicate this
-    semantics by passing ``is_skip_broad = ~(is_lp | is_like)`` instead of
-    the per-event ``is_skip`` flag. The user_counters and item_counters
-    paths use the proper ``is_skip`` indicator, matching the original.
+    Args:
+        chunk_users: number of users per chunk. Lower = less memory.
+            Default 100k users keeps peak sort memory under ~50 GB for
+            typical event distributions.
     """
     counter_windows_days = list(counter_windows_days)
     N = flat_uid.shape[0]
@@ -306,58 +388,20 @@ def precompute_cross_counters(
     flat_artist = item_to_artist[flat_item_ids]
     flat_album = item_to_album[flat_item_ids]
 
+    user_starts, user_ends = _compute_segments(flat_uid)
+    logger.info(
+        f"  cross counters: {len(user_starts):,} users, {N:,} events, "
+        f"chunk_users={chunk_users:,}"
+    )
+
     for entity_idx, (entity_name, entity_arr) in enumerate(
         [("item", flat_item_ids), ("artist", flat_artist), ("album", flat_album)]
     ):
-        t0 = time.time()
-        # Sort by (uid, entity_id, ts) so that each (uid, entity_id) pair forms
-        # a single contiguous segment. polars sort is multi-threaded.
-        sort_idx = _polars_lexsort({
-            "uid": flat_uid, "ent": entity_arr, "ts": flat_ts,
-        })
-        sorted_uid = flat_uid[sort_idx]
-        sorted_ent = entity_arr[sort_idx]
-        sorted_ts = flat_ts_i64[sort_idx]
-        sorted_lp = is_lp_u8[sort_idx]
-        sorted_like = is_like_u8[sort_idx]
-        sorted_skip = is_skip_broad_u8[sort_idx]
-        seg_s, seg_e = _compute_segments_2col(sorted_uid, sorted_ent)
-        logger.info(
-            f"  cross[{entity_name}]: sort+segment in {time.time() - t0:.1f}s "
-            f"({len(seg_s):,} unique (uid, {entity_name}) segments)"
+        _cross_counter_one_entity(
+            flat_uid, entity_arr, flat_ts_i64,
+            is_lp_u8, is_like_u8, is_skip_broad_u8,
+            counter_windows_days, entity_name, entity_idx,
+            out, user_starts, user_ends, chunk_users,
         )
-
-        sorted_out = np.zeros((N, 3 * W), dtype=np.float64)
-        for w_idx, w_days in enumerate(counter_windows_days):
-            t1 = time.time()
-            _user_counters_kernel(
-                seg_s, seg_e,
-                sorted_ts, sorted_lp, sorted_like, sorted_skip,
-                np.int64(w_days * SECONDS_PER_DAY),
-                sorted_out,
-                np.int64(w_idx * 3 + 0),
-                np.int64(w_idx * 3 + 1),
-                np.int64(w_idx * 3 + 2),
-            )
-            logger.info(
-                f"  cross[{entity_name},{w_days}d]: {time.time() - t1:.1f}s"
-            )
-
-        # Scatter back into the (entity-block) columns of the output.
-        # Original's per-window column layout for cross is:
-        #   base = w_idx * 9; then [item_lp, item_like, item_skip,
-        #                           artist_lp, artist_like, artist_skip,
-        #                           album_lp,  album_like,  album_skip]
-        for w_idx in range(W):
-            base = w_idx * 9 + entity_idx * 3
-            out[sort_idx, base + 0] = sorted_out[:, w_idx * 3 + 0].astype(
-                np.float32, copy=False
-            )
-            out[sort_idx, base + 1] = sorted_out[:, w_idx * 3 + 1].astype(
-                np.float32, copy=False
-            )
-            out[sort_idx, base + 2] = sorted_out[:, w_idx * 3 + 2].astype(
-                np.float32, copy=False
-            )
 
     return out

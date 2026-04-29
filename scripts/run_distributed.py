@@ -178,9 +178,12 @@ def _setup_synthetic(config, world_size, rank, pipeline):
 
 def _setup_real_data(config, paths, world_size, rank, pipeline):
     """Build dataset and dataloader for real Yambda data."""
+    import time as _time
+    _t0 = _time.time()
     if is_main_process():
-        logger.info("Loading training dataset...")
+        logger.info("Stage: loading training dataset...")
     dataset = YambdaTrainDataset(config.data, paths)
+    logger.info(f"Stage: rank {rank} dataset loaded in {_time.time() - _t0:.1f}s")
 
     per_gpu_batch = config.train.batch_size // world_size
     sampler = DistributedSampler(
