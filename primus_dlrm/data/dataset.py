@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import logging
+import mmap as _mmap_mod
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -13,6 +15,33 @@ from torch.utils.data import Dataset
 
 from primus_dlrm.config import DataConfig
 from primus_dlrm.data.preprocessing import EVENT_TYPE_MAP
+
+
+def _load_npy_readonly(path: str | Path) -> np.ndarray:
+    """Load a .npy file as a read-only mmap with zero overcommit charge.
+
+    Uses MAP_SHARED + PROT_READ which the kernel does not count against
+    the vm.overcommit limit (unlike numpy's mmap_mode='r' which uses
+    MAP_PRIVATE and reserves commit for copy-on-write pages).
+    """
+    path = Path(path)
+    with open(path, "rb") as f:
+        version = np.lib.format.read_magic(f)
+        if version[0] == 1:
+            shape, fortran, dtype = np.lib.format.read_array_header_1_0(f)
+        else:
+            shape, fortran, dtype = np.lib.format.read_array_header_2_0(f)
+        offset = f.tell()
+
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        buf = _mmap_mod.mmap(fd, 0, access=_mmap_mod.ACCESS_READ)
+    finally:
+        os.close(fd)
+
+    arr = np.ndarray(shape, dtype=dtype, buffer=buf, offset=offset)
+    arr.flags.writeable = False
+    return arr
 
 
 # ---------------------------------------------------------------------------
@@ -130,11 +159,11 @@ class FlatEventStore:
             "is_organic", "played_ratio_pct", "track_length_seconds",
         ])
 
-        self.flat_uid = exploded["uid"].to_numpy().astype(np.int32)
-        self.flat_item_ids = exploded["item_ids"].to_numpy().astype(np.int32)
+        self.flat_uid = exploded["uid"].to_numpy().astype(np.int64)
+        self.flat_item_ids = exploded["item_ids"].to_numpy().astype(np.int64)
         self.flat_timestamps = exploded["timestamps"].to_numpy().astype(np.int64)
-        self.flat_event_types = exploded["event_types"].to_numpy().astype(np.int8)
-        self.flat_played_ratio = exploded["played_ratio_pct"].to_numpy().astype(np.float16)
+        self.flat_event_types = exploded["event_types"].to_numpy().astype(np.int64)
+        self.flat_played_ratio = exploded["played_ratio_pct"].to_numpy().astype(np.float32)
 
         np.nan_to_num(self.flat_played_ratio, copy=False, nan=0.0)
 
@@ -261,15 +290,11 @@ class FlatEventStore:
                       "flat_event_types", "flat_played_ratio",
                       "flat_is_listen_plus", "flat_is_like", "flat_is_skip",
                       "user_start", "user_end", "unique_uids"):
-            setattr(store, name, np.load(
-                mmap_dir / f"{name}.npy", mmap_mode="r",
-            ))
+            setattr(store, name, _load_npy_readonly(mmap_dir / f"{name}.npy"))
 
         if store.enable_counters:
             for name in ("user_counters", "item_counters", "cross_counters"):
-                setattr(store, name, np.load(
-                    mmap_dir / f"{name}.npy", mmap_mode="r",
-                ))
+                setattr(store, name, _load_npy_readonly(mmap_dir / f"{name}.npy"))
 
         logger.info(
             f"Loaded mmap store: {store.total_events:,} events, "
@@ -415,7 +440,7 @@ class YambdaTrainDataset(Dataset):
         pos_path = self.paths.cache / cache_key / f"positions_L{L}.npy"
 
         if pos_path.exists():
-            self._positions = np.load(pos_path, mmap_mode="r")
+            self._positions = _load_npy_readonly(pos_path)
             logger.info(
                 f"Valid training positions: {len(self._positions):,} (mmap from cache)"
             )
