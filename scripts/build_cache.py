@@ -74,31 +74,57 @@ def build_split_cache(
     key = _cache_key(
         split, config.counter_windows_days if config.enable_counters else None,
     )
-    if cached is not None:
-        logger.info(f"[{key}] Cache already exists at {paths.cache / key}, skipping.")
-        return
-
-    logger.info(f"[{key}] Building FlatEventStore...")
     t0 = time.time()
+    if cached is not None:
+        store = cached
+        logger.info(f"[{key}] Store cache exists at {paths.cache / key}.")
+    else:
+        logger.info(f"[{key}] Building FlatEventStore...")
 
-    if sessions is None:
-        sessions = pl.read_parquet(paths.processed / "train_sessions.parquet")
+        if sessions is None:
+            sessions = pl.read_parquet(paths.processed / "train_sessions.parquet")
 
-    if config.enable_counters and item_to_artist is None:
-        num_items = len(np.load(paths.processed / "item_popularity.npy"))
-        item_to_artist, item_to_album = _load_id_mappings(paths.metadata, num_items)
+        if config.enable_counters and item_to_artist is None:
+            num_items = len(np.load(paths.processed / "item_popularity.npy"))
+            item_to_artist, item_to_album = _load_id_mappings(paths.metadata, num_items)
 
-    store = FlatEventStore(
-        sessions,
-        enable_counters=config.enable_counters,
-        item_to_artist=item_to_artist if config.enable_counters else None,
-        item_to_album=item_to_album if config.enable_counters else None,
-        counter_windows_days=config.counter_windows_days if config.enable_counters else None,
-    )
-    _save_store_cache(store, config, paths, split)
+        store = FlatEventStore(
+            sessions,
+            enable_counters=config.enable_counters,
+            item_to_artist=item_to_artist if config.enable_counters else None,
+            item_to_album=item_to_album if config.enable_counters else None,
+            counter_windows_days=config.counter_windows_days if config.enable_counters else None,
+        )
+        _save_store_cache(store, config, paths, split)
+
+    # Pre-build positions arrays for common history_length values
+    cache_dir = paths.cache / key
+    for hl in [config.history_length]:
+        pos_path = cache_dir / f"positions_L{hl}.npy"
+        if pos_path.exists():
+            logger.info(f"[{key}] positions_L{hl} already cached.")
+            continue
+        t_pos = time.time()
+        starts = store.user_start
+        ends = store.user_end
+        counts = np.maximum(ends - starts - hl, 0)
+        total = int(counts.sum())
+        positions = np.empty(total, dtype=np.int64)
+        offset = 0
+        for i in range(len(starts)):
+            n = int(counts[i])
+            if n > 0:
+                positions[offset:offset + n] = np.arange(
+                    int(starts[i]) + hl, int(ends[i]), dtype=np.int64,
+                )
+                offset += n
+        np.save(pos_path, positions)
+        logger.info(
+            f"[{key}] positions_L{hl}: {total:,} positions, "
+            f"{positions.nbytes / 1e9:.2f} GB, {time.time() - t_pos:.1f}s"
+        )
 
     elapsed = time.time() - t0
-    cache_dir = paths.cache / key
     total_bytes = sum(f.stat().st_size for f in cache_dir.iterdir())
     logger.info(
         f"[{key}] Cache built in {elapsed:.1f}s — "

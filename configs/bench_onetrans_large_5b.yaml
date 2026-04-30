@@ -38,7 +38,9 @@ model:
     ffn_mult: 4
     n_ns_tokens: 16
     use_pyramid: true
-    dropout: 0.1
+    # Set to 0.0 for fair cross-platform comparison: some attention backends
+    # (e.g. fav4/FlashAttention-4) do not support dropout_p yet.
+    dropout: 0.0
     pos_embed: true
     attention_impl: turbo
   embedding_tables:
@@ -61,7 +63,11 @@ feature:
 
 train:
   torch_compile: true
-  batch_size: 16384
+  # Sequential access avoids random mmap page faults on shared FS (virtiofs).
+  # On B200 nodes (1.3 TB RAM, 738 GB mmap cache), shuffle=true causes random
+  # I/O across the full cache, dropping throughput until the entire cache is warm.
+  shuffle: false
+  batch_size: 8192
   lr: 0.0003
   weight_decay: 0.00001
   epochs: 1

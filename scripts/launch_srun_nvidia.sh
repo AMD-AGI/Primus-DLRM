@@ -102,8 +102,9 @@ docker run --rm \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     "'"$DOCKER_IMAGE"'" \
     bash -c "
-        pip install fbgemm-gpu==1.5.0+cu130 --index-url https://download.pytorch.org/whl/cu130 2>&1 | tail -3
-        pip install torchrec==1.4.0 polars pyarrow pyyaml tqdm datasets psutil 2>&1 | tail -3
+        pip install /workspace/dlrm/pip_cache/fbgemm_gpu_nightly-2026.4.29-cp312-cp312-linux_x86_64.whl 2>&1 | tail -3
+        pip install --no-deps torchrec==1.4.0 2>&1 | tail -3
+        pip install polars pyarrow pyyaml tqdm datasets psutil torchmetrics tensordict pyre-extensions iopath typing-inspect 2>&1 | tail -3
         pip install 'flash-attn-4==4.0.0b10' 'flash-attn-4[cu13]' 2>&1 | tail -3
         export PYTHONPATH=/workspace/dlrm:\${PYTHONPATH:-}
         echo \"Starting torchrun...\"

@@ -16,9 +16,57 @@ import sys
 from functools import partial
 from pathlib import Path
 
+import math
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Sampler
+
+
+class LargeDatasetSampler(Sampler):
+    """Memory-efficient DistributedSampler for billion-scale datasets.
+
+    PyTorch's stock ``DistributedSampler`` materializes ``list(range(N))``
+    which costs 28 bytes per element in CPython. For 4B+ samples that's
+    >100 GB per rank. This sampler yields indices lazily with O(1) memory.
+
+    Activated automatically by ``setup_real_dataloader`` when
+    ``len(dataset) > 100M``; smaller datasets keep using
+    ``DistributedSampler``.
+
+    Shuffle path uses ``torch.randint`` (sampling with replacement) rather
+    than ``randperm`` to stay O(1). For epoch-scale training on 4B+
+    samples this is statistically equivalent (negligible repeat probability
+    per epoch). With ``shuffle=False`` it does sequential striding
+    ``i*world_size + rank`` for perfectly reproducible per-rank streams.
+    """
+
+    def __init__(self, dataset, num_replicas, rank, shuffle=False, seed=0):
+        self.dataset_len = len(dataset)
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        self.num_samples = math.ceil(self.dataset_len / self.num_replicas)
+        self.total_size = self.num_samples * self.num_replicas
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __len__(self):
+        return self.num_samples
+
+    def __iter__(self):
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            # Use randint for O(1) memory instead of randperm for O(N)
+            for _ in range(self.num_samples):
+                yield int(torch.randint(0, self.dataset_len, (1,), generator=g).item())
+        else:
+            for i in range(self.num_samples):
+                idx = (i * self.num_replicas + self.rank) % self.dataset_len
+                yield idx
 
 from primus_dlrm.config import Config
 from primus_dlrm.data.dataset import (
@@ -178,15 +226,28 @@ def _setup_synthetic(config, world_size, rank, pipeline):
 
 def _setup_real_data(config, paths, world_size, rank, pipeline):
     """Build dataset and dataloader for real Yambda data."""
+    import time as _time
+    _t0 = _time.time()
     if is_main_process():
-        logger.info("Loading training dataset...")
+        logger.info("Stage: loading training dataset...")
     dataset = YambdaTrainDataset(config.data, paths)
+    logger.info(f"Stage: rank {rank} dataset loaded in {_time.time() - _t0:.1f}s")
 
     per_gpu_batch = config.train.batch_size // world_size
-    sampler = DistributedSampler(
-        dataset, num_replicas=world_size, rank=rank,
-        shuffle=config.train.shuffle,
-    )
+    if len(dataset) > 100_000_000:
+        logger.info(
+            f"Using LargeDatasetSampler for {len(dataset):,} samples "
+            f"(avoids {len(dataset) * 28 / 1e9:.0f} GB per-rank allocation)"
+        )
+        sampler = LargeDatasetSampler(
+            dataset, num_replicas=world_size, rank=rank,
+            shuffle=config.train.shuffle, seed=config.train.seed,
+        )
+    else:
+        sampler = DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank,
+            shuffle=config.train.shuffle,
+        )
     if pipeline:
         collate_fn = partial(collate_pipeline_batch, config=config)
     else:
@@ -234,6 +295,9 @@ def main():
     parser.add_argument("--trace-active", type=int, default=10)
     parser.add_argument("--pipeline", action="store_true",
                         help="Use TorchRec TrainPipelineSparseDist (3-stage, DMP only)")
+    parser.add_argument("--attention-impl", default=None,
+                        choices=["sdpa", "fav2", "fav4", "turbo"],
+                        help="Override config.model.transformer.attention_impl")
     args = parser.parse_args()
 
     init_distributed()

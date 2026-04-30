@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import logging
+import mmap as _mmap_mod
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -13,6 +15,36 @@ from torch.utils.data import Dataset
 
 from primus_dlrm.config import DataConfig
 from primus_dlrm.data.preprocessing import EVENT_TYPE_MAP
+
+
+def _load_npy_readonly(path: str | Path) -> np.ndarray:
+    """Load a .npy file as a read-only mmap with zero overcommit charge.
+
+    Uses MAP_SHARED + PROT_READ so the kernel does not count the mapping
+    against ``vm.overcommit_memory=2`` limits (unlike numpy's
+    ``mmap_mode='r'`` which uses MAP_PRIVATE and reserves per-process
+    commit for copy-on-write). Required for the 5B cache (~700 GB total)
+    where 8 ranks per node would otherwise blow past virtual-memory
+    overcommit on shared filesystems.
+    """
+    path = Path(path)
+    with open(path, "rb") as f:
+        version = np.lib.format.read_magic(f)
+        if version[0] == 1:
+            shape, fortran, dtype = np.lib.format.read_array_header_1_0(f)
+        else:
+            shape, fortran, dtype = np.lib.format.read_array_header_2_0(f)
+        offset = f.tell()
+
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        buf = _mmap_mod.mmap(fd, 0, access=_mmap_mod.ACCESS_READ)
+    finally:
+        os.close(fd)
+
+    arr = np.ndarray(shape, dtype=dtype, buffer=buf, offset=offset)
+    arr.flags.writeable = False
+    return arr
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +162,10 @@ class FlatEventStore:
             "is_organic", "played_ratio_pct", "track_length_seconds",
         ])
 
+        # int64 throughout: 5B-scale uid/item_ids exceed int32 (2^31) range.
+        # Using int64 uniformly makes the cache binary layout dataset-size
+        # agnostic (50m and 5b share the same load path) at the cost of ~2x
+        # larger flat arrays for 50m.
         self.flat_uid = exploded["uid"].to_numpy().astype(np.int64)
         self.flat_item_ids = exploded["item_ids"].to_numpy().astype(np.int64)
         self.flat_timestamps = exploded["timestamps"].to_numpy().astype(np.int64)
@@ -237,8 +273,15 @@ class FlatEventStore:
         logger.info(f"Saved mmap store to {mmap_dir}")
 
     @classmethod
-    def load_mmap(cls, mmap_dir: str | Path) -> "FlatEventStore":
-        """Load flat arrays from memory-mapped files (lazy reads)."""
+    def load_mmap(cls, mmap_dir: str | Path, in_memory: bool = False) -> "FlatEventStore":
+        """Load flat arrays from cache files.
+
+        Args:
+            mmap_dir: directory containing the .npy cache files.
+            in_memory: if True, load arrays fully into RAM (fast random
+                access, higher memory). If False, use memory-mapped files
+                (lazy page faults, lower memory but slower on networked FS).
+        """
         mmap_dir = Path(mmap_dir)
         import json
         with open(mmap_dir / "store_meta.json") as f:
@@ -254,15 +297,11 @@ class FlatEventStore:
                       "flat_event_types", "flat_played_ratio",
                       "flat_is_listen_plus", "flat_is_like", "flat_is_skip",
                       "user_start", "user_end", "unique_uids"):
-            setattr(store, name, np.load(
-                mmap_dir / f"{name}.npy", mmap_mode="r",
-            ))
+            setattr(store, name, _load_npy_readonly(mmap_dir / f"{name}.npy"))
 
         if store.enable_counters:
             for name in ("user_counters", "item_counters", "cross_counters"):
-                setattr(store, name, np.load(
-                    mmap_dir / f"{name}.npy", mmap_mode="r",
-                ))
+                setattr(store, name, _load_npy_readonly(mmap_dir / f"{name}.npy"))
 
         logger.info(
             f"Loaded mmap store: {store.total_events:,} events, "
@@ -279,6 +318,7 @@ def _cache_key(split: str, counter_windows_days: list[int] | None) -> str:
 
 def _try_load_cached_store(
     config: DataConfig, paths: "DataPaths", split: str,
+    in_memory: bool = False,
 ) -> FlatEventStore | None:
     """Return cached FlatEventStore if available and use_cache is enabled."""
     if not config.use_cache:
@@ -290,7 +330,7 @@ def _try_load_cached_store(
     if not meta_path.exists():
         return None
     try:
-        store = FlatEventStore.load_mmap(cache_dir)
+        store = FlatEventStore.load_mmap(cache_dir, in_memory=in_memory)
         if store.enable_counters != config.enable_counters:
             logger.info("Cache counter mismatch, rebuilding...")
             return None
@@ -329,7 +369,7 @@ class YambdaTrainDataset(Dataset):
 
         self._load_metadata(paths.metadata)
 
-        cached = _try_load_cached_store(config, paths, "train")
+        cached = _try_load_cached_store(config, paths, "train", in_memory=False)
         if cached is not None:
             self.store = cached
         else:
@@ -393,16 +433,47 @@ class YambdaTrainDataset(Dataset):
         ]
 
     def _build_sample_positions(self) -> None:
-        """Build flat array of valid training positions."""
+        """Build or load flat array of valid training positions.
+
+        If a cached ``positions_L{history_length}.npy`` exists in the cache
+        dir, it is memory-mapped (shared across ranks, zero computation).
+        Otherwise, positions are computed vectorised and optionally saved.
+        """
         L = self.config.history_length
-        positions = []
-        for uid in self.store.unique_uids:
-            start, end = self.store.get_user_slice(int(uid))
-            if end - start <= L:
-                continue
-            for pos in range(start + L, end):
-                positions.append(pos)
-        self._positions = np.array(positions, dtype=np.int64)
+        cache_key = _cache_key(
+            "train",
+            self.config.counter_windows_days if self.config.enable_counters else None,
+        )
+        pos_path = self.paths.cache / cache_key / f"positions_L{L}.npy"
+
+        if pos_path.exists():
+            self._positions = _load_npy_readonly(pos_path)
+            logger.info(
+                f"Valid training positions: {len(self._positions):,} (mmap from cache)"
+            )
+            return
+
+        starts = self.store.user_start
+        ends = self.store.user_end
+        counts = np.maximum(ends - starts - L, 0)
+        total = int(counts.sum())
+        positions = np.empty(total, dtype=np.int64)
+        offset = 0
+        for i in range(len(starts)):
+            n = int(counts[i])
+            if n > 0:
+                positions[offset:offset + n] = np.arange(
+                    int(starts[i]) + L, int(ends[i]), dtype=np.int64,
+                )
+                offset += n
+
+        if self.config.use_cache:
+            pos_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(pos_path, positions)
+            logger.info(f"Saved positions cache: {pos_path}")
+            self._positions = positions
+        else:
+            self._positions = positions
         logger.info(f"Valid training positions: {len(self._positions):,}")
 
     def __len__(self) -> int:

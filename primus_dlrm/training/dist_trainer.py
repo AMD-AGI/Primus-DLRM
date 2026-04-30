@@ -575,11 +575,16 @@ class DistributedTrainer:
             num_batches = 0
 
             if pipeline:
-                steps = self._pipelined_steps(pipeline_obj, iter(self._dataloader))
+                logger.info("Stage: creating dataloader iterator...")
+                dl_iter = iter(self._dataloader)
+                logger.info("Stage: starting first training step...")
+                steps = self._pipelined_steps(pipeline_obj, dl_iter)
             else:
                 steps = self._sequential_steps(tc, active_tasks)
 
             for loss_val, task_losses in steps:
+                if num_batches == 0:
+                    logger.info(f"Stage: first step completed in {time.time() - epoch_start:.1f}s")
                 self.scheduler.step()
 
                 if self.tracer:
