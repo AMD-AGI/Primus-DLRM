@@ -36,10 +36,22 @@ import torch.nn.functional as F
 BACKEND_REGISTRY = {}
 
 KERNEL_PATTERNS = {
-    "fav4": ("fwd_sm100", "bwd_sm100"),
-    "fav2": ("fwd_sm80", "bwd_sm80"),
-    "sdpa": ("fmha_v2", "fmha_v2"),
-    "turbo": ("flash_fwd", "flash_bwd"),
+    # Case-insensitive substring match on kernel names (post .lower()).
+    # Default values pick the most common build per backend; override via
+    # --fwd-pattern / --bwd-pattern for the alternative platform/build, e.g.:
+    #   - NVIDIA Dao-AI fav2 (Hopper-and-older): fwd_sm80, bwd_sm80
+    #   - AMD primus-turbo: flash_fwd, flash_bwd (default below)
+    #   - cuDNN SDPA on NVIDIA: fmha_v2
+    "fav4": ("fwd_sm100", "bwd_sm100"),     # CuTeDSL Blackwell (NVIDIA-only)
+    "fav2": ("fmhafwd", "fmhabwddqdkdv"),   # AMD CK (ROCm flash-attention).
+                                            # CK has 3 BWD kernels per layer
+                                            # (ConvertQGrad, OGradDotO, DQDKDVKernel);
+                                            # we track only DQDKDV — the main BWD
+                                            # compute kernel carrying ~80% of BWD
+                                            # work — so per-layer assignment via
+                                            # i%n_layers stays 1:1.
+    "sdpa": ("fmha_v2", "fmha_v2"),         # NVIDIA cuDNN; on AMD ROCm, override to "fmha"
+    "turbo": ("flash_fwd", "flash_bwd"),    # AMD primus-turbo / aiter (AMD-only)
 }
 
 
@@ -161,16 +173,23 @@ def _profile_fwd_bwd(attn_fn, q, k, v, grad_out, warmup, iters, fwd_pat, bwd_pat
     return fwd_us / 1000 / iters, bwd_us / 1000 / iters
 
 
-def _load_trace(path, n_layers):
-    """Load a training trace and extract per-layer FWD/BWD kernel averages."""
+def _load_trace(path, n_layers, fwd_pat="fwd_sm100", bwd_pat="bwd_sm100"):
+    """Load a training trace and extract per-layer FWD/BWD kernel averages.
+
+    ``fwd_pat`` / ``bwd_pat`` are case-insensitive substrings used to filter
+    kernel events. AMD CK fav2 traces use ``fmhafwd``/``fmhabwd``; NVIDIA
+    fav4 traces use ``fwd_sm100``/``bwd_sm100``.
+    """
     with open(path) as f:
         data = json.load(f)
     events = data.get("traceEvents", data) if isinstance(data, dict) else data
 
-    tfwd = sorted([e for e in events if "fwd_sm100" in e.get("name", "").lower()
+    fwd_pat = fwd_pat.lower()
+    bwd_pat = bwd_pat.lower()
+    tfwd = sorted([e for e in events if fwd_pat in e.get("name", "").lower()
                    and e.get("cat") == "kernel" and e.get("dur", 0) > 0],
                   key=lambda e: e["ts"])
-    tbwd = sorted([e for e in events if "bwd_sm100" in e.get("name", "").lower()
+    tbwd = sorted([e for e in events if bwd_pat in e.get("name", "").lower()
                    and e.get("cat") == "kernel" and e.get("dur", 0) > 0],
                   key=lambda e: e["ts"])
 
@@ -206,6 +225,11 @@ def main():
     parser.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     parser.add_argument("--trace-json", type=str, default=None,
                         help="Training trace JSON for kernel-to-kernel comparison")
+    parser.add_argument("--fwd-pattern", type=str, default=None,
+                        help="Override FWD kernel-name substring (case-insensitive). "
+                             "Defaults to KERNEL_PATTERNS lookup by backend.")
+    parser.add_argument("--bwd-pattern", type=str, default=None,
+                        help="Override BWD kernel-name substring (case-insensitive).")
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -221,10 +245,16 @@ def main():
 
     layers = compute_layer_shapes(l_s, l_ns, args.n_layers, not args.no_pyramid)
 
-    # Load training trace if provided
+    # Load training trace if provided. Use first backend's patterns by default
+    # (overrideable via --fwd-pattern/--bwd-pattern for cross-backend comparison).
     trace_fwd, trace_bwd, trace_steps = {}, {}, 0
     if args.trace_json:
-        trace_fwd, trace_bwd, trace_steps = _load_trace(args.trace_json, args.n_layers)
+        be0 = args.backends[0]
+        default_fp, default_bp = KERNEL_PATTERNS.get(be0, ("fwd", "bwd"))
+        fp = args.fwd_pattern or default_fp
+        bp = args.bwd_pattern or default_bp
+        trace_fwd, trace_bwd, trace_steps = _load_trace(args.trace_json, args.n_layers,
+                                                         fwd_pat=fp, bwd_pat=bp)
 
     print("=" * 90)
     print("OneTrans Attention Kernel Benchmark")
@@ -323,7 +353,9 @@ def main():
     # ---- FWD+BWD mode (profiler, exact kernel times) ----
     for name, be in backends.items():
         attn_fn = be["fwd"]
-        fwd_pat, bwd_pat = KERNEL_PATTERNS.get(name, ("fwd", "bwd"))
+        default_fp, default_bp = KERNEL_PATTERNS.get(name, ("fwd", "bwd"))
+        fwd_pat = args.fwd_pattern or default_fp
+        bwd_pat = args.bwd_pattern or default_bp
 
         has_trace = bool(trace_fwd)
         if has_trace:
