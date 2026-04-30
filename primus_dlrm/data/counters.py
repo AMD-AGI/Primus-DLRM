@@ -371,7 +371,10 @@ def precompute_cross_counters(
     Args:
         chunk_users: number of users per chunk. Lower = less memory.
             Default 100k users keeps peak sort memory under ~50 GB for
-            typical event distributions.
+            typical event distributions. The all-at-once alternative
+            allocates >300 GB transient on 5B-scale data (4.7B events,
+            1M users) and OOMs if CPU memory is exhausted. Output is bit-identical regardless of
+            ``chunk_users``.
     """
     counter_windows_days = list(counter_windows_days)
     N = flat_uid.shape[0]

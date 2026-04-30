@@ -25,9 +25,19 @@ from torch.utils.data import DataLoader, DistributedSampler, Sampler
 class LargeDatasetSampler(Sampler):
     """Memory-efficient DistributedSampler for billion-scale datasets.
 
-    PyTorch's DistributedSampler materializes ``list(range(N))`` which
-    costs 28 bytes per element in CPython. For 4B+ samples that's >100 GB
-    per rank. This sampler yields indices lazily with O(1) memory.
+    PyTorch's stock ``DistributedSampler`` materializes ``list(range(N))``
+    which costs 28 bytes per element in CPython. For 4B+ samples that's
+    >100 GB per rank. This sampler yields indices lazily with O(1) memory.
+
+    Activated automatically by ``setup_real_dataloader`` when
+    ``len(dataset) > 100M``; smaller datasets keep using
+    ``DistributedSampler``.
+
+    Shuffle path uses ``torch.randint`` (sampling with replacement) rather
+    than ``randperm`` to stay O(1). For epoch-scale training on 4B+
+    samples this is statistically equivalent (negligible repeat probability
+    per epoch). With ``shuffle=False`` it does sequential striding
+    ``i*world_size + rank`` for perfectly reproducible per-rank streams.
     """
 
     def __init__(self, dataset, num_replicas, rank, shuffle=False, seed=0):
@@ -285,6 +295,9 @@ def main():
     parser.add_argument("--trace-active", type=int, default=10)
     parser.add_argument("--pipeline", action="store_true",
                         help="Use TorchRec TrainPipelineSparseDist (3-stage, DMP only)")
+    parser.add_argument("--attention-impl", default=None,
+                        choices=["sdpa", "fav2", "fav4", "turbo"],
+                        help="Override config.model.transformer.attention_impl")
     args = parser.parse_args()
 
     init_distributed()

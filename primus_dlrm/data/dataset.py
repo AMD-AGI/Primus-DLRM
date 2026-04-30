@@ -20,9 +20,12 @@ from primus_dlrm.data.preprocessing import EVENT_TYPE_MAP
 def _load_npy_readonly(path: str | Path) -> np.ndarray:
     """Load a .npy file as a read-only mmap with zero overcommit charge.
 
-    Uses MAP_SHARED + PROT_READ which the kernel does not count against
-    the vm.overcommit limit (unlike numpy's mmap_mode='r' which uses
-    MAP_PRIVATE and reserves commit for copy-on-write pages).
+    Uses MAP_SHARED + PROT_READ so the kernel does not count the mapping
+    against ``vm.overcommit_memory=2`` limits (unlike numpy's
+    ``mmap_mode='r'`` which uses MAP_PRIVATE and reserves per-process
+    commit for copy-on-write). Required for the 5B cache (~700 GB total)
+    where 8 ranks per node would otherwise blow past virtual-memory
+    overcommit on shared filesystems.
     """
     path = Path(path)
     with open(path, "rb") as f:
@@ -159,6 +162,10 @@ class FlatEventStore:
             "is_organic", "played_ratio_pct", "track_length_seconds",
         ])
 
+        # int64 throughout: 5B-scale uid/item_ids exceed int32 (2^31) range.
+        # Using int64 uniformly makes the cache binary layout dataset-size
+        # agnostic (50m and 5b share the same load path) at the cost of ~2x
+        # larger flat arrays for 50m.
         self.flat_uid = exploded["uid"].to_numpy().astype(np.int64)
         self.flat_item_ids = exploded["item_ids"].to_numpy().astype(np.int64)
         self.flat_timestamps = exploded["timestamps"].to_numpy().astype(np.int64)
