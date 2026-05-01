@@ -505,3 +505,128 @@ Column meanings:
 
 Variants of row 2 (DDP small-bucket AR uses several grid sizes; the dominant `(112,1,1)`
 is shown above): `ncclDevKernel_Generic_1` also fires at `grid=(110,1,1)` and `(111,1,1)`.
+
+## Comparing MI355X vs B200
+
+Both runs train OneTrans Large (1.23B dense params) on 8 GPUs intra-node, batch=1024
+per GPU, BF16, `torch.compile`. BF16 peaks: B200 = 2,250 TF/s, MI355X = 2,300 TF/s
+(within 2%, so absolute TF/s and % peak are directly comparable).
+
+### E2E
+
+| Metric | B200 | MI355X | MI355X / B200 |
+|---|---:|---:|---:|
+| Throughput (samples/s) | 24,400 | ~23,500 | 0.96× |
+| TFLOPS/GPU | 327–328 | 316 | 0.96× |
+| MFU | 14.5–14.6% | 13.7% | 0.94× |
+| Step time | 335.7 ms | 341 ms | 1.02× |
+
+MI355X is ~4% behind B200 on overall throughput despite a ~2% higher peak BF16. The
+gap comes mainly from GEMM efficiency (see below), partly compensated by similar
+attention TF/s and similar exposed comm.
+
+### Attention (FlashAttention-2 CK on AMD vs FlashAttention-4 CuTeDSL on NVIDIA)
+
+Aggregate per training step (8 layers combined):
+
+| Phase | B200 standalone | B200 e2e | MI355X standalone | MI355X e2e | MI355 / B200 (e2e) |
+|---|---:|---:|---:|---:|---:|
+| FWD time | 16.25 ms | 17.07 ms | 16.45 ms | 18.54 ms | 1.09× slower |
+| FWD TF/s | 742 | 707 | 733 | 651 | 0.92× |
+| BWD time | 38.20 ms | 41.32 ms | 56.97 ms | 59.21 ms | 1.43× slower |
+| BWD TF/s | 632 | 584 | 530 | 509 | 0.87× |
+| **FWD+BWD total** | 54.45 ms | 58.39 ms | 73.42 ms | 77.75 ms | **1.33× slower** |
+| E2E overhead | +5.0% | +12.7% FWD, +3.9% BWD | | | |
+
+CK FA-2 BWD on MI355X is ~1.4× slower than FA-4 BWD on B200 (the largest single
+attention gap). FA-4's CuTeDSL kernel benefits from sm_100 TMA + WGMMA scheduling
+that CK FA-2 hasn't yet incorporated. FWD is closer (~1.1× slower).
+
+### GEMM (cuBLAS+nvJet on B200 vs hipBLASLt+Tensile on MI355X)
+
+Aggregate:
+
+| Metric | B200 | MI355X | MI355X / B200 |
+|---|---:|---:|---:|
+| Total GEMM time / step | 33.13 ms | 86.54 ms | **2.61× slower** |
+| Aggregate TF/s | 1,092 | 836 | 0.77× |
+| Aggregate % peak | 48.5% | 36.4% | — |
+| Unique shapes | 88 | 89 | — |
+| Total ops / step | ~129 | ~130 | — |
+
+Same-shape per-kernel comparison (shapes appearing in both top-time tables):
+
+| Shape (M, N, K) | role | B200 TF/s (% peak) | MI355X TF/s (% peak) | MI / B200 |
+|---|---|---:|---:|---:|
+| **FFN forward (M ≫ N, K)** | | | | |
+| (1 536 000, 1 536, 384) | FFN up-proj | 1 200 (53%) | 770 (34%) | **0.64×** |
+| (1 536 000, 384, 1 536) | FFN down-proj | 1 295 (58%) | 1 000 (44%) | 0.77× |
+| (1 318 912, 1 536, 384) | FFN up-proj | 1 206 (54%) | 835 (36%) | 0.69× |
+| (1 318 912, 384, 1 536) | FFN down-proj | 1 303 (58%) | 1 057 (46%) | 0.81× |
+| (1 101 824, 384, 1 536) | FFN down-proj | 1 299 (58%) | 1 045 (45%) | 0.80× |
+| (884 736, 1 536, 384) | FFN up-proj | 1 242 (55%) | 773 (34%) | **0.62×** |
+| (884 736, 384, 1 536) | FFN down-proj | 1 302 (58%) | 1 054 (46%) | 0.81× |
+| **Attention projection (M ≫ N, K)** | | | | |
+| (1 536 000, 1 152, 384) | qkv proj | 1 032 (46%) | 732 (32%) | 0.71× |
+| (1 536 000, 384, 1 152) | out proj | 1 295 (58%) | 931 (40%) | 0.72× |
+| **Backward weight-grad (splitK, K ≫ M, N)** | | | | |
+| (1 152, 384, 1 536 000) | dW for attn proj | 994 (44%) | 1 042 (45%) | **1.05×** |
+| (1 536, 384, 1 536 000) | dW for FFN | 1 009 (45%) | 1 059 (46%) | **1.05×** |
+| (384, 1 536, 1 536 000) | dW for FFN | 1 036 (46%) | 635 (28%) | **0.61×** |
+| (384, 1 536, 1 318 912) | dW for FFN | 1 029 (46%) | 624 (27%) | 0.61× |
+| (384, 1 536, 1 101 824) | dW for FFN | 829 (37%) | 617 (27%) | 0.74× |
+
+Pattern:
+- **Forward "tall-skinny" GEMMs** (M ≫ N, K): MI355X gets 0.6–0.8× of B200's per-shape TF/s.
+- **Backward weight-gradient splitK with M ∈ {1152, 1536}**: MI355X is **competitive
+  (1.05× — slightly faster)** because Tensile's MT256x256 tile naturally fits
+  these MN dimensions.
+- **Backward weight-gradient splitK with M = 384**: MI355X falls to **0.6×** —
+  Tensile splitK kernel (`MT192x192`) is poorly tuned for this aspect ratio. This
+  single shape pattern (M=384) accounts for the bulk of the GEMM aggregate gap.
+
+### Communication (NCCL on B200 vs RCCL on MI355X)
+
+| Metric | B200 | MI355X | MI355X / B200 |
+|---|---:|---:|---:|
+| Total NCCL GPU time / step | 31.34 ms | 161.39 ms | **5.15× more** |
+| **Exposed (critical path) / step** | **16.76 ms** | **30.56 ms** | **1.82× more** |
+| Hidden (overlapped) / step | 14.58 ms | 130.83 ms | 8.97× more |
+| Hidden % | 47% | 81% | — |
+| Total per-rank wire bytes / step | (similar) | 14.54 GB | — |
+
+On both platforms, the **single critical-path collective is the embedding data a2a**
+(FWD scatter + BWD gather of the 6.6 GB per-rank tensor):
+
+| Embedding data a2a | B200 | MI355X | MI355X / B200 |
+|---|---:|---:|---:|
+| ms/call | 8.38 ms | 14.83 ms | 1.77× slower |
+| algBw (% peak) | 804 GB/s (89% of NVLink5 peak) | 447 GB/s (50% of XGMI peak) | 0.56× |
+| busBw (% peak) | 704 GB/s (78%) | 391 GB/s (44%) | 0.56× |
+| Critical-path contribution / step | 16.76 ms | 29.65 ms | 1.77× |
+
+NVIDIA achieves ~89% of NVLink5 peak for the data a2a; AMD achieves ~50% of XGMI peak.
+The 1.8× exposed-comm gap on this single collective accounts for ~13 ms of MI355X's
+5 ms step-time deficit vs B200; the remainder comes from GEMM and BWD attention.
+
+MI355X has **5× more total NCCL GPU time** because of (a) the int32 keys-a2a RCCL
+pathology (87 ms/step, fully hidden but using 25% of step time on the comm stream)
+and (b) AllReduce gradient sync that takes 33 ms on MI355X vs 13 ms on B200 (smaller
+buckets at lower busBw). Both are well-overlapped with compute and don't affect
+wall-clock time on either platform — the only e2e-relevant comm gap is the data a2a.
+
+### Bottom line
+
+| | B200 | MI355X | gap explanation |
+|---|---:|---:|---|
+| E2E TFLOPS/GPU | 327 | 316 (0.97×) | small overall gap |
+| Attention | strong (sm_100 TMA/WGMMA) | weaker (CK FA-2) | BWD 1.4× slower, FWD 1.1× slower |
+| GEMM | 48% peak | 36% peak (0.77×) | splitK M=384 path poorly tuned in Tensile |
+| Critical-path comm | 17 ms | 31 ms (1.8× more) | a2a busBw 78% NVLink vs 44% XGMI peak |
+
+MI355X reaches 96% of B200's e2e despite individual subsystems being 0.6–0.8× as
+efficient because: AllReduce (the comm cost most users worry about) is fully hidden
+on both, fused-ops/embeddings are similar, and the overall step is paced by the
+slowest stream (compute on B200, slightly more comm-on-the-side on MI355X). Closing
+the remaining 4% gap requires improving (in priority): Tensile splitK for M=384 shapes,
+CK FA-2 BWD kernel selection, and embedding data a2a busBw (would need MSCCL++).
