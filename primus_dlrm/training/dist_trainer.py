@@ -24,6 +24,7 @@ from primus_dlrm.distributed.setup import barrier, get_rank, get_world_size, is_
 from primus_dlrm.distributed.wrapper import is_dmp
 from primus_dlrm.training.losses import InBatchBPRLoss, MultiTaskLoss
 from primus_dlrm.training.tracer import Tracer
+from primus_dlrm.utils.model_params import is_embedding_param, log_param_summary
 
 logger = logging.getLogger(__name__)
 
@@ -164,11 +165,6 @@ def _gather_max_gpu_memory() -> str:
         return ""
 
 
-def _is_embedding_param(name: str) -> bool:
-    """Heuristic to identify embedding parameters managed by DMP."""
-    return any(tok in name for tok in ("ebc.", "ec.", "embedding"))
-
-
 def _create_dense_optimizer(params: list, tc) -> torch.optim.Optimizer:
     """Create the dense parameter optimizer based on config.
 
@@ -281,22 +277,25 @@ class DistributedTrainer:
         if is_dmp(model):
             dense_params = [
                 p for n, p in model.named_parameters()
-                if p.requires_grad and _is_embedding_param(n) is False
+                if p.requires_grad and is_embedding_param(n) is False
             ]
             self.optimizer = _create_dense_optimizer(dense_params, tc)
             self.fused_optimizer = model.fused_optimizer
             n_dense = sum(p.numel() for p in dense_params)
             n_emb = sum(
                 p.numel() for n, p in model.named_parameters()
-                if p.requires_grad and _is_embedding_param(n)
+                if p.requires_grad and is_embedding_param(n)
             )
             logger.info(f"DMP optimizer split: {n_dense:,} dense params ({tc.dense_optimizer}), "
                         f"{n_emb:,} embedding params (fused TBE)")
+            if is_main_process():
+                log_param_summary(model, dense_params, tc.dense_optimizer, get_world_size(), config)
         else:
-            self.optimizer = _create_dense_optimizer(
-                list(self.model.parameters()), tc,
-            )
+            all_params = list(self.model.parameters())
+            self.optimizer = _create_dense_optimizer(all_params, tc)
             self.fused_optimizer = None
+            if is_main_process():
+                log_param_summary(model, all_params, tc.dense_optimizer, get_world_size(), config)
 
         # Sparse warmup (wraps the fused TBE optimizer if configured)
         if self.fused_optimizer is not None and tc.sparse_warmup_steps > 0:
