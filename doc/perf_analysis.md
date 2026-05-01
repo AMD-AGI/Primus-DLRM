@@ -1,5 +1,13 @@
 # Performance Analysis
 
+## Workload (common to all platforms)
+
+- Model: OneTrans Large (d_model=384, n_heads=6, head_dim=64, 8 layers, pyramid schedule)
+- Sequence config: history_length=500, n_groups=3, L_S=1500, L_NS=16
+- Batch: 1024 per GPU × 8 GPUs = 8192 global, BF16, `torch.compile` (Inductor backend)
+- Causal attention, no dropout
+- Distributed strategy: DMP + `TrainPipelineSparseDist` (TorchRec pipelined sparse-dist)
+
 ## NVIDIA B200
 
 **Setup**
@@ -9,10 +17,6 @@
 - TorchRec: 1.4.0 (`--no-deps`)
 - FBGEMM-GPU: source-built from v1.5.0 tag (`TORCH_CUDA_ARCH_LIST=10.0`)
 - FlashAttention-4: `flash-attn-4==4.0.0b10` (CuTeDSL, sm100)
-- Model: OneTrans Large (d_model=384, n_heads=6, head_dim=64, 8 layers, pyramid schedule)
-- Sequence config: history_length=500, n_groups=3, L_S=1500, L_NS=16
-- Batch: 1024 per GPU, BF16, `torch.compile` (Inductor backend)
-- Causal attention, no dropout
 
 ### E2E Training
 
@@ -266,9 +270,7 @@ per-rank NVLink5 peak: 50 GB/s × 18 links = 900 GB/s (busBw % column references
 - TorchRec: 1.4.0 | FBGEMM-GPU: 2026.4.24 (bundled, ROCm 7.2)
 - FlashAttention-2 (CK backend, yiding12 ROCm dev branch, commit 7222cad5)
 - RCCL: 2.27.7 (no MSCCL++ — `ENABLE_MSCCLPP` not compiled in)
-- Model: OneTrans Large — same config as B200 (d_model=384, n_heads=6, head_dim=64,
-  8 layers, pyramid; L_S=1500, L_NS=16; batch=1024 per GPU; BF16; `torch.compile` Inductor)
-- Causal attention, no dropout, hipBLASLt offline tuning override applied
+- hipBLASLt offline tuning override applied
   (`configs/hipblaslt_tune/onetrans_large_5b_all138_full.txt`, +6.4% e2e gain)
 
 ### E2E Training
@@ -508,9 +510,9 @@ is shown above): `ncclDevKernel_Generic_1` also fires at `grid=(110,1,1)` and `(
 
 ## Comparing MI355X vs B200
 
-Both runs train OneTrans Large (1.23B dense params) on 8 GPUs intra-node, batch=1024
-per GPU, BF16, `torch.compile`. BF16 peaks: B200 = 2,250 TF/s, MI355X = 2,300 TF/s
-(within 2%, so absolute TF/s and % peak are directly comparable).
+Same workload on both platforms (see [Workload](#workload-common-to-all-platforms)
+above). BF16 peaks: B200 = 2,250 TF/s, MI355X = 2,300 TF/s (within 2%, so absolute
+TF/s and % peak are directly comparable across platforms).
 
 ### E2E
 
