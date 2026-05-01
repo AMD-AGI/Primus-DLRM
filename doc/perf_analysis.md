@@ -14,6 +14,46 @@
 - Batch: 1024 per GPU, BF16, `torch.compile` (Inductor backend)
 - Causal attention, no dropout
 
+### E2E Training
+
+**Performance**
+
+| Metric | Value |
+|---|---|
+| Throughput | 24,400 samples/s (8x B200) |
+| TFLOPS/GPU | 327–328 |
+| MFU | 14.5–14.6% |
+| Step time | 335.7 ms |
+
+**GPU Kernel Time Breakdown (per step, % of 335.7 ms wall-clock step time)**
+
+| Category | ms/step | % of step |
+|---|---:|---:|
+| Fused ops (Triton) | 105.55 | 31.4% |
+| GEMM (cuBLAS) | 68.02 | 20.3% |
+| Attention (FA4) | 63.86 | 19.0% |
+| Elementwise | 60.22 | 17.9% |
+| NCCL — exposed | 16.76 | 5.0% |
+| NCCL — overlapped | 14.58 | 4.3% |
+| Embeddings (FBGEMM) | 12.46 | 3.7% |
+| Misc (optimizer, sort, etc.) | 12.01 | 3.6% |
+
+Total kernel time (353 ms) exceeds wall-clock step time (336 ms) because ~14.6 ms of
+NCCL communication overlaps with compute on a separate CUDA stream. Only 16.8 ms of
+NCCL is exposed (not overlapped), adding 5% to step time.
+
+**Kernel TF/s by category:**
+
+| Category | TF/s | % of B200 peak |
+|---|---:|---:|
+| Attention FWD (`fwd_sm100`) | 707 | 31.4% |
+| Attention BWD (`bwd_sm100`) | 584 | 26.0% |
+| GEMM (cuBLAS aggregate) | 1,092 | 48.5% |
+
+GEMM achieves higher % peak than attention because cuBLAS benefits from Inductor's
+algorithm autotuning, while FA4 is a fixed custom kernel. Attention kernels are
+memory-bandwidth-bound at smaller pyramid layers (L5–L7), pulling down the aggregate.
+
 ### Attention (FlashAttention-4 / CuTeDSL)
 
 **Methodology**
@@ -187,42 +227,252 @@ inference. Per-op kernel durations are summed when cuBLAS launches multiple kern
 - **500–800 TF/s (25–35%):** Small backward splitK, embedding projections
 - **<500 TF/s (<22%):** Tiny shapes, CUTLASS fallbacks (N=396, N=18)
 
+## AMD MI355X
+
+**Setup**
+
+- GPU: AMD Instinct MI355X (gfx950, 256 CUs, BF16 peak: 2,300 TFLOPS)
+- Container: `rocm/pyt-megatron-lm-jax-nightly-private:primus_rocm7.2_20260424`
+- ROCm: 7.2.53211 | PyTorch: 2.10.0+git94c6e04 | Python: 3.12.3
+- TorchRec: 1.4.0 | FBGEMM-GPU: 2026.4.24 (bundled, ROCm 7.2)
+- FlashAttention-2 (CK backend, yiding12 ROCm dev branch, commit 7222cad5)
+- RCCL: 2.27.7 (no MSCCL++ — `ENABLE_MSCCLPP` not compiled in)
+- Model: OneTrans Large — same config as B200 (d_model=384, n_heads=6, head_dim=64,
+  8 layers, pyramid; L_S=1500, L_NS=16; batch=1024 per GPU; BF16; `torch.compile` Inductor)
+- Causal attention, no dropout, hipBLASLt offline tuning override applied
+  (`configs/hipblaslt_tune/onetrans_large_5b_all138_full.txt`, +6.4% e2e gain)
+
 ### E2E Training
 
 **Performance**
 
 | Metric | Value |
 |---|---|
-| Throughput | 24,400 samples/s (8x B200) |
-| TFLOPS/GPU | 327–328 |
-| MFU | 14.5–14.6% |
-| Step time | 335.7 ms |
+| Throughput | ~23,500 samples/s (8x MI355X, batch=8192) |
+| TFLOPS/GPU | 316 |
+| MFU | 13.7% |
+| Step time | 341 ms |
 
-**GPU Kernel Time Breakdown (per step, % of 335.7 ms wall-clock step time)**
+**GPU Kernel Time Breakdown (per step, % of 341 ms wall-clock step time)**
 
 | Category | ms/step | % of step |
 |---|---:|---:|
-| Fused ops (Triton) | 105.55 | 31.4% |
-| GEMM (cuBLAS) | 68.02 | 20.3% |
-| Attention (FA4) | 63.86 | 19.0% |
-| Elementwise | 60.22 | 17.9% |
-| NCCL — exposed | 16.76 | 5.0% |
-| NCCL — overlapped | 14.58 | 4.3% |
-| Embeddings (FBGEMM) | 12.46 | 3.7% |
-| Misc (optimizer, sort, etc.) | 12.01 | 3.6% |
+| NCCL — overlapped | 131.90 | 38.7% |
+| GEMM (hipBLASLt/Tensile) | 90.10 | 26.4% |
+| Fused ops (Triton/Inductor) | 88.91 | 26.1% |
+| Attention (CK Flash) | 77.87 | 22.8% |
+| NCCL — exposed | 33.53 | 9.8% |
+| Elementwise/Reduce | 29.66 | 8.7% |
+| Embeddings (FBGEMM) | 19.56 | 5.7% |
+| Misc (optimizer, etc.) | 10.58 | 3.1% |
 
-Total kernel time (353 ms) exceeds wall-clock step time (336 ms) because ~14.6 ms of
-NCCL communication overlaps with compute on a separate CUDA stream. Only 16.8 ms of
-NCCL is exposed (not overlapped), adding 5% to step time.
+Total kernel time across all categories sums to 482 ms; this exceeds the 341 ms wall
+step time because **132 ms (39%) of NCCL** runs overlapped with compute on a separate
+HIP stream and contributes nothing to wall time. Only **34 ms (10%)** of NCCL is
+exposed (on the critical path), about 2× B200's 5%.
+
+**NCCL breakdown by collective type (per step, classified by kernel `Collective name` arg):**
+
+| Collective | Total ms | Exposed ms | Overlapped ms | Hidden % |
+|---|---:|---:|---:|---:|
+| AllToAll  | 125.0 | 29.7 | 95.3  | 76.3% |
+| AllReduce |  36.4 |  0.9 | 35.5  | **97.5%** |
+| Other     |   4.0 |  3.0 |  1.1  | 26.6% |
+
+AllReduce is essentially free on this run (97.5% hidden behind compute, just 0.9 ms
+exposed) — DDP gradient sync overlaps almost perfectly with FWD compute of the
+following step. **All NCCL exposed time is dominated by AllToAll** (29.7 of 33.5 ms),
+specifically the keys a2a + tail of the large data a2a. This is the opposite of the
+naïve assumption that gradient AllReduce dominates comm cost on AMD.
 
 **Kernel TF/s by category:**
 
-| Category | TF/s | % of B200 peak |
+| Category | TF/s | % of MI355X peak |
 |---|---:|---:|
-| Attention FWD (`fwd_sm100`) | 707 | 31.4% |
-| Attention BWD (`bwd_sm100`) | 584 | 26.0% |
-| GEMM (cuBLAS aggregate) | 1,092 | 48.5% |
+| Attention FWD (`FmhaFwdKernel`) | 651 | 28.3% |
+| Attention BWD (DQDKDV+OGD+CQG) | 509 | 22.1% |
+| GEMM (Tensile aggregate) | 836 | 36.4% |
 
-GEMM achieves higher % peak than attention because cuBLAS benefits from Inductor's
-algorithm autotuning, while FA4 is a fixed custom kernel. Attention kernels are
-memory-bandwidth-bound at smaller pyramid layers (L5–L7), pulling down the aggregate.
+GEMM achieves the highest % peak among the three but it is **substantially below
+B200's 48.5%** for the same logical workload. The gap comes mostly from non-square
+backward-weight (splitK) shapes — e.g. shape `(384, 1536, 1.5M)` runs at 635 TF/s
+on MI355X (28% peak) vs 1009 TF/s on B200 (45% peak). hipBLASLt offline tuning
+recovered +6.4% e2e but the residual gap appears to be Tensile kernel selection +
+lower achievable HBM bandwidth utilization on the splitK back-prop shapes.
+
+### Attention (FlashAttention-2 / CK)
+
+**Methodology**
+
+Standalone benchmark uses `scripts/bench_attn_save_trace.py` (sequential layer
+iteration with profiler-saved trace). E2E uses `torch.profiler` trace at step 52
+(2 warmup + 5 active steps). Per-layer matching uses kernel grid dimensions:
+`FmhaFwdKernel` grid is `(n_heads=6, q_seq_tiles, batch=1024)` so q-seq-tile count
+identifies the layer; `FmhaBwdDQDKDVKernel` grid is `(kv_seq_tiles, n_heads=6, batch)`
+so kv-tile count identifies the layer for BWD. Three layers (L0–L2) share the same
+kv-tile count of 6; their per-layer BWD time is reported as the average within that
+group.
+
+**Per-Layer Results (FWD — `FmhaFwdKernel`)**
+
+| Layer | Q | KV | Standalone | TF/s | E2E Trace | TF/s | Overhead |
+|-------|------:|------:|-----------:|-----:|----------:|-----:|--------:|
+| L0 | 1516 | 1516 | 4.068 ms | 889 | 4.730 ms | 764 | +16.3% |
+| L1 | 1304 | 1516 | 4.041 ms | 770 | 4.606 ms | 675 | +14.0% |
+| L2 | 1092 | 1304 | 3.039 ms | 737 | 3.376 ms | 663 | +11.1% |
+| L3 | 880 | 1092 | 2.157 ms | 701 | 2.374 ms | 637 | +10.0% |
+| L4 | 668 | 880 | 1.627 ms | 568 | 1.823 ms | 507 | +12.1% |
+| L5 | 456 | 668 | 0.985 ms | 486 | 1.085 ms | 441 | +10.2% |
+| L6 | 244 | 456 | 0.446 ms | 392 | 0.444 ms | 394 | −0.4% |
+| L7 | 32 | 244 | 0.091 ms | 135 | 0.102 ms | 121 | +11.7% |
+| **Total** | | | **16.45 ms** | **733** | **18.54 ms** | **651** | **+12.7%** |
+
+**Per-Layer Results (BWD — sum of `OGradDotO + DQDKDV + ConvertQGrad`)**
+
+| Layer | Q | KV | Standalone | TF/s | E2E Trace | TF/s | Overhead |
+|-------|------:|------:|-----------:|-----:|----------:|-----:|--------:|
+| L0 | 1516 | 1516 | 13.441 ms | 672 | 13.234 ms | 683 | −1.5% |
+| L1 | 1304 | 1516 | 12.745 ms | 610 | 13.051 ms | 596 | +2.4% |
+| L2 | 1092 | 1304 | 10.930 ms | 512 | 12.903 ms | 434 | +18.0% |
+| L3 | 880 | 1092 | 7.932 ms | 476 | 8.249 ms | 458 | +4.0% |
+| L4 | 668 | 880 | 6.328 ms | 365 | 6.297 ms | 367 | −0.5% |
+| L5 | 456 | 668 | 3.548 ms | 338 | 3.380 ms | 354 | −4.8% |
+| L6 | 244 | 456 | 1.701 ms | 257 | 1.744 ms | 251 | +2.5% |
+| L7 | 32 | 244 | 0.342 ms | 90 | 0.352 ms | 87 | +3.0% |
+| **Total** | | | **56.97 ms** | **530** | **59.21 ms** | **509** | **+3.9%** |
+
+**Kernel Composition**
+
+Each CK FA-2 attention call launches:
+- FWD: 1 kernel (`FmhaFwdKernel`)
+- BWD: 3 kernels (`FmhaBwdOGradDotOKernel` + `FmhaBwdDQDKDVKernel` + `FmhaBwdConvertQGradKernel`)
+
+The `FmhaBwdDQDKDVKernel` (main BWD) carries ~90% of total BWD time (53.7 ms of 59.2 ms
+in E2E). `OGradDotOKernel` adds 3.0 ms and `ConvertQGradKernel` 2.7 ms. The CK kernel
+grid for FWD is `(n_heads=6, ⌈Q/128⌉, batch=1024)` with block `(256,1,1)` = 4 wavefronts
+per block. Even the smallest layer (L7, 32-token Q) launches 6 144 blocks — 3× over the
+GPU's 2 048 concurrent-block capacity (256 CU × 32 waves/CU ÷ 4 waves/block) — so all
+256 CUs are saturated for every layer in both standalone and E2E. Kernel selection is
+shape-driven, not workload-driven.
+
+**Training Context**
+
+- CK FA-2 attention (FWD+BWD) consumes **77.75 ms per training step** (all 8 layers
+  combined), which is **22.8% of the 341 ms step time** at ~23,500 samples/s throughput.
+- FWD attention for the 6 largest layers (L0–L5, ~17 ms total per step) **overlaps
+  100% with the EmbeddingShardingDist keys all-to-all** — the 87 ms `all_to_allv`
+  on int32 indices that runs concurrently on the comm stream throughout most of the
+  FWD pass. The two smallest layers (L6, L7) finish in <0.5 ms each and fall outside
+  this overlap window. Per-kernel verification: 30 of 40 FmhaFwd events show 100%
+  lifetime overlap with the keys a2a, 0% with AllReduce; 10 events (the L6/L7 pairs)
+  show 0% overlap with any NCCL.
+- BWD attention has **zero NCCL overlap** in our trace (verified for all 40 DQDKDV
+  events) — by the time BWD starts, the next-step keys a2a hasn't been launched yet,
+  and the AllReduce queue runs on a non-contending HIP stream. The +3.9% BWD overhead
+  is from background GEMM/embedding HBM contention, not communication.
+- Between consecutive FA-2 FWD kernels the GPU runs MLP/FFN projections (Tensile GEMMs),
+  RMSNorm (Triton), and output gating — same compute pattern as B200.
+
+**Overhead Analysis**
+
+The E2E overhead pattern differs from B200's. On B200 the smallest layers (L5–L7) suffer
+the largest FWD overhead (14–17%) because cache pollution dominates short kernels. On
+MI355X the **largest** layers (L0–L1) suffer the largest FWD overhead (+14–16%):
+- The keys a2a (87 ms) is in flight throughout the FWD pass, sharing HBM bandwidth
+  with FA-2. Larger FWD kernels stay on-chip longer and are exposed to more of the
+  a2a's HBM traffic, so they pay a larger fraction of contention cost.
+- Per-shape grid/block configs are **identical** between bench and E2E (we verified by
+  matching `(grid, block)` tuples in `scripts/compare_attn_grid_block_v2.py`); the kernel
+  selection itself does not adapt to runtime contention.
+- BWD overhead is much lower (+3.9% vs +12.7% FWD) because by the time BWD starts the
+  keys a2a window has closed and BWD runs in a near-quiet comm period. Combined with
+  DQDKDV's higher arithmetic intensity (recompute + dQ/dK/dV in one kernel), this
+  leaves only background GEMM/embedding contention as the BWD overhead source.
+
+### GEMM (hipBLASLt / Tensile)
+
+GEMM shapes and TF/s extracted directly from GPU kernel durations in the E2E training
+trace, correlated to CPU ops (`aten::mm` / `aten::addmm`) via `External id` for (M, N, K)
+shape inference. Per-op kernel durations are summed when hipBLASLt launches multiple
+kernels per op (split-K cases). Trace already includes the hipBLASLt offline tuning
+override (138 hot shapes pre-tuned via full `hipblaslt-bench --requested_solution -1`
+sweep, +6.4% e2e gain over RCCL defaults).
+
+**Aggregate: 836 TF/s (36.4% peak) | 89 shapes, 650 ops | 86.54 ms/step**
+
+| # | M | N | K | Ops | kn/op | Avg ms | TF/s | % peak | % time | Cum % | Kernel |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | 1536000 | 1536 | 384 | 10 | 1 | 2.352 | 770 | 33.5% | 5.4% | 5.4% | Custom_Cijk_Alik_Bljk_BBS_BH_MT256x256x64_MI16x16x1 |
+| 2 | 1318912 | 1536 | 384 | 10 | 1 | 1.862 | 835 | 36.3% | 4.3% | 9.7% | Custom_Cijk_Alik_Bljk_BBS_BH_MT256x256x64_MI16x16x1 |
+| 3 | 1536000 | 1152 | 384 | 10 | 1 | 1.857 | 732 | 31.8% | 4.3% | 14.0% | Cijk_Alik_Bljk_BBS_BH_MT384x256x32 |
+| 4 | 1536000 | 384 | 1536 | 10 | 1 | 1.813 | 1000 | 43.5% | 4.2% | 18.2% | Cijk_Alik_Bljk_BBS_BH_MT384x256x32 |
+| 5 | 1101824 | 1536 | 384 | 10 | 1 | 1.588 | 818 | 35.6% | 3.7% | 21.9% | Custom_Cijk_Alik_Bljk_BBS_BH_MT256x256x64_MI16x16x1 |
+| 6 | 1318912 | 384 | 1536 | 10 | 1 | 1.472 | 1057 | 45.9% | 3.4% | 25.3% | Cijk_Alik_Bljk_BBS_BH_MT384x256x32 |
+| 7 | 1536000 | 384 | 1152 | 10 | 1 | 1.460 | 931 | 40.5% | 3.4% | 28.7% | Cijk_Ailk_Bljk_BBS_BH_MT192x384x64 |
+| 8 | 384 | 1536 | 1536000 | 5 | 2 | 2.854 | 635 | 27.6% | 3.3% | 32.0% | Cijk_Ailk_Bjlk_BBS_BH_MT192x192x64 (splitK) |
+| 9 | 884736 | 1536 | 384 | 10 | 1 | 1.350 | 773 | 33.6% | 3.1% | 35.1% | Custom_Cijk_Alik_Bljk_BBS_BH_MT256x256x64_MI16x16x1 |
+| 10 | 1152 | 384 | 1536000 | 10 | 2 | 1.304 | 1042 | 45.3% | 3.0% | 38.1% | Cijk_Ailk_Bjlk_BBS_BH_MT192x320x64 (splitK) |
+| 11 | 384 | 1536 | 1318912 | 5 | 2 | 2.494 | 624 | 27.1% | 2.9% | 41.0% | Cijk_Ailk_Bjlk_BBS_BH_MT192x192x64 (splitK) |
+| 12 | 1101824 | 384 | 1536 | 10 | 1 | 1.244 | 1045 | 45.4% | 2.9% | 43.9% | Cijk_Alik_Bljk_BBS_BH_MT384x256x32 |
+| 13 | 667648 | 1536 | 384 | 10 | 1 | 1.071 | 735 | 32.0% | 2.5% | 46.3% | Custom_Cijk_Alik_Bljk_BBS_BH_MT256x256x64_MI16x16x1 |
+| 14 | 384 | 1536 | 1101824 | 5 | 2 | 2.107 | 617 | 26.8% | 2.4% | 48.8% | Cijk_Ailk_Bjlk_BBS_BH_MT192x192x64 (splitK) |
+| 15 | 884736 | 384 | 1536 | 10 | 1 | 0.991 | 1054 | 45.8% | 2.3% | 51.1% | Cijk_Alik_Bljk_BBS_BH_MT384x256x32 |
+| 16 | 1536 | 384 | 1536000 | 5 | 2 | 1.711 | 1059 | 46.0% | 2.0% | 53.0% | Cijk_Ailk_Bjlk_BBS_BH_MT192x192x64 (splitK) |
+| 17 | 384 | 1536 | 884736 | 5 | 2 | 1.687 | 619 | 26.9% | 1.9% | 55.0% | Cijk_Ailk_Bjlk_BBS_BH_MT192x192x64 (splitK) |
+| 18 | 512000 | 384 | 384 | 30 | 1 | 0.277 | 545 | 23.7% | 1.9% | 56.9% | Cijk_Alik_Bljk_BBS_BH_MT384x256x32 |
+| 19 | 1536 | 384 | 1318912 | 5 | 2 | 1.608 | 967 | 42.1% | 1.9% | 58.8% | Cijk_Ailk_Bjlk_BBS_BH_MT192x192x64 (splitK) |
+| 20 | 1318912 | 1152 | 384 | 5 | 1 | 1.553 | 751 | 32.7% | 1.8% | 60.6% | Cijk_Alik_Bljk_BBS_BH_MT384x256x32 |
+
+(Full table for all 89 shapes is available via `python3 scripts/analyze_gemm_trace.py
+--trace-json results/.../trace_step52.json --peak 2300`. Shapes 21–89 collectively
+contribute the remaining 39.4% of GEMM time.)
+
+**Shape categories by TF/s efficiency:**
+- **>1000 TF/s (>43% peak):** FFN down-projections (M~1M, N=384, K=1536) — best efficiency,
+  but only ~45% of peak (vs B200's 57% for the same logical shapes).
+- **700–1000 TF/s (30–43%):** FFN up-projections, large attention projections.
+- **500–700 TF/s (22–30%):** Backward weight gradients (splitK shapes).
+- **<500 TF/s (<22%):** Tiny shapes, fallback shaders.
+
+### Communications (RCCL)
+
+Per-comm-kind breakdown extracted from the same E2E training trace (5 active steps,
+hipBLASLt-tuned baseline). Each row groups all kernels of the same `(purpose, dtype,
+size-bucket)` and reports the representative kernel signature, message-volume and
+bandwidth metrics, and time decomposition into EXPOSED (critical-path) vs HIDDEN
+(overlapped with compute on a separate stream). Sorted by exposed time descending,
+so the single comm kind that actually moves wall-clock time is at the top.
+
+```
+profiled steps : 5
+step wall time : 341.8 ms (avg across 5 ProfilerStep events)
+NCCL kernels   : 155 (after dropping 4 trace-boundary kernels with no Collective name args)
+total NCCL time: 161.4 ms/step (47.2% of step)
+exposed (crit) : 30.6 ms/step ( 8.9% of step)
+overlapped     : 130.8 ms/step (38.3% of step)
+per-rank XGMI peak: 128 GB/s × 7 links = 896 GB/s (busBw % column references this)
+```
+
+| # | purpose | kernel | grid | block | dtype | #/step | vol/call | ms/call | algBw (% peak) | busBw (% peak) | tot ms | %step | EXP ms | %exp | where |
+|---:|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | Embedding data a2a (FWD dispatch / BWD grad) | `ncclDevKernel_G1` | (64,1,1)  | (256,1,1) | Float (4B) |  2.0× |   7.81 GB | 14.83 ms | 447.3 GB/s (49.9%)  | **391.4 GB/s (43.7%)** | 29.65 |  8.7% | **29.65** | **8.7%** | **EXPOSED (100%)** |
+| 2 | DDP gradient AllReduce (small bucket)        | `ncclDevKernel_G1` | (112,1,1) | (256,1,1) | Float (4B) | 25.0× |  73.0 MB |  1.33 ms |  54.8 GB/s ( 6.1%)  |  95.9 GB/s (10.7%)     | 33.25 |  9.7% |  0.88     | 0.3%     | HIDDEN |
+| 3 | DDP gradient AllReduce (single big bucket)   | `ncclDevKernel_G1` | (112,1,1) | (256,1,1) | Float (4B) |  1.0× | 316.2 MB |  3.16 ms |  51.1 GB/s ( 5.7%)  |  89.5 GB/s (10.0%)     |  3.16 |  0.9% |  0.02     | 0.0%     | HIDDEN |
+| 4 | KJT keys a2a (sparse feature indices)        | `ncclDevKernel_G1` | (57,1,1)  | (256,1,1) | Int (4B)   |  1.0× | 852.0 KB | **87.16 ms** | **4.9 MB/s (0.0%)** | **4.3 MB/s (0.0%)**    | **87.16** | **25.5%** | 0.01 | 0.0% | HIDDEN |
+| 5 | KJT splits a2a (per-feature lengths metadata)| `mscclKernel_Sum`  | (15,1,1)  | (256,1,1) | Long (8B)  |  1.0× |  384.0 B |  6.83 ms |  28.1 KB/s (0.0%)   |  24.6 KB/s (0.0%)      |  6.83 |  2.0% |  0.00     | 0.0%     | HIDDEN |
+| 6 | KJT lengths a2a (per-row offsets)            | `ncclDevKernel_G1` | (64,1,1)  | (256,1,1) | Long (8B)  |  1.0× | 244.3 MB |  1.34 ms | 160.0 GB/s (17.9%)  | 140.0 GB/s (15.6%)     |  1.34 |  0.4% |  0.00     | 0.0%     | HIDDEN |
+| | **TOTAL** | | | | | 31.0× | | | | | **161.39** | **47.2%** | **30.56** | **8.9%** | EXP+HID |
+
+Column meanings:
+- `vol/call` = `(In + Out) × dtype_bytes` per rank — total per-call I/O volume per rank
+  (asymmetric for a2a-v scatter/gather, exactly 2× msg-size for symmetric collectives).
+- `algBw` = `msg_size_per_rank / time` — perceived per-rank bandwidth (nccl-tests
+  "algBw"; uses `max(In, Out) × dtype_bytes` as the size).
+- `busBw` = `algBw × bus_factor` — bandwidth on the bus (nccl-tests convention,
+  comparable to per-link peak); `bus_factor = (N-1)/N` for AllToAll and `2(N-1)/N`
+  for AllReduce.
+- `ms/call` = total kernel time ÷ kernel count for the group.
+- `where` = `EXPOSED (X%)` if >50% on critical path, `HIDDEN` if <5%, else `mixed (X%)`.
+
+Variants of row 2 (DDP small-bucket AR uses several grid sizes; the dominant `(112,1,1)`
+is shown above): `ncclDevKernel_Generic_1` also fires at `grid=(110,1,1)` and `(111,1,1)`.

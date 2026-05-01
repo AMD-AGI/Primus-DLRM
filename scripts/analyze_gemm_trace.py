@@ -57,15 +57,21 @@ def main():
             cpu_by_ext[ext_id] = shape
 
     # Walk GPU kernels, correlate to shapes
+    # GEMM kernel name patterns:
+    #   NVIDIA: nvjet (cuBLAS), cutlass
+    #   AMD:    Cijk_ (Tensile/hipBLASLt), rocblas_*gemm
+    # Attention kernels to exclude:
+    #   NVIDIA: fwd_sm100/bwd_sm100/bwd_preprocess/bwd_postprocess (FA4/FA2/FA3)
+    #   AMD:    Fmha*Kernel (CK / aiter Triton)
+    GEMM_PATS = ["nvjet", "cutlass", "cijk_", "rocblas"]
+    ATTN_PATS = ["fwd_sm100", "bwd_sm100", "bwd_preprocess", "bwd_postprocess",
+                 "fmhafwdkernel", "fmhabwd"]
     ops = []
     for ext_id, kernels in gpu_by_ext.items():
-        is_gemm = any("nvjet" in k["name"].lower() or "cutlass" in k["name"].lower()
-                       for k in kernels)
+        is_gemm = any(any(g in k["name"].lower() for g in GEMM_PATS) for k in kernels)
         if not is_gemm:
             continue
-        # Skip attention
-        if any(p in kernels[0]["name"].lower()
-               for p in ["fwd_sm100", "bwd_sm100", "bwd_preprocess", "bwd_postprocess"]):
+        if any(any(p in k["name"].lower() for p in ATTN_PATS) for k in kernels):
             continue
         shape = cpu_by_ext.get(ext_id)
         if not shape:
@@ -74,10 +80,14 @@ def main():
         ops.append({"shape": shape, "dur_ms": dur_ms, "n_kernels": len(kernels),
                      "kernel": kernels[0]["name"][:60]})
 
-    # Detect steps
-    step_events = [e for e in events if "ProfilerStep" in e.get("name", "")
-                   and e.get("ph") == "X" and e.get("dur", 0) > 0]
-    n_steps = len(step_events) if step_events else 1
+    # Detect steps. ProfilerStep#N may appear multiple times per step (multiple
+    # threads emit the same span); dedupe by name to count unique step indices.
+    step_names = set()
+    for e in events:
+        n = e.get("name", "")
+        if "ProfilerStep" in n and e.get("ph") == "X" and e.get("dur", 0) > 0:
+            step_names.add(n)
+    n_steps = len(step_names) if step_names else 1
 
     # Group by shape
     shape_stats = defaultdict(lambda: {"count": 0, "total_ms": 0, "kernel": "", "n_kernels": 0})
