@@ -2,11 +2,37 @@
 
 ## Workload (common to all platforms)
 
-- Model: OneTrans Large (d_model=384, n_heads=6, head_dim=64, 8 layers, pyramid schedule)
-- Sequence config: history_length=500, n_groups=3, L_S=1500, L_NS=16
-- Batch: 1024 per GPU × 8 GPUs = 8192 global, BF16, `torch.compile` (Inductor backend)
-- Causal attention, no dropout
-- Distributed strategy: DMP + `TrainPipelineSparseDist` (TorchRec pipelined sparse-dist)
+**Model** — OneTrans Large (1.23 B dense params, arXiv:2510.26104)
+- d_model=384, n_heads=6 (head_dim=64), n_layers=8
+- Pyramid schedule: S-tokens shrink 1500→16 across the 8 layers
+- L_S=1500 (history_length=500 × 3 groups), L_NS=16
+- Causal attention, no dropout, BF16, `torch.compile` (Inductor)
+
+**Dataset** — Yambda 5B (Yandex public music-recommendation dataset)
+- ~4.7 B events / ~1 M unique users
+- Per-event features: `item`, `artist`, `album`, `uid` plus 3 history channels
+  (last-played `lp`, `like`, `skip`) per entity = 13 sparse features
+- Embedding-bag table sizes (rows × dim=64, fp32):
+
+| Table | Num rows | Bytes | Features fed |
+|---|---:|---:|---|
+| `item`   | 9 390 624 | 2.41 GB | item, hist_lp_item, hist_like_item, hist_skip_item |
+| `artist` | 1 293 395 | 0.33 GB | artist, hist_lp_artist, hist_like_artist, hist_skip_artist |
+| `album`  | 3 367 692 | 0.86 GB | album, hist_lp_album, hist_like_album, hist_skip_album |
+| `uid`    | 1 000 001 | 0.26 GB | uid |
+| **Total dense embedding** | **15.1 M** | **3.86 GB** | 13 sparse features |
+
+- Cross-counter features: 6 dense per-(user, entity) interaction counters over
+  7- and 30-day windows, projected into the dense path.
+- Cache: `data/cache_5b/` (~700 GB on shared FS, mmapped read-only across 8 ranks
+  via `MAP_SHARED + PROT_READ` to avoid `vm.overcommit_memory=2` ceilings).
+
+**Distributed** — 8 GPUs intra-node, batch=1024 per GPU × 8 = 8192 global, BF16
+- DMP (Distributed Model Parallel): each rank owns a row-wise shard of every
+  embedding table; FWD does `EmbeddingShardingDist.all_to_all_v` on sparse keys
+  (the source of the 6.6 GB per-rank a2a in the comm tables).
+- `TrainPipelineSparseDist`: 3-stage pipeline (sparse-dist of next batch
+  overlaps with current-batch FWD/BWD compute).
 
 ## NVIDIA B200
 
