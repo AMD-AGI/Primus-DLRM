@@ -227,6 +227,35 @@ inference. Per-op kernel durations are summed when cuBLAS launches multiple kern
 - **500–800 TF/s (25–35%):** Small backward splitK, embedding projections
 - **<500 TF/s (<22%):** Tiny shapes, CUTLASS fallbacks (N=396, N=18)
 
+### Communications (NCCL)
+
+Per-comm-kind breakdown extracted from the E2E training trace (5 active steps).
+Each row groups all kernels of the same `(purpose, dtype, size-bucket)` and reports
+the representative kernel signature, message volume and bandwidth metrics, and time
+decomposition into EXPOSED (critical-path) vs HIDDEN (overlapped with compute on a
+separate CUDA stream). Sorted by exposed time descending.
+
+```
+profiled steps : 5
+step wall time : 339.2 ms (avg across 5 ProfilerStep events)
+NCCL kernels   : 155
+total NCCL time: 31.3 ms/step (9.2% of step)
+exposed (crit) : 17.0 ms/step (5.0% of step)
+overlapped     : 14.3 ms/step (4.2% of step)
+per-rank NVLink5 peak: 50 GB/s × 18 links = 900 GB/s (busBw % column references this)
+```
+
+| # | purpose | kernel | dtype | #/step | vol/call | ms/call | algBw (% peak) | busBw (% peak) | tot ms | %step | EXP ms | %exp | where |
+|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | Embedding data a2a (FWD dispatch / BWD grad) | `ncclDevKernel_SendRecv` | Float (4B) | 2.0× | 7.81 GB | 8.38 ms | 804.1 GB/s (89.3%) | **703.6 GB/s (78.2%)** | 16.76 | 4.9% | **16.76** | **4.9%** | **EXPOSED (100%)** |
+| 2 | DDP gradient AllReduce (small bucket) | `ncclDevKernel_AllReduce` | Float (4B) | 25.0× | 73.4 MB | 0.52 ms | 121.6 GB/s (13.5%) | 212.7 GB/s (23.6%) | 12.95 | 3.8% | 0.18 | 0.1% | HIDDEN |
+| 3 | DDP gradient AllReduce (big bucket) | `ncclDevKernel_AllReduce` | Float (4B) | 1.0× | 305.5 MB | 0.62 ms | 286.7 GB/s (31.9%) | 501.7 GB/s (55.7%) | 0.62 | 0.2% | 0.08 | 0.0% | HIDDEN |
+| 4 | KJT lengths a2a (per-row offsets) | `ncclDevKernel_SendRecv` | Long (8B) | 1.0× | 244.3 MB | 0.98 ms | 217.0 GB/s (24.1%) | 189.9 GB/s (21.1%) | 0.98 | 0.3% | 0.02 | 0.0% | HIDDEN |
+| 5 | KJT splits a2a (per-feature metadata) | `ncclDevKernel_SendRecv` | Long (8B) | 1.0× | 384.0 B | 0.01 ms | 23.0 MB/s (0.0%) | 20.2 MB/s (0.0%) | 0.01 | 0.0% | 0.01 | 0.0% | EXPOSED (71%) |
+| 6 | KJT keys a2a (sparse feature indices) | `ncclDevKernel_SendRecv` | Int (4B) | 1.0× | 852.0 KB | 0.03 ms | 17.5 GB/s (1.9%) | 15.3 GB/s (1.7%) | 0.03 | 0.0% | 0.00 | 0.0% | HIDDEN |
+| | **TOTAL** | | | 31.0× | | | | | **31.34** | **9.2%** | **17.05** | **5.0%** | EXP+HID |
+
+
 ## AMD MI355X
 
 **Setup**
