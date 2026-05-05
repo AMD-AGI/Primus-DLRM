@@ -556,6 +556,10 @@ class DistributedTrainer:
 
         mode = "pipelined (TrainPipelineSparseDist)" if pipeline else "sequential"
         logger.info(f"Training mode: {mode}")
+        logger.info(
+            f"Batch: global={tc.batch_size} per_rank={per_gpu_batch} "
+            f"world_size={get_world_size()}"
+        )
 
         pipeline_obj = None
         if pipeline:
