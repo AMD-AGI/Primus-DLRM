@@ -176,6 +176,7 @@ def _create_dense_optimizer(params: list, tc) -> torch.optim.Optimizer:
         from distributed_shampoo import DistributedShampoo
         from distributed_shampoo.shampoo_types import (
             AdaGradPreconditionerConfig,
+            DDPDistributedConfig,
             RootInvShampooPreconditionerConfig,
         )
         from distributed_shampoo.preconditioner.matrix_functions_types import EigenConfig
@@ -195,7 +196,8 @@ def _create_dense_optimizer(params: list, tc) -> torch.optim.Optimizer:
             f"Using Distributed Shampoo (precondition_frequency={tc.shampoo_precondition_frequency}, "
             f"max_preconditioner_dim={tc.shampoo_max_preconditioner_dim}, "
             f"bf16_factor_matrix={tc.shampoo_use_bf16_factor_matrix}, "
-            f"momentum={tc.shampoo_momentum})"
+            f"momentum={tc.shampoo_momentum}, "
+            f"ddp_distributed_config={tc.shampoo_use_ddp_distributed_config})"
         )
         shampoo_kwargs: dict = dict(
             lr=tc.lr,
@@ -208,6 +210,11 @@ def _create_dense_optimizer(params: list, tc) -> torch.optim.Optimizer:
             grafting_config=AdaGradPreconditionerConfig(epsilon=1.4285714285714e-05),
             preconditioner_config=preconditioner_config,
         )
+        if tc.shampoo_use_ddp_distributed_config:
+            shampoo_kwargs["distributed_config"] = DDPDistributedConfig(
+                num_trainers_per_group=tc.shampoo_ddp_num_trainers_per_group,
+                communicate_params=tc.shampoo_ddp_communicate_params,
+            )
         # These kwargs were added in later Shampoo versions; only pass if non-default
         import inspect
         sig = inspect.signature(DistributedShampoo.__init__)

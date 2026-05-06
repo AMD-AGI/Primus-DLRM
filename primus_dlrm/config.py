@@ -60,6 +60,13 @@ class DataConfig:
     # When a string, the file is loaded and parsed during Config.load().
     schema: SchemaConfig | str = field(default_factory=lambda: SchemaConfig())
 
+    # Cross-product hashed embedding tables (e.g. user x artist, user x hour).
+    # Single source of truth: Config.expand_cross_features() auto-registers
+    # each enabled spec into model.embedding_tables, feature.scalar_features,
+    # and the schema lists at load time. Toggle individual crosses on/off
+    # via the per-spec ``enabled`` flag without touching the other lists.
+    cross_features: list[CrossFeatureSpec] = field(default_factory=list)
+
 
 # ---------------------------------------------------------------------------
 # Feature schema configuration (YAML-driven)
@@ -73,6 +80,39 @@ class EmbeddingTableConfig:
     num_embeddings: int = 0
     embedding_dim: int = 0
     pooling: str = "none"
+
+
+# Recognized cross-feature key sources resolvable from a single training event.
+# Anchored on the ScoringPair fields plus a derived hour-of-day from the event
+# timestamp.  Extending this set requires a matching getter in
+# ``YambdaTrainDataset.__getitem__`` and ``YambdaEvalDataset.get_user_history``.
+CROSS_FEATURE_KEYS = ("uid", "item_id", "artist_id", "album_id", "hour_of_day", "is_organic")
+
+
+@dataclass
+class CrossFeatureSpec:
+    """One cross-product hashed embedding table.
+
+    The dataset hot path computes ``xxhash64(key_a, key_b) % num_buckets`` per
+    sample (see ``primus_dlrm.data.hashing``). The resulting id is fed to a
+    dedicated EmbeddingCollection table whose name matches ``name``.
+
+    YAML example::
+
+        data:
+          cross_features:
+            - { name: user_x_artist, keys: [uid, artist_id],   num_buckets: 100000000 }
+            - { name: user_x_hour,   keys: [uid, hour_of_day], num_buckets: 24000000  }
+            - { name: user_x_album,  keys: [uid, album_id],    num_buckets: 40000000, enabled: false }
+
+    ``enabled: false`` disables a single cross without removing the spec from
+    the YAML, useful for ablation sweeps.
+    """
+    name: str = ""
+    keys: list[str] = field(default_factory=list)
+    num_buckets: int = 0
+    salt: int = 0
+    enabled: bool = True
 
 # Tower routing constants (DLRM only; OneTrans ignores tower)
 TOWER_USER = "user"
@@ -408,6 +448,18 @@ class TrainConfig:
     # Shampoo: use decoupled weight decay (like AdamW)
     shampoo_use_decoupled_weight_decay: bool = False
 
+    # Shampoo: use upstream DDPDistributedConfig, which shards Shampoo's
+    # optimizer-state computation and synchronizes updates across local ranks.
+    shampoo_use_ddp_distributed_config: bool = False
+
+    # Shampoo DDPDistributedConfig: number of trainers per distributed group.
+    # -1 lets upstream default to LOCAL_WORLD_SIZE.
+    shampoo_ddp_num_trainers_per_group: int = -1
+
+    # Shampoo DDPDistributedConfig: communicate updated parameters instead of
+    # parameter updates. Default mirrors upstream DDPDistributedConfig.
+    shampoo_ddp_communicate_params: bool = False
+
     # torch.compile: compile each transformer block with Inductor (or other backend)
     torch_compile: bool = False
     # Backend for torch.compile: "inductor" (default) or "aot_eager".
@@ -484,6 +536,103 @@ class Config:
                 inv[name] = name
         return inv
 
+    def expand_cross_features(self) -> list[CrossFeatureSpec]:
+        """Auto-register enabled cross_features into the downstream lists.
+
+        Mutates in place:
+          - ``model.embedding_tables`` += one ``EmbeddingTableConfig`` per
+            enabled spec (``embedding_dim=0`` so it inherits ``model.embedding_dim``).
+          - ``feature.scalar_features`` += one ``ScalarFeatureSpec`` per spec
+            (NS-token concat order = cross-spec order).
+          - ``data.schema.batch_to_feature`` += ``{f"{spec.name}_id": spec.name}``.
+          - ``data.schema.kjt_feature_order`` += ``spec.name`` (only when the
+            schema's existing kjt_feature_order is non-empty -- otherwise the
+            schema falls back to ``feature.all_ec_feature_names()`` which
+            already picks up the new scalar feature).
+
+        Specs with ``enabled=False`` are skipped entirely (no table, no scalar
+        feature, no schema entry, no dataset hash).
+
+        Idempotent: re-running is a no-op once expansion has happened. The
+        first call records auto-registered names on ``self._cross_registered``
+        so subsequent calls can distinguish "already auto-registered" from
+        "user wrote a native table that collides with a cross spec name".
+
+        Raises ``ValueError`` on:
+          - a spec name colliding with a hand-written native table or scalar;
+          - an unknown key (must be one of ``CROSS_FEATURE_KEYS``);
+          - missing required fields (``name``, ``num_buckets``, 2+ keys).
+
+        Returns the list of specs that were actually expanded on this call.
+        """
+        if isinstance(self.data.schema, str):
+            return []  # schema not yet loaded; expand_cross_features() runs after Config.load()
+
+        registered: set[str] = getattr(self, "_cross_registered", set())
+        existing_table_names = {t.name for t in self.model.embedding_tables}
+        existing_scalar_names = set(self.feature.scalar_feature_names)
+
+        expanded: list[CrossFeatureSpec] = []
+        for spec in self.data.cross_features:
+            if not spec.enabled:
+                continue
+            if not spec.name:
+                raise ValueError("CrossFeatureSpec.name is required")
+            if spec.num_buckets <= 0:
+                raise ValueError(f"CrossFeatureSpec '{spec.name}' needs num_buckets > 0")
+            if not spec.keys or len(spec.keys) < 2:
+                raise ValueError(
+                    f"CrossFeatureSpec '{spec.name}' needs at least 2 keys, got {spec.keys}"
+                )
+            for k in spec.keys:
+                if k not in CROSS_FEATURE_KEYS:
+                    raise ValueError(
+                        f"CrossFeatureSpec '{spec.name}' uses unknown key '{k}'; "
+                        f"recognized keys: {CROSS_FEATURE_KEYS}"
+                    )
+
+            if spec.name in registered:
+                continue  # idempotent: already auto-registered by an earlier call
+
+            if spec.name in existing_table_names:
+                raise ValueError(
+                    f"CrossFeatureSpec '{spec.name}' collides with an existing "
+                    f"native embedding table; rename the cross spec or the native table"
+                )
+            if spec.name in existing_scalar_names:
+                raise ValueError(
+                    f"CrossFeatureSpec '{spec.name}' collides with an existing "
+                    f"scalar feature; rename the cross spec or the scalar feature"
+                )
+
+            self.model.embedding_tables.append(
+                EmbeddingTableConfig(
+                    name=spec.name,
+                    features=[spec.name],
+                    num_embeddings=spec.num_buckets,
+                    embedding_dim=0,
+                    pooling="none",
+                )
+            )
+            self.feature.scalar_features.append(ScalarFeatureSpec(name=spec.name))
+
+            batch_key = f"{spec.name}_id"
+            if batch_key not in self.data.schema.batch_to_feature:
+                self.data.schema.batch_to_feature[batch_key] = spec.name
+            if (
+                self.data.schema.kjt_feature_order
+                and spec.name not in self.data.schema.kjt_feature_order
+            ):
+                self.data.schema.kjt_feature_order.append(spec.name)
+
+            existing_table_names.add(spec.name)
+            existing_scalar_names.add(spec.name)
+            registered.add(spec.name)
+            expanded.append(spec)
+
+        self._cross_registered = registered
+        return expanded
+
     def save(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -504,6 +653,11 @@ class Config:
             with open(schema_path) as f:
                 config.data.schema = _from_dict(SchemaConfig, yaml.safe_load(f) or {})
 
+        # Auto-register cross-feature specs into embedding_tables / scalar_features
+        # / schema lists.  Runs after the schema is materialized so kjt_feature_order
+        # mutations land on the right object.
+        config.expand_cross_features()
+
         return config
 
 
@@ -521,6 +675,7 @@ def _from_dict(dc_cls: type, raw: dict[str, Any]) -> Any:
             FeatureConfig, SchemaConfig, EmbeddingTableConfig,
             SyntheticDataConfig,
             DenseFeatureSpec, ScalarFeatureSpec,
+            CrossFeatureSpec,
         ):
             _DC_REGISTRY[cls.__name__] = cls
     kwargs = {}

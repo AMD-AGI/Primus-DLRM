@@ -13,7 +13,7 @@ import polars as pl
 import torch
 from torch.utils.data import Dataset
 
-from primus_dlrm.config import DataConfig
+from primus_dlrm.config import CrossFeatureSpec, DataConfig
 from primus_dlrm.data.preprocessing import EVENT_TYPE_MAP
 
 
@@ -134,6 +134,11 @@ class ScoringPair:
     user_counters: torch.Tensor | None = None    # [3W]
     item_counters: torch.Tensor | None = None    # [3W]
     cross_counters: torch.Tensor | None = None   # [9W]
+
+    # Cross-product hashed ids keyed by spec name (e.g. "user_x_artist").
+    # Empty when no cross_features are enabled in the config; otherwise one
+    # entry per enabled CrossFeatureSpec, each an int in [0, num_buckets).
+    cross_ids: dict[str, int] = field(default_factory=dict)
 
 
 class FlatEventStore:
@@ -384,6 +389,12 @@ class YambdaTrainDataset(Dataset):
             _save_store_cache(self.store, config, paths, "train")
 
         self._build_sample_positions()
+        # Snapshot enabled cross-feature specs so the hot path doesn't reread
+        # the config on every sample. Always non-None so __getitem__ doesn't
+        # need to branch on its presence.
+        self._enabled_cross_specs: list[CrossFeatureSpec] = [
+            s for s in (config.cross_features or []) if s.enabled
+        ]
 
         logger.info(
             f"Dataset ready: {len(self._positions)} training positions, "
@@ -489,6 +500,8 @@ class YambdaTrainDataset(Dataset):
         target_item = int(self.store.flat_item_ids[flat_pos])
         event_type = int(self.store.flat_event_types[flat_pos])
         played_ratio = float(self.store.flat_played_ratio[flat_pos])
+        target_artist = int(self.item_to_artist[target_item]) if target_item < len(self.item_to_artist) else 0
+        target_album = int(self.item_to_album[target_item]) if target_item < len(self.item_to_album) else 0
 
         audio = self.audio_embeddings[target_item] if target_item < len(self.audio_embeddings) else np.zeros(self.audio_dim, dtype=np.float32)
 
@@ -504,6 +517,16 @@ class YambdaTrainDataset(Dataset):
                 self.store.cross_counters[flat_pos].copy()
             )
 
+        cross_ids: dict[str, int] = {}
+        if self._enabled_cross_specs:
+            cross_ids = self._compute_cross_ids(
+                uid=uid,
+                item_id=target_item,
+                artist_id=target_artist,
+                album_id=target_album,
+                ts=int(self.store.flat_timestamps[flat_pos]),
+            )
+
         return ScoringPair(
             hist_lp_item_ids=torch.from_numpy(history["lp_items"].copy()),
             hist_lp_artist_ids=torch.from_numpy(history["lp_artists"].copy()),
@@ -516,15 +539,53 @@ class YambdaTrainDataset(Dataset):
             hist_skip_album_ids=torch.from_numpy(history["skip_albums"].copy()),
             uid=uid,
             item_id=target_item,
-            artist_id=int(self.item_to_artist[target_item]) if target_item < len(self.item_to_artist) else 0,
-            album_id=int(self.item_to_album[target_item]) if target_item < len(self.item_to_album) else 0,
+            artist_id=target_artist,
+            album_id=target_album,
             audio_embed=torch.from_numpy(audio.copy()),
             listen_plus=1.0 if (event_type == LISTEN_TYPE and played_ratio >= LISTEN_PLUS_THRESHOLD) else 0.0,
             like=1.0 if event_type == LIKE_TYPE else 0.0,
             dislike=1.0 if event_type == DISLIKE_TYPE else 0.0,
             listen_pct=min(played_ratio / 100.0, 1.0) if event_type == LISTEN_TYPE else 0.0,
+            cross_ids=cross_ids,
             **counters_kwargs,
         )
+
+    def _compute_cross_ids(
+        self,
+        *,
+        uid: int,
+        item_id: int,
+        artist_id: int,
+        album_id: int,
+        ts: int,
+    ) -> dict[str, int]:
+        """Hash the current event's keys into one bucket per enabled cross spec.
+
+        ``ts`` is in seconds (Yambda timestamps are seconds; see
+        ``preprocessing.SECONDS_PER_TIMESTAMP_UNIT``); ``hour_of_day`` is the
+        24-bucket hour of the day in UTC.
+        """
+        from primus_dlrm.data.hashing import cross_hash_int64
+
+        hour_of_day = (ts // 3600) % 24
+        # is_organic is not preserved on the FlatEventStore (would require a
+        # cache rebuild). Default to 0 until needed; user_x_is_organic should
+        # be left disabled until then.
+        sources = {
+            "uid": uid,
+            "item_id": item_id,
+            "artist_id": artist_id,
+            "album_id": album_id,
+            "hour_of_day": int(hour_of_day),
+            "is_organic": 0,
+        }
+        out: dict[str, int] = {}
+        for spec in self._enabled_cross_specs:
+            a, b = spec.keys[0], spec.keys[1]
+            out[spec.name] = cross_hash_int64(
+                sources[a], sources[b], spec.num_buckets, spec.salt,
+            )
+        return out
 
     def _get_split_history(self, flat_pos: int, user_start: int) -> dict:
         """Scan backward from flat_pos, split events into listen+/like/skip pools."""
@@ -834,4 +895,11 @@ def collate_to_dict(batch: list[ScoringPair]) -> dict[str, torch.Tensor]:
         result["user_counters"] = torch.stack([b.user_counters for b in batch])
         result["item_counters"] = torch.stack([b.item_counters for b in batch])
         result["cross_counters"] = torch.stack([b.cross_counters for b in batch])
+    # Cross-feature ids: one tensor per enabled spec, named "<spec.name>_id"
+    # to match data.schema.batch_to_feature populated by expand_cross_features().
+    if batch[0].cross_ids:
+        for name in batch[0].cross_ids:
+            result[f"{name}_id"] = torch.tensor(
+                [b.cross_ids[name] for b in batch], dtype=torch.long,
+            )
     return result
