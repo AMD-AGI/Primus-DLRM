@@ -18,7 +18,41 @@ import numpy as np
 import xxhash
 
 
-__all__ = ["cross_hash_int64", "cross_hash_batch"]
+__all__ = ["cross_hash_int64", "cross_hash_nway", "cross_hash_batch"]
+
+
+def cross_hash_nway(
+    keys: list[int],
+    table_size: int,
+    salt: int = 0,
+) -> int:
+    """xxhash64 of little-endian concat(int64 keys[0], ..., int64 keys[n-1]) mod table_size.
+
+    Generalises the 2-way ``cross_hash_int64`` to any number of int64 keys
+    while keeping the wire format identical for matching key counts: both
+    functions pack with ``struct.Struct("<{n}q")`` then xxhash64, so
+    ``cross_hash_nway([a, b], t, s) == cross_hash_int64(a, b, t, s)`` by
+    construction.
+
+    Args:
+        keys: list of n int64 keys (n >= 2). Order matters; ``[a, b]`` and
+            ``[b, a]`` produce different bucket ids.
+        table_size: hashed embedding table cardinality. Returned id is in
+            ``[0, table_size)``.
+        salt: optional seed for distinguishing different cross specs that
+            share the same key list (e.g. salting an outer 3-way hash to
+            avoid colliding with an inner 2-way hash on the same prefix).
+
+    Returns:
+        The bucket index in ``[0, table_size)``.
+    """
+    n = len(keys)
+    assert n >= 2, f"cross_hash_nway needs >=2 keys, got {n}"
+    digest = xxhash.xxh64(seed=salt)
+    # struct.Struct caches the format string so repeated calls with the same
+    # key count avoid re-parsing.
+    digest.update(struct.Struct(f"<{n}q").pack(*(int(k) for k in keys)))
+    return digest.intdigest() % table_size
 
 
 def cross_hash_int64(
@@ -27,24 +61,12 @@ def cross_hash_int64(
     table_size: int,
     salt: int = 0,
 ) -> int:
-    """xxhash64 of little-endian concat(int64 feat_a, int64 feat_b) mod table_size.
+    """2-way convenience wrapper around ``cross_hash_nway``.
 
-    Args:
-        feat_a: first int64 key (e.g. uid).
-        feat_b: second int64 key (e.g. artist_id, hour_of_day).
-        table_size: hashed embedding table cardinality. Returned id is in
-            ``[0, table_size)``.
-        salt: optional seed for n-way crosses (e.g. ``user x artist x hour``
-            uses one salt for ``(user, artist)`` and a different salt for the
-            outer hash to avoid collisions with the 2-way cross). Defaults to
-            0 for the standard 2-way crosses.
-
-    Returns:
-        The bucket index in ``[0, table_size)``.
+    Identical wire format to ``cross_hash_nway([feat_a, feat_b], ...)`` so
+    existing 2-way golden vectors and trained cross embeddings stay valid.
     """
-    digest = xxhash.xxh64(seed=salt)
-    digest.update(struct.pack("<qq", int(feat_a), int(feat_b)))
-    return digest.intdigest() % table_size
+    return cross_hash_nway([feat_a, feat_b], table_size, salt)
 
 
 def cross_hash_batch(

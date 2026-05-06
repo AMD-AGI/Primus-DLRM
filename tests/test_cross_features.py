@@ -91,6 +91,57 @@ def test_cross_hash_batch_broadcasts_scalar_b():
 
 
 # ---------------------------------------------------------------------------
+# n-way hashing: extends the 2-way wire format to >=2 keys
+# ---------------------------------------------------------------------------
+
+def test_cross_hash_nway_golden_vectors():
+    """Pin n-way values for n=3 and n=4. Failure here means the n-way wire
+    format changed and breaks reproducibility for any cross spec with >2 keys.
+    """
+    from primus_dlrm.data.hashing import cross_hash_nway
+
+    assert cross_hash_nway([1, 2, 3], 1000) == 706
+    assert cross_hash_nway([1, 2, 3], 1 << 30) == 633392634
+    assert cross_hash_nway([42, 7, 15], 1_000_000) == 847584
+    assert cross_hash_nway([1, 2, 3, 4], 1000) == 45
+
+
+def test_cross_hash_nway_2way_matches_int64():
+    """cross_hash_nway([a, b], t, s) must equal cross_hash_int64(a, b, t, s).
+
+    Backward-compat invariant: the 2-way wire format is unchanged after
+    introducing n-way support, so existing trained 2-way cross embeddings
+    keep producing the same bucket ids.
+    """
+    from primus_dlrm.data.hashing import cross_hash_int64, cross_hash_nway
+
+    cases = [(0, 0, 1000, 0), (1, 2, 1000, 0), (42, 7, 1_000_000, 0),
+             (-1, -1, 1000, 0), (1, 2, 1000, 5), (1 << 40, 1 << 30, 1 << 30, 0)]
+    for a, b, t, s in cases:
+        assert cross_hash_nway([a, b], t, s) == cross_hash_int64(a, b, t, s)
+
+
+def test_cross_hash_nway_order_matters():
+    from primus_dlrm.data.hashing import cross_hash_nway
+
+    assert cross_hash_nway([1, 2, 3], 1000) != cross_hash_nway([3, 2, 1], 1000)
+    assert cross_hash_nway([3, 2, 1], 1000) == 313
+
+
+def test_cross_hash_nway_salt_changes_output():
+    from primus_dlrm.data.hashing import cross_hash_nway
+
+    assert cross_hash_nway([1, 2, 3], 1000, salt=0) != cross_hash_nway([1, 2, 3], 1000, salt=5)
+
+
+def test_cross_hash_nway_rejects_single_key():
+    from primus_dlrm.data.hashing import cross_hash_nway
+
+    with pytest.raises(AssertionError):
+        cross_hash_nway([1], 1000)
+
+
+# ---------------------------------------------------------------------------
 # Config.expand_cross_features() — single source of truth, on/off flag
 # ---------------------------------------------------------------------------
 
@@ -225,6 +276,27 @@ def test_expand_rejects_single_key():
         cfg.expand_cross_features()
 
 
+def test_expand_accepts_3way_spec():
+    """A 3-key cross spec must register cleanly into all three downstream lists."""
+    cfg = _baseline_config()
+    cfg.data.cross_features = [
+        CrossFeatureSpec(
+            name="user_x_artist_x_hour",
+            keys=["uid", "artist_id", "hour_of_day"],
+            num_buckets=4096,
+        ),
+    ]
+    expanded = cfg.expand_cross_features()
+
+    assert {s.name for s in expanded} == {"user_x_artist_x_hour"}
+
+    table_names = {t.name for t in cfg.model.embedding_tables}
+    assert "user_x_artist_x_hour" in table_names
+    assert "user_x_artist_x_hour" in cfg.feature.scalar_feature_names
+    assert cfg.data.schema.batch_to_feature["user_x_artist_x_hour_id"] == "user_x_artist_x_hour"
+    assert "user_x_artist_x_hour" in cfg.data.schema.kjt_feature_order
+
+
 def test_expand_appends_in_spec_order():
     """NS-token concat order = cross-spec order; this is the contract."""
     cfg = _baseline_config()
@@ -242,8 +314,39 @@ def test_expand_appends_in_spec_order():
     assert cross_in_scalars == ["z_first", "a_second", "m_third"]
 
 
+def test_load_mmap_missing_flat_is_organic_raises(tmp_path):
+    """Cache contract: flat_is_organic.npy is required by FlatEventStore.load_mmap.
+
+    Caches built before the cross-feature change won't have this file; running
+    the new code against such a cache MUST fail loudly at load time (not
+    silently or at first __getitem__).
+    """
+    import json
+    import numpy as np
+
+    from primus_dlrm.data.dataset import FlatEventStore
+
+    n = 8
+    cache_dir = tmp_path / "fake_cache"
+    cache_dir.mkdir()
+    # Write all required files EXCEPT flat_is_organic.npy.
+    for name in ("flat_uid", "flat_item_ids", "flat_timestamps",
+                 "flat_event_types", "flat_played_ratio",
+                 "flat_is_listen_plus", "flat_is_like", "flat_is_skip",
+                 "user_start", "user_end", "unique_uids"):
+        np.save(cache_dir / f"{name}.npy", np.zeros(n, dtype=np.int64))
+    with open(cache_dir / "store_meta.json", "w") as f:
+        json.dump({
+            "num_users": 1, "total_events": n,
+            "enable_counters": False, "counter_windows_days": [],
+        }, f)
+
+    with pytest.raises(FileNotFoundError, match="flat_is_organic"):
+        FlatEventStore.load_mmap(cache_dir)
+
+
 def test_load_yaml_strategy_a_config():
-    """End-to-end: loading the strategy_a YAML auto-registers crosses on load."""
+    """End-to-end: loading the strategy_a YAML auto-registers all 7 crosses on load."""
     from pathlib import Path
 
     cfg_path = (
@@ -255,19 +358,17 @@ def test_load_yaml_strategy_a_config():
 
     cfg = Config.load(cfg_path)
 
-    # Native + 3 enabled crosses; the 3 disabled crosses should not appear.
+    expected_crosses = {
+        "user_x_artist", "user_x_album", "user_x_hour",
+        "item_x_hour", "artist_x_hour", "user_x_is_organic",
+        "user_x_artist_x_hour",
+    }
     table_names = {t.name for t in cfg.model.embedding_tables}
-    assert "user_x_artist" in table_names
-    assert "user_x_album" in table_names
-    assert "user_x_hour" in table_names
-    assert "item_x_hour" not in table_names
-    assert "artist_x_hour" not in table_names
-    assert "user_x_is_organic" not in table_names
-
-    scalars = cfg.feature.scalar_feature_names
-    assert scalars[-3:] == ["user_x_artist", "user_x_album", "user_x_hour"]
-
-    assert cfg.data.schema.batch_to_feature["user_x_artist_id"] == "user_x_artist"
+    assert expected_crosses.issubset(table_names)
+    assert expected_crosses.issubset(set(cfg.feature.scalar_feature_names))
+    for name in expected_crosses:
+        assert cfg.data.schema.batch_to_feature[f"{name}_id"] == name
+        assert name in cfg.data.schema.kjt_feature_order
 
 
 # ---------------------------------------------------------------------------

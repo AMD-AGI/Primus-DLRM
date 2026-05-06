@@ -176,6 +176,10 @@ class FlatEventStore:
         self.flat_timestamps = exploded["timestamps"].to_numpy().astype(np.int64)
         self.flat_event_types = exploded["event_types"].to_numpy().astype(np.int64)
         self.flat_played_ratio = exploded["played_ratio_pct"].to_numpy().astype(np.float32)
+        # int8 (0/1) — used by cross_features that include "is_organic" as a key
+        # (e.g. user_x_is_organic). Always materialised so the cache is
+        # self-describing; the column is already in the exploded DataFrame.
+        self.flat_is_organic = exploded["is_organic"].to_numpy().astype(np.int8)
 
         np.nan_to_num(self.flat_played_ratio, copy=False, nan=0.0)
 
@@ -258,6 +262,7 @@ class FlatEventStore:
         for name in ("flat_uid", "flat_item_ids", "flat_timestamps",
                       "flat_event_types", "flat_played_ratio",
                       "flat_is_listen_plus", "flat_is_like", "flat_is_skip",
+                      "flat_is_organic",
                       "user_start", "user_end", "unique_uids"):
             arr = getattr(self, name)
             np.save(mmap_dir / f"{name}.npy", arr)
@@ -301,6 +306,7 @@ class FlatEventStore:
         for name in ("flat_uid", "flat_item_ids", "flat_timestamps",
                       "flat_event_types", "flat_played_ratio",
                       "flat_is_listen_plus", "flat_is_like", "flat_is_skip",
+                      "flat_is_organic",
                       "user_start", "user_end", "unique_uids"):
             setattr(store, name, _load_npy_readonly(mmap_dir / f"{name}.npy"))
 
@@ -520,6 +526,7 @@ class YambdaTrainDataset(Dataset):
         cross_ids: dict[str, int] = {}
         if self._enabled_cross_specs:
             cross_ids = self._compute_cross_ids(
+                flat_pos=flat_pos,
                 uid=uid,
                 item_id=target_item,
                 artist_id=target_artist,
@@ -553,6 +560,7 @@ class YambdaTrainDataset(Dataset):
     def _compute_cross_ids(
         self,
         *,
+        flat_pos: int,
         uid: int,
         item_id: int,
         artist_id: int,
@@ -561,29 +569,29 @@ class YambdaTrainDataset(Dataset):
     ) -> dict[str, int]:
         """Hash the current event's keys into one bucket per enabled cross spec.
 
-        ``ts`` is in seconds (Yambda timestamps are seconds; see
-        ``preprocessing.SECONDS_PER_TIMESTAMP_UNIT``); ``hour_of_day`` is the
-        24-bucket hour of the day in UTC.
+        Supports n-way crosses (``len(spec.keys) >= 2``) via
+        ``cross_hash_nway``. ``ts`` is in seconds (Yambda timestamps are
+        seconds; see ``preprocessing.SECONDS_PER_TIMESTAMP_UNIT``);
+        ``hour_of_day`` is the 24-bucket hour of the day in UTC.
+        ``is_organic`` is read directly from the FlatEventStore (required
+        cache file; backfill legacy caches with
+        ``scripts/backfill_flat_is_organic.py``).
         """
-        from primus_dlrm.data.hashing import cross_hash_int64
+        from primus_dlrm.data.hashing import cross_hash_nway
 
         hour_of_day = (ts // 3600) % 24
-        # is_organic is not preserved on the FlatEventStore (would require a
-        # cache rebuild). Default to 0 until needed; user_x_is_organic should
-        # be left disabled until then.
         sources = {
             "uid": uid,
             "item_id": item_id,
             "artist_id": artist_id,
             "album_id": album_id,
             "hour_of_day": int(hour_of_day),
-            "is_organic": 0,
+            "is_organic": int(self.store.flat_is_organic[flat_pos]),
         }
         out: dict[str, int] = {}
         for spec in self._enabled_cross_specs:
-            a, b = spec.keys[0], spec.keys[1]
-            out[spec.name] = cross_hash_int64(
-                sources[a], sources[b], spec.num_buckets, spec.salt,
+            out[spec.name] = cross_hash_nway(
+                [sources[k] for k in spec.keys], spec.num_buckets, spec.salt,
             )
         return out
 
