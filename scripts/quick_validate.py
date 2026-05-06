@@ -38,7 +38,7 @@ def main():
     torch.manual_seed(config.train.seed)
 
     logger.info("Loading training dataset...")
-    train_dataset = YambdaTrainDataset(config.data, processed_dir)
+    train_dataset = YambdaTrainDataset(config, processed_dir)
 
     train_loader = DataLoader(
         train_dataset, batch_size=config.train.batch_size, shuffle=True,
@@ -103,7 +103,7 @@ def main():
 
     # --- Eval ---
     logger.info("Loading eval dataset...")
-    eval_dataset = YambdaEvalDataset(config.data, processed_dir)
+    eval_dataset = YambdaEvalDataset(config, processed_dir)
     logger.info(f"Eval dataset: {len(eval_dataset)} test users")
 
     import numpy as np

@@ -60,13 +60,6 @@ class DataConfig:
     # When a string, the file is loaded and parsed during Config.load().
     schema: SchemaConfig | str = field(default_factory=lambda: SchemaConfig())
 
-    # Cross-product hashed embedding tables (e.g. user x artist, user x hour).
-    # Single source of truth: Config.expand_cross_features() auto-registers
-    # each enabled spec into model.embedding_tables, feature.scalar_features,
-    # and the schema lists at load time. Toggle individual crosses on/off
-    # via the per-spec ``enabled`` flag without touching the other lists.
-    cross_features: list[CrossFeatureSpec] = field(default_factory=list)
-
 
 # ---------------------------------------------------------------------------
 # Feature schema configuration (YAML-driven)
@@ -91,26 +84,42 @@ CROSS_FEATURE_KEYS = ("uid", "item_id", "artist_id", "album_id", "hour_of_day", 
 
 @dataclass
 class CrossFeatureSpec:
-    """One cross-product hashed embedding table.
+    """One cross-product embedding table, optionally hashed.
 
-    The dataset hot path computes ``xxhash64(key_a, key_b) % num_buckets`` per
-    sample (see ``primus_dlrm.data.hashing``). The resulting id is fed to a
-    dedicated EmbeddingCollection table whose name matches ``name``.
+    Each spec auto-registers an ``EmbeddingCollection`` table at config-load
+    time via ``Config.expand_cross_features()``. The dataset hot path computes
+    ``xxhash64(keys) % num_embeddings`` per sample (see
+    ``primus_dlrm.data.hashing``) and feeds the result as the EC index.
+
+    Hashed vs unique coverage:
+      - ``num_embeddings >= prod(unique_cardinality(k) for k in keys)``:
+        the cross is "unique-covered" (e.g. ``user_x_hour`` with 1M users x 24
+        hours = 24M unique pairs at num_embeddings=24M). Hash collisions only
+        come from xxhash birthday probability, effectively zero.
+      - ``num_embeddings <  prod(...)``: the cross is "hashed-truncated" (e.g.
+        ``user_x_artist`` with 1M x 1.29M = 1.29T unique pairs squeezed into
+        100M buckets). Multiple unique pairs share buckets; the table operates
+        as a memorization shortcut rather than a unique row per pair.
+
+    Same name ``num_embeddings`` as ``EmbeddingTableConfig.num_embeddings``;
+    the auto-registered table inherits this value 1:1, so the hash modulus
+    always matches the storage row count by construction (no out-of-range
+    indices possible).
 
     YAML example::
 
         data:
           cross_features:
-            - { name: user_x_artist, keys: [uid, artist_id],   num_buckets: 100000000 }
-            - { name: user_x_hour,   keys: [uid, hour_of_day], num_buckets: 24000000  }
-            - { name: user_x_album,  keys: [uid, album_id],    num_buckets: 40000000, enabled: false }
+            - { name: user_x_artist, keys: [uid, artist_id],   num_embeddings: 100000000 }  # hashed (1.29T unique > 100M)
+            - { name: user_x_hour,   keys: [uid, hour_of_day], num_embeddings: 24000000  }  # unique (1M x 24)
+            - { name: user_x_album,  keys: [uid, album_id],    num_embeddings: 40000000, enabled: false }
 
     ``enabled: false`` disables a single cross without removing the spec from
     the YAML, useful for ablation sweeps.
     """
     name: str = ""
     keys: list[str] = field(default_factory=list)
-    num_buckets: int = 0
+    num_embeddings: int = 0
     salt: int = 0
     enabled: bool = True
 
@@ -318,6 +327,15 @@ class ModelConfig:
 
     # Embedding tables: table names, features, sizes, and per-table pooling.
     embedding_tables: list[EmbeddingTableConfig] = field(default_factory=list)
+
+    # Cross-product (optionally hashed) embedding tables (e.g. user x artist,
+    # user x hour, user x artist x hour). Sits next to embedding_tables because
+    # each enabled spec auto-registers as one EmbeddingCollection table at
+    # load time via Config.expand_cross_features(), inheriting embedding_dim
+    # and being routed through the same DMP planner. The dataset reads the
+    # same list to compute xxhash64 ids per sample. Toggle individual crosses
+    # on/off via the per-spec ``enabled`` flag.
+    cross_features: list[CrossFeatureSpec] = field(default_factory=list)
 
     # Transformer hyperparameters (used when model_type="onetrans")
     transformer: TransformerConfig = field(default_factory=TransformerConfig)
@@ -561,7 +579,7 @@ class Config:
         Raises ``ValueError`` on:
           - a spec name colliding with a hand-written native table or scalar;
           - an unknown key (must be one of ``CROSS_FEATURE_KEYS``);
-          - missing required fields (``name``, ``num_buckets``, 2+ keys).
+          - missing required fields (``name``, ``num_embeddings``, 2+ keys).
 
         Returns the list of specs that were actually expanded on this call.
         """
@@ -573,13 +591,13 @@ class Config:
         existing_scalar_names = set(self.feature.scalar_feature_names)
 
         expanded: list[CrossFeatureSpec] = []
-        for spec in self.data.cross_features:
+        for spec in self.model.cross_features:
             if not spec.enabled:
                 continue
             if not spec.name:
                 raise ValueError("CrossFeatureSpec.name is required")
-            if spec.num_buckets <= 0:
-                raise ValueError(f"CrossFeatureSpec '{spec.name}' needs num_buckets > 0")
+            if spec.num_embeddings <= 0:
+                raise ValueError(f"CrossFeatureSpec '{spec.name}' needs num_embeddings > 0")
             if not spec.keys or len(spec.keys) < 2:
                 raise ValueError(
                     f"CrossFeatureSpec '{spec.name}' needs at least 2 keys, got {spec.keys}"
@@ -609,7 +627,7 @@ class Config:
                 EmbeddingTableConfig(
                     name=spec.name,
                     features=[spec.name],
-                    num_embeddings=spec.num_buckets,
+                    num_embeddings=spec.num_embeddings,
                     embedding_dim=0,
                     pooling="none",
                 )
@@ -644,6 +662,17 @@ class Config:
         path = Path(path)
         with open(path) as f:
             raw = yaml.safe_load(f)
+
+        # cross_features moved from data.cross_features to model.cross_features.
+        # Catch stale YAMLs at load time so the operator sees a clear error
+        # instead of training with zero crosses (the old field would silently
+        # be ignored by _from_dict since DataConfig no longer declares it).
+        if isinstance(raw, dict) and "cross_features" in (raw.get("data") or {}):
+            raise ValueError(
+                f"{path}: 'cross_features' moved from 'data.cross_features' to "
+                f"'model.cross_features'; please move the block under model:."
+            )
+
         config = _from_dict(cls, raw)
 
         if isinstance(config.data.schema, str) and config.data.schema:

@@ -230,7 +230,7 @@ def _setup_real_data(config, paths, world_size, rank, pipeline):
     _t0 = _time.time()
     if is_main_process():
         logger.info("Stage: loading training dataset...")
-    dataset = YambdaTrainDataset(config.data, paths)
+    dataset = YambdaTrainDataset(config, paths)
     logger.info(f"Stage: rank {rank} dataset loaded in {_time.time() - _t0:.1f}s")
 
     per_gpu_batch = config.train.batch_size // world_size
@@ -372,7 +372,7 @@ def main():
     # Eval function (rank 0 only, unless skipped; always skipped for synthetic)
     eval_fn = None
     if not args.skip_eval and not use_synthetic and is_main_process():
-        eval_dataset = YambdaEvalDataset(config.data, paths)
+        eval_dataset = YambdaEvalDataset(config, paths)
         pop = eval_dataset.item_popularity
         candidate_items = np.argsort(-pop)[:5000]
 

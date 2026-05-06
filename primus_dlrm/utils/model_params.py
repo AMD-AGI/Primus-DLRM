@@ -225,11 +225,11 @@ def log_param_summary(
 
     if table_rows:
         logger.info("  Embedding tables (rows × dim × dtype):")
-        # Mark cross-feature tables (auto-registered from data.cross_features)
+        # Mark cross-feature tables (auto-registered from model.cross_features)
         # so the operator can correlate the YAML toggles with the live shapes.
         cross_names: set[str] = set()
         if config is not None:
-            cross_specs = getattr(getattr(config, "data", None), "cross_features", None) or []
+            cross_specs = getattr(getattr(config, "model", None), "cross_features", None) or []
             cross_names = {s.name for s in cross_specs if getattr(s, "enabled", True)}
         max_name_len = max((len(n) for n, *_ in table_rows), default=10)
         for name, n_rows, dim, dt_s in table_rows:
@@ -241,7 +241,7 @@ def log_param_summary(
             )
 
     if config is not None:
-        cross_specs = getattr(getattr(config, "data", None), "cross_features", None) or []
+        cross_specs = getattr(getattr(config, "model", None), "cross_features", None) or []
         if cross_specs:
             enabled = [s for s in cross_specs if getattr(s, "enabled", True)]
             disabled = [s for s in cross_specs if not getattr(s, "enabled", True)]
@@ -250,7 +250,7 @@ def log_param_summary(
             )
             for s in enabled:
                 logger.info(
-                    f"    + {s.name:<24s}  keys={s.keys}  buckets={s.num_buckets:,d}"
+                    f"    + {s.name:<24s}  keys={s.keys}  num_embeddings={s.num_embeddings:,d}"
                 )
             for s in disabled:
                 logger.info(f"    - {s.name:<24s}  (disabled)")

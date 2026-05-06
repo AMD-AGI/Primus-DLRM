@@ -47,7 +47,7 @@ def main():
     torch.manual_seed(config.train.seed)
 
     logger.info("Loading training dataset...")
-    train_dataset = YambdaTrainDataset(config.data, processed_dir)
+    train_dataset = YambdaTrainDataset(config, processed_dir)
 
     train_loader = DataLoader(
         train_dataset,
@@ -60,7 +60,7 @@ def main():
     )
 
     logger.info("Loading eval dataset...")
-    eval_dataset = YambdaEvalDataset(config.data, processed_dir)
+    eval_dataset = YambdaEvalDataset(config, processed_dir)
 
     logger.info(f"Building model (type={config.model.model_type})...")
     model = build_model(config, device=device)

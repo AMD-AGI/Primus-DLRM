@@ -173,9 +173,9 @@ def _baseline_config() -> Config:
 
 def test_expand_registers_enabled_specs_into_all_three_lists():
     cfg = _baseline_config()
-    cfg.data.cross_features = [
-        CrossFeatureSpec(name="user_x_artist", keys=["uid", "artist_id"], num_buckets=1024),
-        CrossFeatureSpec(name="user_x_hour", keys=["uid", "hour_of_day"], num_buckets=512),
+    cfg.model.cross_features = [
+        CrossFeatureSpec(name="user_x_artist", keys=["uid", "artist_id"], num_embeddings=1024),
+        CrossFeatureSpec(name="user_x_hour", keys=["uid", "hour_of_day"], num_embeddings=512),
     ]
 
     expanded = cfg.expand_cross_features()
@@ -204,10 +204,10 @@ def test_expand_registers_enabled_specs_into_all_three_lists():
 def test_expand_skips_disabled_specs():
     """enabled=False removes a cross from EVERY downstream list."""
     cfg = _baseline_config()
-    cfg.data.cross_features = [
-        CrossFeatureSpec(name="user_x_artist", keys=["uid", "artist_id"], num_buckets=1024),
-        CrossFeatureSpec(name="user_x_album", keys=["uid", "album_id"], num_buckets=512, enabled=False),
-        CrossFeatureSpec(name="user_x_hour", keys=["uid", "hour_of_day"], num_buckets=256),
+    cfg.model.cross_features = [
+        CrossFeatureSpec(name="user_x_artist", keys=["uid", "artist_id"], num_embeddings=1024),
+        CrossFeatureSpec(name="user_x_album", keys=["uid", "album_id"], num_embeddings=512, enabled=False),
+        CrossFeatureSpec(name="user_x_hour", keys=["uid", "hour_of_day"], num_embeddings=256),
     ]
 
     expanded = cfg.expand_cross_features()
@@ -223,8 +223,8 @@ def test_expand_skips_disabled_specs():
 def test_expand_is_idempotent():
     """Calling expand_cross_features() twice is a no-op on the second call."""
     cfg = _baseline_config()
-    cfg.data.cross_features = [
-        CrossFeatureSpec(name="user_x_artist", keys=["uid", "artist_id"], num_buckets=1024),
+    cfg.model.cross_features = [
+        CrossFeatureSpec(name="user_x_artist", keys=["uid", "artist_id"], num_embeddings=1024),
     ]
     n_tables_before = len(cfg.model.embedding_tables)
 
@@ -241,9 +241,9 @@ def test_expand_is_idempotent():
 
 def test_expand_rejects_collision_with_native_table():
     cfg = _baseline_config()
-    cfg.data.cross_features = [
+    cfg.model.cross_features = [
         # 'item' is already a native table
-        CrossFeatureSpec(name="item", keys=["uid", "item_id"], num_buckets=1024),
+        CrossFeatureSpec(name="item", keys=["uid", "item_id"], num_embeddings=1024),
     ]
     with pytest.raises(ValueError, match="collides"):
         cfg.expand_cross_features()
@@ -251,8 +251,8 @@ def test_expand_rejects_collision_with_native_table():
 
 def test_expand_rejects_unknown_key():
     cfg = _baseline_config()
-    cfg.data.cross_features = [
-        CrossFeatureSpec(name="bad", keys=["uid", "not_a_real_key"], num_buckets=1024),
+    cfg.model.cross_features = [
+        CrossFeatureSpec(name="bad", keys=["uid", "not_a_real_key"], num_embeddings=1024),
     ]
     with pytest.raises(ValueError, match="unknown key"):
         cfg.expand_cross_features()
@@ -260,17 +260,17 @@ def test_expand_rejects_unknown_key():
 
 def test_expand_rejects_zero_buckets():
     cfg = _baseline_config()
-    cfg.data.cross_features = [
-        CrossFeatureSpec(name="user_x_artist", keys=["uid", "artist_id"], num_buckets=0),
+    cfg.model.cross_features = [
+        CrossFeatureSpec(name="user_x_artist", keys=["uid", "artist_id"], num_embeddings=0),
     ]
-    with pytest.raises(ValueError, match="num_buckets"):
+    with pytest.raises(ValueError, match="num_embeddings"):
         cfg.expand_cross_features()
 
 
 def test_expand_rejects_single_key():
     cfg = _baseline_config()
-    cfg.data.cross_features = [
-        CrossFeatureSpec(name="bad", keys=["uid"], num_buckets=1024),
+    cfg.model.cross_features = [
+        CrossFeatureSpec(name="bad", keys=["uid"], num_embeddings=1024),
     ]
     with pytest.raises(ValueError, match="at least 2 keys"):
         cfg.expand_cross_features()
@@ -279,11 +279,11 @@ def test_expand_rejects_single_key():
 def test_expand_accepts_3way_spec():
     """A 3-key cross spec must register cleanly into all three downstream lists."""
     cfg = _baseline_config()
-    cfg.data.cross_features = [
+    cfg.model.cross_features = [
         CrossFeatureSpec(
             name="user_x_artist_x_hour",
             keys=["uid", "artist_id", "hour_of_day"],
-            num_buckets=4096,
+            num_embeddings=4096,
         ),
     ]
     expanded = cfg.expand_cross_features()
@@ -300,10 +300,10 @@ def test_expand_accepts_3way_spec():
 def test_expand_appends_in_spec_order():
     """NS-token concat order = cross-spec order; this is the contract."""
     cfg = _baseline_config()
-    cfg.data.cross_features = [
-        CrossFeatureSpec(name="z_first", keys=["uid", "artist_id"], num_buckets=8),
-        CrossFeatureSpec(name="a_second", keys=["uid", "album_id"], num_buckets=8),
-        CrossFeatureSpec(name="m_third", keys=["uid", "hour_of_day"], num_buckets=8),
+    cfg.model.cross_features = [
+        CrossFeatureSpec(name="z_first", keys=["uid", "artist_id"], num_embeddings=8),
+        CrossFeatureSpec(name="a_second", keys=["uid", "album_id"], num_embeddings=8),
+        CrossFeatureSpec(name="m_third", keys=["uid", "hour_of_day"], num_embeddings=8),
     ]
     cfg.expand_cross_features()
 
@@ -422,8 +422,8 @@ def test_pipeline_batch_explodes_cross_ids():
     from primus_dlrm.data.pipeline_batch import collate_pipeline_batch
 
     cfg = _baseline_config()
-    cfg.data.cross_features = [
-        CrossFeatureSpec(name="user_x_artist", keys=["uid", "artist_id"], num_buckets=1024),
+    cfg.model.cross_features = [
+        CrossFeatureSpec(name="user_x_artist", keys=["uid", "artist_id"], num_embeddings=1024),
     ]
     cfg.expand_cross_features()
 
