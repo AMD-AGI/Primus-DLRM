@@ -9,6 +9,7 @@ Supports three strategies:
 from __future__ import annotations
 
 import logging
+import os
 from typing import Literal
 
 import torch
@@ -159,7 +160,18 @@ def _wrap_dmp(
         logger.info(f"Wrapped with TorchRec DMP for 1 GPU.")
         return dmp
 
-    topology = Topology(world_size=world_size, compute_device="cuda")
+    topology_kwargs = {"world_size": world_size, "compute_device": "cuda"}
+    hbm_cap_gb = os.environ.get("PRIMUS_TORCHREC_HBM_CAP_GB")
+    ddr_cap_gb = os.environ.get("PRIMUS_TORCHREC_DDR_CAP_GB")
+    local_world_size = os.environ.get("PRIMUS_TORCHREC_LOCAL_WORLD_SIZE")
+    if hbm_cap_gb is not None:
+        topology_kwargs["hbm_cap"] = int(float(hbm_cap_gb) * (1024 ** 3))
+    if ddr_cap_gb is not None:
+        topology_kwargs["ddr_cap"] = int(float(ddr_cap_gb) * (1024 ** 3))
+    if local_world_size is not None:
+        topology_kwargs["local_world_size"] = int(local_world_size)
+    logger.info(f"TorchRec topology overrides: {topology_kwargs}")
+    topology = Topology(**topology_kwargs)
     planner = EmbeddingShardingPlanner(
         topology=topology,
         constraints=constraints if constraints else None,

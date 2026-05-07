@@ -1,16 +1,3 @@
-# OneTransL on Yambda 5B + all 7 Strategy-A cross-feature tables + Shampoo (DDPDist).
-#
-# Combines three independent features in the codebase:
-#   - cross-feature embedding tables (data.cross_features auto-registered
-#     into model.embedding_tables / feature.scalar_features / schema lists)
-#   - Distributed Shampoo dense optimizer with DDPDistributedConfig
-#   - DMP + TrainPipelineSparseDist + torch.compile + CK FA-2 attention
-#
-# Sized at embedding_dim=64 (not the canonical Strategy-A 512) so all 7 cross
-# tables fit alongside the native tables on 8x MI355X (~177 GB / rank). Bump
-# embedding_dim to 512 in bench_onetrans_large_5b_strategy_a.yaml for the full
-# ~600 GB footprint sweep once a multi-node sharding plan is in place.
-
 data:
   dataset_size: "5b"
   data_dir: "data"
@@ -43,8 +30,7 @@ model:
     - { name: album,  features: [album, hist_lp_album, hist_like_album, hist_skip_album],    num_embeddings: 3367692 }
     - { name: uid,    features: [uid],                                                        num_embeddings: 1000001 }
 
-  # Strategy-A cross-product (optionally hashed) tables. Each spec
-  # auto-registers an EmbeddingCollection table, a scalar feature, and a
+  # Each spec auto-registers an EmbeddingCollection table, a scalar feature, and a
   # batch_to_feature/kjt_feature_order entry on Config.load(). Toggle
   # individual crosses on/off via the per-spec ``enabled`` flag.
   # num_embeddings sets the embedding-table row count and the hash modulus
@@ -76,7 +62,7 @@ feature:
 train:
   torch_compile: true
   dense_optimizer: shampoo
-  shampoo_precondition_frequency: 50
+  shampoo_precondition_frequency: 500
   shampoo_use_ddp_distributed_config: true
   shampoo_ddp_num_trainers_per_group: -1
   shampoo_ddp_communicate_params: false
