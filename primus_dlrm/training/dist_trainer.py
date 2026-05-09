@@ -260,6 +260,7 @@ class DistributedTrainer:
         trace_steps: list[int] | None = None,
         trace_warmup: int = 5,
         trace_active: int = 10,
+        trace_ranks: set[int] | None = None,
     ):
         self.model = model
         self._dataloader = train_loader
@@ -270,13 +271,20 @@ class DistributedTrainer:
         self.log_interval = log_interval
         self._num_flops_per_sample = self._estimate_flops(model)
         self.tracer: Tracer | None = None
-        if trace and is_main_process():
+        # trace_ranks: None -> trace every rank; set -> only listed global ranks.
+        # Default ({0}) preserves the legacy "rank 0 only" behavior.
+        if trace_ranks is None:
+            trace_this_rank = True
+        else:
+            trace_this_rank = get_rank() in trace_ranks
+        if trace and trace_this_rank:
             trace_dir = Path(config.train.checkpoint_dir) / "trace"
             self.tracer = Tracer(
                 trace_dir,
                 trace_steps=trace_steps,
                 warmup=trace_warmup,
                 active=trace_active,
+                rank=get_rank(),
             )
 
         tc = config.train
@@ -671,7 +679,10 @@ class DistributedTrainer:
         if self.tracer:
             self.tracer.stop()
             files = self.tracer.trace_files
-            logger.info(f"Trace dumped: {self.tracer.trace_dir}/ ({len(files)} files)")
+            logger.info(
+                f"[rank {get_rank()}] Trace dumped: {self.tracer.trace_dir}/ "
+                f"({len(files)} files)"
+            )
 
     def _run_eval(self) -> None:
         """Run evaluation. For FSDP, uses summon_full_params so all ranks

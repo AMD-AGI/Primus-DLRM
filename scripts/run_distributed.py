@@ -96,6 +96,7 @@ from primus_dlrm.evaluation.metrics import evaluate_ranking, evaluate_ranking_pe
 from primus_dlrm.models.dlrm import DLRMBaseline
 from primus_dlrm.training.dist_trainer import DistributedTrainer
 from primus_dlrm.training.runtime import apply_cli_overrides, configure_runtime
+from primus_dlrm.training.tracer import parse_trace_ranks
 from primus_dlrm.models.onetrans import OneTransModel
 
 
@@ -293,6 +294,13 @@ def main():
                              "Each step gets its own trace file.")
     parser.add_argument("--trace-warmup", type=int, default=5)
     parser.add_argument("--trace-active", type=int, default=10)
+    parser.add_argument(
+        "--trace-ranks", type=str, default="0",
+        help="Which global ranks should capture traces. "
+             "Accepts a comma-separated list (e.g. '0,3,5') or 'all'. "
+             "Default '0' preserves the legacy rank-0-only behavior. "
+             "Each rank writes trace_step{step}_rank{rank}.json.",
+    )
     parser.add_argument("--pipeline", action="store_true",
                         help="Use TorchRec TrainPipelineSparseDist (3-stage, DMP only)")
     parser.add_argument("--attention-impl", default=None,
@@ -407,6 +415,7 @@ def main():
         trace_steps=[int(s) for s in args.trace_steps.split(",") if s.strip()] or None,
         trace_warmup=args.trace_warmup,
         trace_active=args.trace_active,
+        trace_ranks=parse_trace_ranks(args.trace_ranks),
     )
     if args.pipeline and not use_dmp:
         raise ValueError("--pipeline requires --dense-strategy dmp")
