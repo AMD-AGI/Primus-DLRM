@@ -1,0 +1,8 @@
+# CODEOWNERS for AMD-AGI/Primus-DLRM
+# Syntax: https://docs.github.com/en/repositories/managing-your-repositories-settings-and-features/customizing-your-repository/about-code-owners
+#
+# TODO: Replace placeholder team slugs with the real ones from
+#       https://github.com/orgs/AMD-AGI/teams
+
+# Default owners for everything in the repo
+*                              @AMD-AGI/DLRM
