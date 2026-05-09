@@ -13,6 +13,7 @@ import torch
 import torch.fx
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as _ckpt
 from torch import Tensor
 
 from primus_dlrm.config import Config
@@ -27,6 +28,7 @@ except ImportError:
 
 try:
     from flash_attn import flash_attn_func as _flash_attn
+    from flash_attn import flash_attn_varlen_func as _flash_attn_varlen
     _HAS_FLASH_ATTN = True
 except ImportError:
     _HAS_FLASH_ATTN = False
@@ -93,9 +95,9 @@ class MixedAttention(nn.Module):
             raise RuntimeError(
                 "attention_impl='turbo' requires primus_turbo package. "
             )
-        if attention_impl == "fav2" and not _HAS_FLASH_ATTN:
+        if attention_impl in ("fav2", "fav2_varlen") and not _HAS_FLASH_ATTN:
             raise RuntimeError(
-                "attention_impl='fav2' requires flash_attn package. "
+                f"attention_impl={attention_impl!r} requires flash_attn package. "
             )
         if attention_impl == "fav4" and not _HAS_FLASH_ATTN_4:
             raise RuntimeError(
@@ -121,7 +123,16 @@ class MixedAttention(nn.Module):
         for i in range(self.n_ns):
             nn.init.xavier_uniform_(self.ns_qkv_weight.data[i])
 
-    def forward(self, x: Tensor, n_s: int, mask: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        n_s: int,
+        mask: Tensor | None = None,
+        cu_seqlens: Tensor | None = None,
+        max_seqlen: int | None = None,
+        real_mask: Tensor | None = None,
+        real_indices: Tensor | None = None,
+    ) -> Tensor:
         B, T, _ = x.shape
         s_part = x[:, :n_s]
         ns_part = x[:, n_s:]
@@ -145,12 +156,53 @@ class MixedAttention(nn.Module):
 
         drop_p = self.attn_drop if self.training else 0.0
 
-        if self.attention_impl == "turbo":
+        # Jagged path: when real_indices is provided, pack via index_select
+        # (no nonzero/boolean indexing inside the compiled block — graph stays
+        # whole, no aten.nonzero graph break, no IndexPut backward), run
+        # varlen attention, then scatter back via index_copy.
+        if cu_seqlens is not None and real_indices is not None:
+            q_flat = q.reshape(B * T, self.n_heads, self.d_head)
+            k_flat = k.reshape(B * T, self.n_heads, self.d_head)
+            v_flat = v.reshape(B * T, self.n_heads, self.d_head)
+            q_packed = q_flat.index_select(0, real_indices)  # [total_real, H, D]
+            k_packed = k_flat.index_select(0, real_indices)
+            v_packed = v_flat.index_select(0, real_indices)
+            out_packed = _flash_attn_varlen(
+                q_packed, k_packed, v_packed,
+                cu_seqlens, cu_seqlens,
+                max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+                causal=True, dropout_p=drop_p,
+            )
+            out_flat = q_flat.new_zeros(B * T, self.n_heads, self.d_head)
+            out_flat.index_copy_(0, real_indices, out_packed)
+            out = out_flat.view(B, T, self.n_heads, self.d_head)
+        elif self.attention_impl == "turbo":
             out = _turbo_flash_attn(q, k, v, causal=True, dropout_p=drop_p)
         elif self.attention_impl == "fav4":
             out = _flash_attn_4(q, k, v, causal=True)
         elif self.attention_impl == "fav2":
             out = _flash_attn(q, k, v, causal=True, dropout_p=drop_p)
+        elif self.attention_impl == "fav2_varlen":
+            # Pack [B, T, H, D] -> [B*T, H, D] with cu_seqlens = [0, T, 2T, ..., B*T].
+            # All sequences same length T; this is jagged/varlen attention applied
+            # to a regular workload to test if the varlen kernel is better tuned
+            # than the dense one for the same shapes (no FLOP savings expected).
+            B_q, T_q = q.shape[0], q.shape[1]
+            T_k = k.shape[1]
+            q_packed = q.reshape(B_q * T_q, q.shape[2], q.shape[3])
+            k_packed = k.reshape(B_q * T_k, k.shape[2], k.shape[3])
+            v_packed = v.reshape(B_q * T_k, v.shape[2], v.shape[3])
+            cu_seqlens_q = torch.arange(0, (B_q + 1) * T_q, T_q,
+                                        device=q.device, dtype=torch.int32)
+            cu_seqlens_k = torch.arange(0, (B_q + 1) * T_k, T_k,
+                                        device=q.device, dtype=torch.int32)
+            out_packed = _flash_attn_varlen(
+                q_packed, k_packed, v_packed,
+                cu_seqlens_q, cu_seqlens_k,
+                max_seqlen_q=T_q, max_seqlen_k=T_k,
+                causal=True, dropout_p=drop_p,
+            )
+            out = out_packed.reshape(B_q, T_q, q.shape[2], q.shape[3])
         elif self.attention_impl == "sdpa":
             q_t = q.transpose(1, 2)
             k_t = k.transpose(1, 2)
@@ -162,7 +214,7 @@ class MixedAttention(nn.Module):
         else:
             raise ValueError(
                 f"Unknown attention_impl: {self.attention_impl!r}. "
-                f"Supported: 'sdpa', 'fav2', 'fav4', 'turbo'"
+                f"Supported: 'sdpa', 'fav2', 'fav2_varlen', 'fav4', 'turbo'"
             )
 
         out = out.reshape(B, out.shape[1], self.d_model)
@@ -217,18 +269,196 @@ class OneTransBlock(nn.Module):
         self.norm2 = RMSNorm(d_model)
         self.ffn = MixedFFN(d_model, d_model * ffn_mult, n_ns_tokens, dropout)
 
-    def forward(self, x: Tensor, mask: Tensor, q_len: int, n_s_tokens: int) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        mask: Tensor | None,
+        q_len: int,
+        n_s_tokens: int,
+        cu_seqlens: Tensor | None = None,
+        max_seqlen: int | None = None,
+        real_mask: Tensor | None = None,
+        real_indices: Tensor | None = None,
+    ) -> Tensor:
         kv_len = x.shape[1]
         n_ns = kv_len - n_s_tokens
 
         normed = self.norm1(x)
-        attn_out = self.attn(normed, n_s=n_s_tokens, mask=mask)
+        attn_out = self.attn(
+            normed, n_s=n_s_tokens, mask=mask,
+            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+            real_mask=real_mask, real_indices=real_indices,
+        )
         x_tail = x[:, kv_len - q_len:]
         z = attn_out + x_tail
 
         n_s_out = q_len - n_ns
         ffn_out = self.ffn(self.norm2(z), n_s=n_s_out)
         return z + ffn_out
+
+
+# ---------------------------------------------------------------------------
+# Phase B2: Packed (jagged) variants
+#
+# These run the transformer with S-tokens in PACKED form ([total_S_real, D])
+# and NS-tokens in DENSE form ([B, n_ns, D]). NS stays dense because its
+# Q/K/V/FFN weights are per-position (n_ns separate weight matrices) and
+# index-selecting per token would be slow. The two streams are interleaved
+# only at the FA-varlen boundary using precomputed gather/scatter indices.
+#
+# Pack/unpack indices are computed ONCE per batch in OneTransModel._backbone
+# (eager mode) and threaded through all layers, so the per-block compiled
+# forward never sees any data-dependent ops (no nonzero, no boolean indexing).
+# ---------------------------------------------------------------------------
+
+class MixedAttentionPacked(nn.Module):
+    """Packed-input variant of MixedAttention.
+
+    Inputs:
+      s_packed:    [total_S_real, D]
+      ns_dense:    [B, n_ns, D]
+      cu_seqlens:  [B+1] int32 — cumulative (S_real_i + n_ns) per user
+      max_seqlen:  static int upper bound (L_S + n_ns)
+      s_to_packed: [total_S_real] int64 — for each S-token, its position in the
+                   interleaved attention buffer (cu_seqlens[i] + within-user-pos)
+      ns_to_packed:[B*n_ns] int64 — for each (i, j) NS slot, its position in the
+                   attention buffer (cu_seqlens[i] + S_real_i + j)
+
+    Outputs:
+      s_packed_out: [total_S_real, D]
+      ns_dense_out: [B, n_ns, D]
+    """
+
+    def __init__(self, d_model: int, n_heads: int, n_ns_tokens: int,
+                 dropout: float = 0.0):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads
+        self.n_ns = n_ns_tokens
+
+        self.s_qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.ns_qkv_weight = nn.Parameter(torch.empty(n_ns_tokens, 3 * d_model, d_model))
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.attn_drop = dropout
+
+        nn.init.xavier_uniform_(self.s_qkv.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        for i in range(self.n_ns):
+            nn.init.xavier_uniform_(self.ns_qkv_weight.data[i])
+
+    def forward(
+        self,
+        s_packed: Tensor,
+        ns_dense: Tensor,
+        cu_seqlens: Tensor,
+        max_seqlen: int,
+        s_to_packed: Tensor,
+        ns_to_packed: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        B = ns_dense.shape[0]
+        H, D_head = self.n_heads, self.d_head
+        drop_p = self.attn_drop if self.training else 0.0
+
+        # Project (S packed, NS per-position dense)
+        s_qkv = self.s_qkv(s_packed)                                        # [N_S, 3D]
+        ns_qkv = torch.einsum("btn,tmn->btm", ns_dense, self.ns_qkv_weight)  # [B, n_ns, 3D]
+
+        # Interleave into a single attn buffer with FA-friendly per-user contiguity
+        total_attn = s_qkv.shape[0] + B * self.n_ns
+        attn_qkv = s_qkv.new_zeros(total_attn, 3 * self.d_model)
+        attn_qkv.index_copy_(0, s_to_packed, s_qkv)
+        attn_qkv.index_copy_(0, ns_to_packed, ns_qkv.reshape(B * self.n_ns, 3 * self.d_model))
+
+        # Reshape to [N_attn, 3, H, D_head] then unbind
+        attn_qkv = attn_qkv.view(total_attn, 3, H, D_head)
+        q, k, v = attn_qkv.unbind(1)
+
+        out_attn = _flash_attn_varlen(
+            q, k, v, cu_seqlens, cu_seqlens,
+            max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+            causal=True, dropout_p=drop_p,
+        )  # [N_attn, H, D_head]
+
+        # De-interleave back to packed S + dense NS
+        out_attn_flat = out_attn.reshape(total_attn, self.d_model)
+        s_out_flat = out_attn_flat.index_select(0, s_to_packed)        # [N_S, D]
+        ns_out_flat = out_attn_flat.index_select(0, ns_to_packed)      # [B*n_ns, D]
+        ns_out = ns_out_flat.view(B, self.n_ns, self.d_model)
+
+        # Out projection (shared Linear works on either shape)
+        s_out = self.out_proj(s_out_flat)
+        ns_out = self.out_proj(ns_out)
+        return s_out, ns_out
+
+
+class MixedFFNPacked(nn.Module):
+    """Packed-input variant of MixedFFN.
+
+    S uses shared Linear (works on packed [N_S, D]); NS uses per-position
+    weights via einsum on dense [B, n_ns, D]. No interleaving needed —
+    FFN is element-wise per token.
+    """
+
+    def __init__(self, d_model: int, ffn_dim: int, n_ns_tokens: int, dropout: float = 0.0):
+        super().__init__()
+        self.n_ns = n_ns_tokens
+        self.d_model = d_model
+
+        self.s_w1 = nn.Linear(d_model, ffn_dim, bias=False)
+        self.s_w2 = nn.Linear(ffn_dim, d_model, bias=False)
+        self.ns_w1 = nn.Parameter(torch.empty(n_ns_tokens, ffn_dim, d_model))
+        self.ns_w2 = nn.Parameter(torch.empty(n_ns_tokens, d_model, ffn_dim))
+        self.dropout = nn.Dropout(dropout)
+
+        nn.init.xavier_uniform_(self.s_w1.weight)
+        nn.init.xavier_uniform_(self.s_w2.weight)
+        for i in range(self.n_ns):
+            nn.init.xavier_uniform_(self.ns_w1.data[i])
+            nn.init.xavier_uniform_(self.ns_w2.data[i])
+
+    def forward(
+        self, s_packed: Tensor, ns_dense: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        s_out = self.s_w2(self.dropout(F.gelu(self.s_w1(s_packed))))
+        ns_h = F.gelu(torch.einsum("btn,tmn->btm", ns_dense, self.ns_w1))
+        ns_out = torch.einsum("btm,tnm->btn", self.dropout(ns_h), self.ns_w2)
+        return s_out, ns_out
+
+
+class OneTransPackedBlock(nn.Module):
+    """Pre-norm causal Transformer block running on packed-S + dense-NS streams."""
+
+    def __init__(self, d_model: int, n_heads: int, n_ns_tokens: int,
+                 ffn_mult: int = 4, dropout: float = 0.0):
+        super().__init__()
+        self.norm1 = RMSNorm(d_model)
+        self.attn = MixedAttentionPacked(d_model, n_heads, n_ns_tokens, dropout)
+        self.norm2 = RMSNorm(d_model)
+        self.ffn = MixedFFNPacked(d_model, d_model * ffn_mult, n_ns_tokens, dropout)
+
+    def forward(
+        self,
+        s: Tensor,
+        ns: Tensor,
+        cu_seqlens: Tensor,
+        max_seqlen: int,
+        s_to_packed: Tensor,
+        ns_to_packed: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        # Attention
+        s_n = self.norm1(s)
+        ns_n = self.norm1(ns)
+        s_a, ns_a = self.attn(s_n, ns_n, cu_seqlens, max_seqlen, s_to_packed, ns_to_packed)
+        s = s + s_a
+        ns = ns + ns_a
+        # FFN
+        s_n = self.norm2(s)
+        ns_n = self.norm2(ns)
+        s_f, ns_f = self.ffn(s_n, ns_n)
+        s = s + s_f
+        ns = ns + ns_f
+        return s, ns
 
 
 # ---------------------------------------------------------------------------
@@ -348,12 +578,18 @@ class OneTransModel(BaseModel):
             ns_raw_dim, ot.d_model, ot.n_ns_tokens,
         ).to(device)
 
-        # Transformer stack
-        self.blocks = nn.ModuleList([
-            OneTransBlock(ot.d_model, ot.n_heads, ot.n_ns_tokens, ot.ffn_mult, ot.dropout,
-                         attention_impl=ot.attention_impl)
-            for _ in range(ot.n_layers)
-        ]).to(device)
+        # Transformer stack: dense (default) or fully-packed (use_jagged=True)
+        if ot.use_jagged:
+            self.blocks = nn.ModuleList([
+                OneTransPackedBlock(ot.d_model, ot.n_heads, ot.n_ns_tokens, ot.ffn_mult, ot.dropout)
+                for _ in range(ot.n_layers)
+            ]).to(device)
+        else:
+            self.blocks = nn.ModuleList([
+                OneTransBlock(ot.d_model, ot.n_heads, ot.n_ns_tokens, ot.ffn_mult, ot.dropout,
+                             attention_impl=ot.attention_impl)
+                for _ in range(ot.n_layers)
+            ]).to(device)
         self._compile_blocks = config.train.torch_compile
         self._compile_backend = config.train.torch_compile_backend
         self.final_norm = RMSNorm(ot.d_model).to(device)
@@ -562,7 +798,10 @@ class OneTransModel(BaseModel):
         ns_raw = self._build_ns_raw(embs, batch)
         ns_tokens = self.ns_tokenizer(ns_raw)
 
-        # Concatenate: [S-tokens ; NS-tokens]
+        if ot.use_jagged:
+            return self._backbone_jagged(s_tokens, ns_tokens, batch, B, L_S, L_NS)
+
+        # Dense path (default)
         x = torch.cat([s_tokens, ns_tokens], dim=1)
 
         # Pyramid schedule
@@ -591,6 +830,101 @@ class OneTransModel(BaseModel):
         ns_out = x[:, -L_NS:]
         h = self.head_proj(ns_out.reshape(B, -1))
 
+        return h, s_repr
+
+    def _backbone_jagged(
+        self,
+        s_tokens: Tensor,
+        ns_tokens: Tensor,
+        batch: dict[str, Tensor],
+        B: int,
+        L_S: int,
+        L_NS: int,
+    ) -> tuple[Tensor, Tensor]:
+        """Phase B2 packed transformer path.
+
+        Pack ONCE before the block loop, run all layers fully packed, unpack
+        ONCE after for s_repr. NS stays dense throughout because its weights
+        are per-position (n_ns separate matrices indexed by slot).
+        """
+        ot = self.config.model.transformer
+        device = s_tokens.device
+        L_per_pool = L_S // len(self.config.feature.sequence_groups)
+        n_lp = batch["hist_lp_len"].to(torch.int32)
+        n_like = batch["hist_like_len"].to(torch.int32)
+        n_skip = batch["hist_skip_len"].to(torch.int32)
+        s_real_lens = n_lp + n_like + n_skip                 # [B] int32
+        attn_real_lens = s_real_lens + L_NS                  # [B] int32 — per-user attn seq
+
+        # Build s_real_mask [B, L_S] bool: True at real-token positions in s_tokens
+        arange_pool = torch.arange(L_per_pool, device=device, dtype=torch.int32)
+        lp_mask = arange_pool.unsqueeze(0) >= (L_per_pool - n_lp.unsqueeze(1))
+        like_mask = arange_pool.unsqueeze(0) >= (L_per_pool - n_like.unsqueeze(1))
+        skip_mask = arange_pool.unsqueeze(0) >= (L_per_pool - n_skip.unsqueeze(1))
+        s_real_mask = torch.cat([lp_mask, like_mask, skip_mask], dim=1)  # [B, L_S]
+
+        # Pack S tokens: nonzero gives positions in s_tokens.flatten(0,1), in
+        # row-major (per-user contiguous, per-pool front-padding-skipped) order.
+        s_indices_in_dense = s_real_mask.flatten().nonzero(as_tuple=False).squeeze(1).to(torch.int64)
+        s_packed = s_tokens.reshape(B * L_S, ot.d_model).index_select(0, s_indices_in_dense)
+        # ^ [total_S_real, D]
+
+        # Build cu_seqlens for FA-varlen: one segment per user covering S_real_i + n_ns
+        cu_seqlens = attn_real_lens.cumsum(0).to(torch.int32)
+        zero = cu_seqlens.new_zeros(1)
+        cu_seqlens = torch.cat([zero, cu_seqlens])           # [B+1]
+        max_seqlen = L_S + L_NS
+
+        # s_to_packed[k] = position in attn buffer of the k-th S-token in s_packed.
+        # For user i, S tokens are at attn positions [cu_seqlens[i], cu_seqlens[i] + S_real_i).
+        # User-id-per-token via searchsorted on cumulative S-real lengths.
+        cu_s_real = s_real_lens.cumsum(0).to(torch.int32)
+        zero32 = cu_s_real.new_zeros(1)
+        cu_s_real = torch.cat([zero32, cu_s_real])           # [B+1]
+        # arange over total_S_real WITHOUT Python int() cast (FX-friendly).
+        # ones_like + cumsum - 1 generates [0, 1, 2, ..., N-1] from any [N]-shaped tensor.
+        arange_s = torch.ones_like(s_indices_in_dense, dtype=torch.int64).cumsum(0) - 1
+        # user_id_per_token: which user does each S-real token belong to.
+        s_user = torch.searchsorted(cu_s_real, arange_s.to(torch.int32), right=True) - 1   # [total_S_real]
+        s_user = s_user.to(torch.int64)
+        s_local = arange_s - cu_s_real[s_user].to(torch.int64)                              # within-user offset
+        s_to_packed = cu_seqlens[s_user].to(torch.int64) + s_local                          # [total_S_real]
+
+        # ns_to_packed[k] = position in attn buffer of the k-th NS slot (k = i*L_NS + j)
+        arange_ns = torch.arange(B * L_NS, device=device, dtype=torch.int64)
+        ns_user = arange_ns // L_NS
+        ns_local = arange_ns - ns_user * L_NS
+        # NS goes after each user's S in attn buffer
+        ns_to_packed = (
+            cu_seqlens[1:][ns_user].to(torch.int64) - L_NS + ns_local
+        )                                                                                   # [B*L_NS]
+
+        # Run packed transformer (optionally with gradient checkpointing).
+        # Checkpointing recomputes each block's interleave + attention in
+        # backward, freeing the per-layer attn_qkv / out_attn buffers (~25-35
+        # GB at hist=500/1000) for ~25% extra step time.
+        s = s_packed
+        ns = ns_tokens
+        use_ckpt = ot.grad_checkpoint and self.training
+        for block in self.blocks:
+            if use_ckpt:
+                s, ns = _ckpt.checkpoint(
+                    block, s, ns, cu_seqlens, max_seqlen,
+                    s_to_packed, ns_to_packed, use_reentrant=False,
+                )
+            else:
+                s, ns = block(s, ns, cu_seqlens, max_seqlen, s_to_packed, ns_to_packed)
+
+        s = self.final_norm(s)
+        ns = self.final_norm(ns)
+
+        # s_repr: per-user mean of S tokens. scatter_add then divide by lens.
+        s_repr_sum = s.new_zeros(B, ot.d_model)
+        s_repr_sum.index_add_(0, s_user, s)
+        s_repr = s_repr_sum / s_real_lens.to(s.dtype).clamp_min(1).unsqueeze(1)
+
+        # NS head projection (NS already dense [B, L_NS, D])
+        h = self.head_proj(ns.reshape(B, -1))
         return h, s_repr
 
     # ------------------------------------------------------------------

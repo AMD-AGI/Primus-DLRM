@@ -142,6 +142,13 @@ class ScoringPair:
     # larger than num_embeddings) into the table-row index space.
     cross_ids: dict[str, int] = field(default_factory=dict)
 
+    # Per-pool real (un-padded) lengths, used by jagged attention to build
+    # cu_seqlens. Values in [0, history_length]. Default 0 keeps backward
+    # compat with non-jagged callers (dense attention ignores these fields).
+    hist_lp_len: int = 0
+    hist_like_len: int = 0
+    hist_skip_len: int = 0
+
 
 class FlatEventStore:
     """Memory-efficient flat array storage for all user events.
@@ -560,6 +567,9 @@ class YambdaTrainDataset(Dataset):
             dislike=1.0 if event_type == DISLIKE_TYPE else 0.0,
             listen_pct=min(played_ratio / 100.0, 1.0) if event_type == LISTEN_TYPE else 0.0,
             cross_ids=cross_ids,
+            hist_lp_len=int(history["lp_len"]),
+            hist_like_len=int(history["like_len"]),
+            hist_skip_len=int(history["skip_len"]),
             **counters_kwargs,
         )
 
@@ -602,10 +612,18 @@ class YambdaTrainDataset(Dataset):
         return out
 
     def _get_split_history(self, flat_pos: int, user_start: int) -> dict:
-        """Scan backward from flat_pos, split events into listen+/like/skip pools."""
+        """Scan backward from flat_pos, split events into listen+/like/skip pools.
+
+        ``scan_window`` controls how far back the dataset looks; ``history_length``
+        controls how many events from each (listen+/like/skip) pool to keep
+        after splitting. With imbalanced behavior frequencies, scan_window must
+        be substantially larger than 3 * history_length to give each pool a fair
+        chance at filling its last-L slice from real events (vs zero padding).
+        """
         L = self.config.data.history_length
+        scan_window = self.config.data.scan_window
         scan_end = flat_pos
-        scan_start = max(user_start, flat_pos - 500)
+        scan_start = max(user_start, flat_pos - scan_window)
 
         item_ids = self.store.flat_item_ids[scan_start:scan_end]
         is_lp = self.store.flat_is_listen_plus[scan_start:scan_end]
@@ -629,10 +647,18 @@ class YambdaTrainDataset(Dataset):
         like_i, like_a, like_al = pad_and_lookup(like_items)
         skip_i, skip_a, skip_al = pad_and_lookup(skip_items)
 
+        # Per-pool actual (real, un-padded) lengths for jagged attention.
+        # Each is in [0, L]; jagged attention uses these to build cu_seqlens
+        # so the FA varlen kernel skips padded positions. Dense path ignores.
+        n_lp = min(len(lp_items), L)
+        n_like = min(len(like_items), L)
+        n_skip = min(len(skip_items), L)
+
         return {
             "lp_items": lp_i, "lp_artists": lp_a, "lp_albums": lp_al,
             "like_items": like_i, "like_artists": like_a, "like_albums": like_al,
             "skip_items": skip_i, "skip_artists": skip_a, "skip_albums": skip_al,
+            "lp_len": n_lp, "like_len": n_like, "skip_len": n_skip,
         }
 
 

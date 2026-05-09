@@ -23,6 +23,15 @@ class DataConfig:
     #   "last_x_days" — all events within history_days window
     history_mode: str = "last_l"
 
+    # How many raw events to scan backward when building per-behavior pools.
+    # The dataset reads the last ``scan_window`` events of the user's history
+    # and splits them into listen+/like/skip; ``history_length`` then keeps
+    # the last L of each. Default 500 matches legacy behavior; raising this
+    # gives the per-pool ``last_l`` slice access to a much larger pool of
+    # candidates (important when listen+/like/skip frequencies are imbalanced).
+    # Higher values increase per-sample data-loading cost roughly linearly.
+    scan_window: int = 500
+
     # Time window for "last_x_days" mode (ignored in "last_l" mode)
     history_days: int = 30
 
@@ -334,6 +343,23 @@ class TransformerConfig:
     #   "fav4"  — FlashAttention-4 / CuTeDSL (requires flash-attn-4, Blackwell optimized)
     #   "turbo" — Primus-Turbo flash attention (requires primus_turbo package, ROCm)
     attention_impl: str = "turbo"
+
+    # Jagged attention: when True, build cu_seqlens from per-pool real lengths
+    # (data.scan_window provides the events; data.history_length caps each pool)
+    # and call flash_attn_varlen_func instead of dense flash_attn_func.
+    # Skips compute on padded zero tokens. Requires attention_impl='fav2_varlen'
+    # or compatible varlen-capable backend; ignored otherwise.
+    # Pyramid masking (use_pyramid=True) is NOT supported with jagged in this
+    # MVP — set use_pyramid=False when enabling use_jagged.
+    use_jagged: bool = False
+
+    # When True, recompute each transformer block in backward instead of
+    # retaining its activations. On the packed (use_jagged=True) path this
+    # frees the per-layer interleave buffer (attn_qkv) and FA-output buffers,
+    # cutting peak HBM by ~60% (e.g. 250 GB -> 96 GB at hist=500) and
+    # unlocking history_length up to 2000 on a single MI355X. Same weights
+    # and same outputs; ~25% extra step time from recompute.
+    grad_checkpoint: bool = False
 
 
 
