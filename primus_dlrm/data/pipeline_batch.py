@@ -132,6 +132,22 @@ def collate_pipeline_batch(
 
 
 def _scoring_pair_to_dict(sp) -> dict[str, Any]:
-    """Convert a ScoringPair dataclass to a plain dict."""
+    """Convert a ScoringPair dataclass to a plain dict.
+
+    The ``cross_ids`` dict is exploded into one flat key per cross
+    (``"<spec.name>_id"``) so ``build_kjt`` can look it up via
+    ``data.schema.batch_to_feature``, which uses the same key convention
+    populated by ``Config.expand_cross_features()``.
+    """
     from dataclasses import fields as dc_fields
-    return {f.name: getattr(sp, f.name) for f in dc_fields(sp) if getattr(sp, f.name) is not None}
+    out: dict[str, Any] = {}
+    for f in dc_fields(sp):
+        val = getattr(sp, f.name)
+        if val is None:
+            continue
+        if f.name == "cross_ids":
+            for cname, cid in val.items():
+                out[f"{cname}_id"] = cid
+        else:
+            out[f.name] = val
+    return out

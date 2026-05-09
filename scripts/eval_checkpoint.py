@@ -50,7 +50,7 @@ def main():
     config = Config.load(args.config)
     processed_dir = Path(args.processed_dir)
 
-    train_dataset = YambdaTrainDataset(config.data, processed_dir)
+    train_dataset = YambdaTrainDataset(config, processed_dir)
 
     if config.model.model_type == "onetrans":
         model = OneTransModel(config=config, device=device)
@@ -67,7 +67,7 @@ def main():
 
     import time
 
-    eval_dataset = YambdaEvalDataset(config.data, processed_dir)
+    eval_dataset = YambdaEvalDataset(config, processed_dir)
     pop = eval_dataset.item_popularity
     candidate_items = np.argsort(-pop)[:args.num_candidates]
     logger.info(

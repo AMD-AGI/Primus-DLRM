@@ -225,10 +225,35 @@ def log_param_summary(
 
     if table_rows:
         logger.info("  Embedding tables (rows × dim × dtype):")
+        # Mark cross-feature tables (auto-registered from model.cross_features)
+        # so the operator can correlate the YAML toggles with the live shapes.
+        cross_names: set[str] = set()
+        if config is not None:
+            cross_specs = getattr(getattr(config, "model", None), "cross_features", None) or []
+            cross_names = {s.name for s in cross_specs if getattr(s, "enabled", True)}
+        max_name_len = max((len(n) for n, *_ in table_rows), default=10)
         for name, n_rows, dim, dt_s in table_rows:
             tbl_bytes = n_rows * dim * dtype_bytes(getattr(torch, dt_s))
-            logger.info(f"    {name:<10s}: {n_rows:>10,d} × {dim:>3d} × {dt_s:<8s}"
-                        f" = {fmt_bytes(tbl_bytes):>10s}")
+            tag = " [cross]" if name in cross_names else ""
+            logger.info(
+                f"    {name:<{max_name_len}s}: {n_rows:>12,d} × {dim:>3d} × {dt_s:<8s}"
+                f" = {fmt_bytes(tbl_bytes):>10s}{tag}"
+            )
+
+    if config is not None:
+        cross_specs = getattr(getattr(config, "model", None), "cross_features", None) or []
+        if cross_specs:
+            enabled = [s for s in cross_specs if getattr(s, "enabled", True)]
+            disabled = [s for s in cross_specs if not getattr(s, "enabled", True)]
+            logger.info(
+                f"  Cross-feature specs: {len(enabled)} enabled, {len(disabled)} disabled"
+            )
+            for s in enabled:
+                logger.info(
+                    f"    + {s.name:<24s}  keys={s.keys}  num_embeddings={s.num_embeddings:,d}"
+                )
+            for s in disabled:
+                logger.info(f"    - {s.name:<24s}  (disabled)")
 
     logger.info(f"  Optimizer state ({dense_optimizer} on dense + Adam on TBE, all fp32 m+v):")
     logger.info(f"    Dense AdamW (m,v fp32):       {fmt_bytes(dense_opt_bytes)}/rank (replicated)")

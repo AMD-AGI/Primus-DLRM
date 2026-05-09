@@ -310,7 +310,7 @@ def main():
     ks = [10, 50, 100]
 
     logger.info("Loading eval dataset...")
-    eval_dataset = YambdaEvalDataset(config.data, processed_dir)
+    eval_dataset = YambdaEvalDataset(config, processed_dir)
 
     if args.mode == "mostpop":
         eval_mostpop(eval_dataset, args.task, ks, top_n=args.top_n)

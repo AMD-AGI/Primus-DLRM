@@ -381,13 +381,15 @@ fi
 # polars-u64-idx (64-bit row index) is mandatory: stock polars wraps at 2^32 rows
 # which crashes during 5b cache load. Drop-in replacement; ~negligible cost on smaller data.
 if [ "'"$PLATFORM"'" = "amd" ]; then
-    pip install --no-cache-dir polars-u64-idx pyarrow pyyaml tqdm datasets pytest psutil numba 2>&1 | tail -3
+    # xxhash is required for cross-feature hashing (data.cross_features in YAML).
+    # Cheap dep, harmless when no crosses are configured.
+    pip install --no-cache-dir polars-u64-idx pyarrow pyyaml tqdm datasets pytest psutil numba xxhash 2>&1 | tail -3
     grep -q shampoo /workspace/dlrm/'"$CONFIG"' 2>/dev/null && \
         pip install --no-cache-dir git+https://github.com/facebookresearch/optimizers.git 2>&1 | tail -3
 else
     pip install /workspace/dlrm/pip_cache/fbgemm_gpu_nightly-2026.4.29-cp312-cp312-linux_x86_64.whl 2>&1 | tail -3
     pip install --no-deps torchrec==1.4.0 2>&1 | tail -3
-    pip install polars-u64-idx pyarrow pyyaml tqdm datasets psutil torchmetrics tensordict pyre-extensions iopath typing-inspect 2>&1 | tail -3
+    pip install polars-u64-idx pyarrow pyyaml tqdm datasets psutil torchmetrics tensordict pyre-extensions iopath typing-inspect xxhash 2>&1 | tail -3
     pip install "flash-attn-4==4.0.0b10" "flash-attn-4[cu13]" 2>&1 | tail -3
 fi
 # Optional CK FlashAttention wheel (yiding12 / fav2 path).

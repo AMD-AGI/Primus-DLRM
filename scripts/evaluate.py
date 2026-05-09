@@ -29,7 +29,7 @@ def main():
     processed_dir = Path(args.processed_dir)
 
     logger.info("Loading eval dataset...")
-    eval_dataset = YambdaEvalDataset(config.data, processed_dir)
+    eval_dataset = YambdaEvalDataset(config, processed_dir)
 
     logger.info("Building model...")
     model = DLRMBaseline(

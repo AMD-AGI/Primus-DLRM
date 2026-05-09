@@ -13,7 +13,7 @@ import polars as pl
 import torch
 from torch.utils.data import Dataset
 
-from primus_dlrm.config import DataConfig
+from primus_dlrm.config import Config, CrossFeatureSpec, DataConfig
 from primus_dlrm.data.preprocessing import EVENT_TYPE_MAP
 
 
@@ -135,6 +135,13 @@ class ScoringPair:
     item_counters: torch.Tensor | None = None    # [3W]
     cross_counters: torch.Tensor | None = None   # [9W]
 
+    # Cross-product ids keyed by spec name (e.g. "user_x_artist"). Empty when
+    # no cross_features are enabled in the config; otherwise one entry per
+    # enabled CrossFeatureSpec, each an int in [0, spec.num_embeddings).
+    # Hashing collapses the unique cross-product cardinality (which can be far
+    # larger than num_embeddings) into the table-row index space.
+    cross_ids: dict[str, int] = field(default_factory=dict)
+
 
 class FlatEventStore:
     """Memory-efficient flat array storage for all user events.
@@ -171,6 +178,10 @@ class FlatEventStore:
         self.flat_timestamps = exploded["timestamps"].to_numpy().astype(np.int64)
         self.flat_event_types = exploded["event_types"].to_numpy().astype(np.int64)
         self.flat_played_ratio = exploded["played_ratio_pct"].to_numpy().astype(np.float32)
+        # int8 (0/1) — used by cross_features that include "is_organic" as a key
+        # (e.g. user_x_is_organic). Always materialised so the cache is
+        # self-describing; the column is already in the exploded DataFrame.
+        self.flat_is_organic = exploded["is_organic"].to_numpy().astype(np.int8)
 
         np.nan_to_num(self.flat_played_ratio, copy=False, nan=0.0)
 
@@ -253,6 +264,7 @@ class FlatEventStore:
         for name in ("flat_uid", "flat_item_ids", "flat_timestamps",
                       "flat_event_types", "flat_played_ratio",
                       "flat_is_listen_plus", "flat_is_like", "flat_is_skip",
+                      "flat_is_organic",
                       "user_start", "user_end", "unique_uids"):
             arr = getattr(self, name)
             np.save(mmap_dir / f"{name}.npy", arr)
@@ -296,6 +308,7 @@ class FlatEventStore:
         for name in ("flat_uid", "flat_item_ids", "flat_timestamps",
                       "flat_event_types", "flat_played_ratio",
                       "flat_is_listen_plus", "flat_is_like", "flat_is_skip",
+                      "flat_is_organic",
                       "user_start", "user_end", "unique_uids"):
             setattr(store, name, _load_npy_readonly(mmap_dir / f"{name}.npy"))
 
@@ -354,9 +367,13 @@ def _save_store_cache(
 class YambdaTrainDataset(Dataset):
     """Training dataset with split history pools (listen+, like, skip)."""
 
-    def __init__(self, config: DataConfig, paths: DataPaths):
+    def __init__(self, config: Config, paths: DataPaths):
+        # Takes the full Config (not just DataConfig) because cross_features
+        # live under config.model and the dataset hot path needs to read them.
+        # All DataConfig-side fields are accessed via self.config.data.<x>.
         self.config = config
         self.paths = paths
+        data_cfg = config.data
 
         logger.info(
             f"Loading preprocessed data from {paths.processed} "
@@ -369,21 +386,27 @@ class YambdaTrainDataset(Dataset):
 
         self._load_metadata(paths.metadata)
 
-        cached = _try_load_cached_store(config, paths, "train", in_memory=False)
+        cached = _try_load_cached_store(data_cfg, paths, "train", in_memory=False)
         if cached is not None:
             self.store = cached
         else:
             sessions = pl.read_parquet(paths.processed / "train_sessions.parquet")
             self.store = FlatEventStore(
                 sessions,
-                enable_counters=config.enable_counters,
-                item_to_artist=self.item_to_artist if config.enable_counters else None,
-                item_to_album=self.item_to_album if config.enable_counters else None,
-                counter_windows_days=config.counter_windows_days if config.enable_counters else None,
+                enable_counters=data_cfg.enable_counters,
+                item_to_artist=self.item_to_artist if data_cfg.enable_counters else None,
+                item_to_album=self.item_to_album if data_cfg.enable_counters else None,
+                counter_windows_days=data_cfg.counter_windows_days if data_cfg.enable_counters else None,
             )
-            _save_store_cache(self.store, config, paths, "train")
+            _save_store_cache(self.store, data_cfg, paths, "train")
 
         self._build_sample_positions()
+        # Snapshot enabled cross-feature specs so the hot path doesn't reread
+        # the config on every sample. Always non-None so __getitem__ doesn't
+        # need to branch on its presence.
+        self._enabled_cross_specs: list[CrossFeatureSpec] = [
+            s for s in (config.model.cross_features or []) if s.enabled
+        ]
 
         logger.info(
             f"Dataset ready: {len(self._positions)} training positions, "
@@ -439,10 +462,10 @@ class YambdaTrainDataset(Dataset):
         dir, it is memory-mapped (shared across ranks, zero computation).
         Otherwise, positions are computed vectorised and optionally saved.
         """
-        L = self.config.history_length
+        L = self.config.data.history_length
         cache_key = _cache_key(
             "train",
-            self.config.counter_windows_days if self.config.enable_counters else None,
+            self.config.data.counter_windows_days if self.config.data.enable_counters else None,
         )
         pos_path = self.paths.cache / cache_key / f"positions_L{L}.npy"
 
@@ -467,7 +490,7 @@ class YambdaTrainDataset(Dataset):
                 )
                 offset += n
 
-        if self.config.use_cache:
+        if self.config.data.use_cache:
             pos_path.parent.mkdir(parents=True, exist_ok=True)
             np.save(pos_path, positions)
             logger.info(f"Saved positions cache: {pos_path}")
@@ -489,6 +512,8 @@ class YambdaTrainDataset(Dataset):
         target_item = int(self.store.flat_item_ids[flat_pos])
         event_type = int(self.store.flat_event_types[flat_pos])
         played_ratio = float(self.store.flat_played_ratio[flat_pos])
+        target_artist = int(self.item_to_artist[target_item]) if target_item < len(self.item_to_artist) else 0
+        target_album = int(self.item_to_album[target_item]) if target_item < len(self.item_to_album) else 0
 
         audio = self.audio_embeddings[target_item] if target_item < len(self.audio_embeddings) else np.zeros(self.audio_dim, dtype=np.float32)
 
@@ -504,6 +529,17 @@ class YambdaTrainDataset(Dataset):
                 self.store.cross_counters[flat_pos].copy()
             )
 
+        cross_ids: dict[str, int] = {}
+        if self._enabled_cross_specs:
+            cross_ids = self._compute_cross_ids(
+                flat_pos=flat_pos,
+                uid=uid,
+                item_id=target_item,
+                artist_id=target_artist,
+                album_id=target_album,
+                ts=int(self.store.flat_timestamps[flat_pos]),
+            )
+
         return ScoringPair(
             hist_lp_item_ids=torch.from_numpy(history["lp_items"].copy()),
             hist_lp_artist_ids=torch.from_numpy(history["lp_artists"].copy()),
@@ -516,19 +552,58 @@ class YambdaTrainDataset(Dataset):
             hist_skip_album_ids=torch.from_numpy(history["skip_albums"].copy()),
             uid=uid,
             item_id=target_item,
-            artist_id=int(self.item_to_artist[target_item]) if target_item < len(self.item_to_artist) else 0,
-            album_id=int(self.item_to_album[target_item]) if target_item < len(self.item_to_album) else 0,
+            artist_id=target_artist,
+            album_id=target_album,
             audio_embed=torch.from_numpy(audio.copy()),
             listen_plus=1.0 if (event_type == LISTEN_TYPE and played_ratio >= LISTEN_PLUS_THRESHOLD) else 0.0,
             like=1.0 if event_type == LIKE_TYPE else 0.0,
             dislike=1.0 if event_type == DISLIKE_TYPE else 0.0,
             listen_pct=min(played_ratio / 100.0, 1.0) if event_type == LISTEN_TYPE else 0.0,
+            cross_ids=cross_ids,
             **counters_kwargs,
         )
 
+    def _compute_cross_ids(
+        self,
+        *,
+        flat_pos: int,
+        uid: int,
+        item_id: int,
+        artist_id: int,
+        album_id: int,
+        ts: int,
+    ) -> dict[str, int]:
+        """Hash the current event's keys into one bucket per enabled cross spec.
+
+        Supports n-way crosses (``len(spec.keys) >= 2``) via
+        ``cross_hash_nway``. ``ts`` is in seconds (Yambda timestamps are
+        seconds; see ``preprocessing.SECONDS_PER_TIMESTAMP_UNIT``);
+        ``hour_of_day`` is the 24-bucket hour of the day in UTC.
+        ``is_organic`` is read directly from the FlatEventStore (required
+        cache file; backfill legacy caches with
+        ``scripts/backfill_flat_is_organic.py``).
+        """
+        from primus_dlrm.data.hashing import cross_hash_nway
+
+        hour_of_day = (ts // 3600) % 24
+        sources = {
+            "uid": uid,
+            "item_id": item_id,
+            "artist_id": artist_id,
+            "album_id": album_id,
+            "hour_of_day": int(hour_of_day),
+            "is_organic": int(self.store.flat_is_organic[flat_pos]),
+        }
+        out: dict[str, int] = {}
+        for spec in self._enabled_cross_specs:
+            out[spec.name] = cross_hash_nway(
+                [sources[k] for k in spec.keys], spec.num_embeddings, spec.salt,
+            )
+        return out
+
     def _get_split_history(self, flat_pos: int, user_start: int) -> dict:
         """Scan backward from flat_pos, split events into listen+/like/skip pools."""
-        L = self.config.history_length
+        L = self.config.data.history_length
         scan_end = flat_pos
         scan_start = max(user_start, flat_pos - 500)
 
@@ -564,30 +639,34 @@ class YambdaTrainDataset(Dataset):
 class YambdaEvalDataset(Dataset):
     """Evaluation dataset with split history pools."""
 
-    def __init__(self, config: DataConfig, paths: DataPaths):
+    def __init__(self, config: Config, paths: DataPaths):
+        # Takes the full Config (not just DataConfig) for symmetry with
+        # YambdaTrainDataset; the eval path doesn't currently consume cross
+        # specs but receives the same config so future additions can.
         self.config = config
         self.paths = paths
+        data_cfg = config.data
 
         test_events = pl.read_parquet(paths.processed / "test_events.parquet")
         self.item_popularity = np.load(paths.processed / "item_popularity.npy")
 
         self._load_metadata(paths.metadata)
 
-        cached = _try_load_cached_store(config, paths, "eval")
+        cached = _try_load_cached_store(data_cfg, paths, "eval")
         if cached is not None:
             self.store = cached
         else:
             sessions = pl.read_parquet(paths.processed / "train_sessions.parquet")
             self.store = FlatEventStore(
                 sessions,
-                enable_counters=config.enable_counters,
-                item_to_artist=self.item_to_artist if config.enable_counters else None,
-                item_to_album=self.item_to_album if config.enable_counters else None,
-                counter_windows_days=config.counter_windows_days if config.enable_counters else None,
+                enable_counters=data_cfg.enable_counters,
+                item_to_artist=self.item_to_artist if data_cfg.enable_counters else None,
+                item_to_album=self.item_to_album if data_cfg.enable_counters else None,
+                counter_windows_days=data_cfg.counter_windows_days if data_cfg.enable_counters else None,
             )
-            _save_store_cache(self.store, config, paths, "eval")
+            _save_store_cache(self.store, data_cfg, paths, "eval")
 
-        if config.enable_counters:
+        if data_cfg.enable_counters:
             self._precompute_eval_item_counters()
 
         self.test_ground_truth: dict[int, dict] = {}
@@ -638,7 +717,7 @@ class YambdaEvalDataset(Dataset):
 
     def get_user_history(self, uid: int) -> dict:
         """Get split history for a test user (at end of training period)."""
-        L = self.config.history_length
+        L = self.config.data.history_length
         start, end = self.store.get_user_slice(uid)
         if start < 0:
             z = np.zeros(L, dtype=np.int64)
@@ -683,7 +762,7 @@ class YambdaEvalDataset(Dataset):
 
     def _precompute_eval_item_counters(self) -> None:
         """Precompute item counters at end-of-training timestamp for all items."""
-        W = len(self.config.counter_windows_days)
+        W = len(self.config.data.counter_windows_days)
         num_items = len(self.item_popularity)
         self.eval_item_counters = np.zeros((num_items, 3 * W), dtype=np.float32)
 
@@ -699,7 +778,7 @@ class YambdaEvalDataset(Dataset):
         item_starts = np.concatenate([[0], item_changes])
         item_ends = np.concatenate([item_changes, [len(sorted_items)]])
 
-        for w_idx, w_days in enumerate(self.config.counter_windows_days):
+        for w_idx, w_days in enumerate(self.config.data.counter_windows_days):
             window_start_ts = max_ts - w_days * SECONDS_PER_DAY
             col_lp = w_idx * 3
             col_like = w_idx * 3 + 1
@@ -727,7 +806,7 @@ class YambdaEvalDataset(Dataset):
         """Return user counters at end of training (last position)."""
         start, end = self.store.get_user_slice(uid)
         if start < 0 or not self.store.enable_counters:
-            W = len(self.config.counter_windows_days)
+            W = len(self.config.data.counter_windows_days)
             return np.zeros(3 * W, dtype=np.float32)
         return self.store.user_counters[end - 1].copy()
 
@@ -739,14 +818,14 @@ class YambdaEvalDataset(Dataset):
         self, uid: int, item_ids: np.ndarray,
     ) -> np.ndarray:
         """Compute cross counters for (uid, each candidate item) at eval time. [len(item_ids), 9W]"""
-        W = len(self.config.counter_windows_days)
+        W = len(self.config.data.counter_windows_days)
         result = np.zeros((len(item_ids), 9 * W), dtype=np.float32)
 
         start, end = self.store.get_user_slice(uid)
         if start < 0:
             return result
 
-        max_window = max(self.config.counter_windows_days)
+        max_window = max(self.config.data.counter_windows_days)
         max_ts = int(self.store.flat_timestamps[end - 1])
         global_window_start = max_ts - max_window * SECONDS_PER_DAY
 
@@ -762,7 +841,7 @@ class YambdaEvalDataset(Dataset):
         window_artists = self.item_to_artist[window_items]
         window_albums = self.item_to_album[window_items]
 
-        for w_idx, w_days in enumerate(self.config.counter_windows_days):
+        for w_idx, w_days in enumerate(self.config.data.counter_windows_days):
             w_start_ts = max_ts - w_days * SECONDS_PER_DAY
             w_mask = window_ts >= w_start_ts
             w_items = window_items[w_mask]
@@ -834,4 +913,11 @@ def collate_to_dict(batch: list[ScoringPair]) -> dict[str, torch.Tensor]:
         result["user_counters"] = torch.stack([b.user_counters for b in batch])
         result["item_counters"] = torch.stack([b.item_counters for b in batch])
         result["cross_counters"] = torch.stack([b.cross_counters for b in batch])
+    # Cross-feature ids: one tensor per enabled spec, named "<spec.name>_id"
+    # to match data.schema.batch_to_feature populated by expand_cross_features().
+    if batch[0].cross_ids:
+        for name in batch[0].cross_ids:
+            result[f"{name}_id"] = torch.tensor(
+                [b.cross_ids[name] for b in batch], dtype=torch.long,
+            )
     return result
