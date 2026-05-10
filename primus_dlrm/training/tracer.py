@@ -8,15 +8,15 @@ Supports two modes:
 2. Multi-window: ``Tracer("dir", trace_steps=[500, 1000], active=10)``
    profiles around each specified step independently.
 
-Usage::
+Trace filenames embed the (optional) global ``rank`` so multi-rank captures
+don't collide::
 
-    tracer = Tracer("results/run/trace", trace_steps=[500, 1000])
-    for step, batch in enumerate(loader):
-        # ... training step ...
-        tracer.step()
-    tracer.stop()
-    # -> results/run/trace/trace_0.json  (step 500 window)
-    #    results/run/trace/trace_1.json  (step 1000 window)
+    tracer = Tracer("results/run/trace", trace_steps=[500, 1000], rank=3)
+    # -> results/run/trace/trace_step500_rank3.json
+    #    results/run/trace/trace_step1000_rank3.json
+
+Multi-rank capture is orchestrated by the trainer: instantiate one Tracer per
+participating rank with that rank's id, all writing to the same ``trace_dir``.
 """
 from __future__ import annotations
 
@@ -70,6 +70,8 @@ class Tracer:
         warmup: profiler warmup steps before each active window.
         active: steps to actively profile in each window.
         repeat: number of (wait+warmup+active) cycles (single-window mode).
+        rank: optional global rank used in trace filenames so multi-rank
+            captures don't collide. ``None`` omits the rank suffix (legacy).
     """
 
     def __init__(
@@ -80,11 +82,13 @@ class Tracer:
         warmup: int = 5,
         active: int = 10,
         repeat: int = 1,
+        rank: int | None = None,
     ):
         self.trace_dir = Path(trace_dir)
         self.trace_dir.mkdir(parents=True, exist_ok=True)
         self._trace_count = 0
         self._trace_steps = trace_steps
+        self._rank = rank
 
         if trace_steps:
             sched = _multi_window_schedule(trace_steps, warmup, active)
@@ -107,14 +111,36 @@ class Tracer:
         self._prof.__exit__(None, None, None)
 
     def _export(self, prof):
+        suffix = f"_rank{self._rank}" if self._rank is not None else ""
         if self._trace_steps and self._trace_count < len(self._trace_steps):
             step = self._trace_steps[self._trace_count]
-            path = self.trace_dir / f"trace_step{step}.json"
+            path = self.trace_dir / f"trace_step{step}{suffix}.json"
         else:
-            path = self.trace_dir / f"trace_{self._trace_count}.json"
+            path = self.trace_dir / f"trace_{self._trace_count}{suffix}.json"
         prof.export_chrome_trace(str(path))
         self._trace_count += 1
 
     @property
     def trace_files(self) -> list[Path]:
         return sorted(self.trace_dir.glob("trace_*.json"))
+
+
+def parse_trace_ranks(spec: str | None) -> set[int] | None:
+    """Parse a ``--trace-ranks`` spec into a set of global ranks (or ``None``).
+
+    Accepts ``None``/``""``/``"0"`` (default — only rank 0), a comma-separated
+    list of ints (``"0,3,5"``), or the literal ``"all"`` (returns ``None``,
+    meaning *every* rank should trace).
+    """
+    if spec is None or spec == "":
+        return {0}
+    s = spec.strip().lower()
+    if s == "all":
+        return None
+    out: set[int] = set()
+    for tok in s.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        out.add(int(tok))
+    return out or {0}
