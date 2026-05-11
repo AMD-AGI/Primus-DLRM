@@ -35,7 +35,6 @@ model:
     # (e.g. fav4/FlashAttention-4) do not support dropout_p yet.
     dropout: 0.0
     pos_embed: true
-    attention_impl: turbo
   embedding_tables:
     - { name: item,   features: [item, hist_lp_item, hist_like_item, hist_skip_item],       num_embeddings: 9390624 }
     - { name: artist, features: [artist, hist_lp_artist, hist_like_artist, hist_skip_artist], num_embeddings: 1293395 }
@@ -55,6 +54,7 @@ feature:
     - { name: cross_counters, dim: 18, project: true, activation: relu }
 
 train:
+  attention_impl: turbo
   torch_compile: true
   batch_size: 16384
   lr: 0.0003

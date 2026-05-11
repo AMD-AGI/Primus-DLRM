@@ -622,14 +622,40 @@ class DistributedTrainer:
                         throughput = num_batches * per_gpu_batch * get_world_size() / elapsed
                         window_elapsed = current_time - window_start
                         window_throughput = self.log_interval * per_gpu_batch * get_world_size() / window_elapsed if window_elapsed > 0 else 0
-                        # TFLOPS/MFU per GPU
+                        # TFLOPS reporting:
+                        #   Dense runs:      ``tflops/gpu``,      ``mfu``
+                        #   Jagged runs:     ``tflops_algo/gpu``, ``mfu``  (= dense-equivalent yardstick)
+                        #                 +  ``tflops_real/gpu``, ``hfu``  (= actual GPU work / peak)
+                        #                 +  ``fill``                       (= real / algo, padding-skipped fraction)
+                        # ``mfu`` (Model FLOPs Utilization) uses the static
+                        # dense formula; ``hfu`` (Hardware FLOPs Utilization)
+                        # uses the per-batch jagged FLOPs estimate.
                         tflops_str = ""
                         if self._num_flops_per_sample > 0:
                             samples_per_sec_per_gpu = window_throughput / get_world_size()
                             tflops = self._num_flops_per_sample * samples_per_sec_per_gpu / 1e12
                             gpu_peak = self._get_gpu_peak_flops("bf16" if tc.bf16 else ("tf32" if tc.allow_tf32 else "fp32"))
                             mfu = 100 * self._num_flops_per_sample * samples_per_sec_per_gpu / gpu_peak if gpu_peak > 0 else 0
-                            tflops_str = f" | tflops/gpu={tflops:.1f} mfu={mfu:.1f}%"
+
+                            inner = self.model.module if hasattr(self.model, "module") else self.model
+                            jagged_flops_t = getattr(inner, "_last_jagged_flops_per_sample", None)
+                            jagged_flops = (
+                                float(jagged_flops_t.item())
+                                if jagged_flops_t is not None else 0.0
+                            )
+                            if 0 < jagged_flops < self._num_flops_per_sample:
+                                # Jagged path active — split algo vs real.
+                                tflops_real = jagged_flops * samples_per_sec_per_gpu / 1e12
+                                hfu = (100 * jagged_flops * samples_per_sec_per_gpu / gpu_peak) if gpu_peak > 0 else 0
+                                fill = 100 * jagged_flops / self._num_flops_per_sample
+                                tflops_str = (
+                                    f" | tflops_algo/gpu={tflops:.1f} mfu={mfu:.1f}%"
+                                    f" tflops_real/gpu={tflops_real:.1f} hfu={hfu:.1f}%"
+                                    f" fill={fill:.1f}%"
+                                )
+                            else:
+                                # Dense path (or jagged degenerated to fill=100%).
+                                tflops_str = f" | tflops/gpu={tflops:.1f} mfu={mfu:.1f}%"
                         sys_metrics = _get_system_metrics()
                         dl_stats = self._dataloader_stats()
                         logger.info(

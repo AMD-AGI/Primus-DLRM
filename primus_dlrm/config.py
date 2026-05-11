@@ -337,29 +337,6 @@ class TransformerConfig:
     # Learnable positional embeddings for S-tokens (one per position per pool)
     pos_embed: bool = True
 
-    # Attention implementation:
-    #   "sdpa"  — PyTorch scaled_dot_product_attention (default, works everywhere)
-    #   "fav2"  — FlashAttention-2 (requires flash_attn package)
-    #   "fav4"  — FlashAttention-4 / CuTeDSL (requires flash-attn-4, Blackwell optimized)
-    #   "turbo" — Primus-Turbo flash attention (requires primus_turbo package, ROCm)
-    attention_impl: str = "turbo"
-
-    # Jagged attention: when True, build cu_seqlens from per-pool real lengths
-    # (data.scan_window provides the events; data.history_length caps each pool)
-    # and call flash_attn_varlen_func instead of dense flash_attn_func.
-    # Skips compute on padded zero tokens. Requires attention_impl='fav2_varlen'
-    # or compatible varlen-capable backend; ignored otherwise.
-    # Pyramid masking (use_pyramid=True) is NOT supported with jagged in this
-    # MVP — set use_pyramid=False when enabling use_jagged.
-    use_jagged: bool = False
-
-    # When True, recompute each transformer block in backward instead of
-    # retaining its activations. On the packed (use_jagged=True) path this
-    # frees the per-layer interleave buffer (attn_qkv) and FA-output buffers,
-    # cutting peak HBM by ~60% (e.g. 250 GB -> 96 GB at hist=500) and
-    # unlocking history_length up to 2000 on a single MI355X. Same weights
-    # and same outputs; ~25% extra step time from recompute.
-    grad_checkpoint: bool = False
 
 
 
@@ -554,6 +531,31 @@ class TrainConfig:
     # workspace sizing bug in SDPA's backward pass.  Use "fav2" or "turbo"
     # attention when compiling with inductor.
     torch_compile_backend: str = "inductor"
+
+    # --- Jagged / packed transformer execution (no effect on weights) ---
+
+    # Attention backend (mathematically equivalent across choices):
+    #   "sdpa"  — PyTorch scaled_dot_product_attention (default, works everywhere)
+    #   "fav2"  — FlashAttention-2 (requires flash_attn package)
+    #   "fav4"  — FlashAttention-4 / CuTeDSL (Blackwell-optimized)
+    #   "turbo" — Primus-Turbo flash attention (ROCm)
+    attention_impl: str = "turbo"
+
+    # Skip the padded portion of each user's history during attention. Per-pool
+    # real lengths drive cu_seqlens for flash_attn_varlen, so attention compute
+    # scales with sum(real_len^2) instead of B*L^2 — fewer FLOPs per step at
+    # low fill ratios. Set use_pyramid=False; needs an FA-varlen backend.
+    use_jagged_attention: bool = False
+
+    # Apply each per-pool tokenizer Linear on PACKED [N_real, raw_dim] instead
+    # of dense [B, L, raw_dim], avoiding the [B, L_S, d_model] intermediate.
+    # Pure restructuring (no recomputation), 2-6 GB HBM savings at hist=500/1000.
+    pack_tokenizer: bool = False
+
+    # Recompute each transformer block in backward instead of retaining its
+    # activations. Frees the per-layer interleave / FA-output buffers (~30 GB
+    # at hist=1000), unlocking longer history at ~25% extra step time.
+    grad_checkpoint: bool = False
 
     # Weight for in-batch BPR contrastive loss (0.0 = disabled)
     contrastive_weight: float = 0.0

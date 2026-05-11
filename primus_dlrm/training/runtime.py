@@ -77,11 +77,11 @@ def apply_cli_overrides(config: Config, args) -> Config:
         )
     if getattr(args, "attention_impl", None):
         _maybe(
-            ("model", "transformer", "attention_impl"),
+            ("train", "attention_impl"),
             args.attention_impl,
             f"--attention-impl={args.attention_impl}",
-            lambda: config.model.transformer.attention_impl,
-            lambda v: setattr(config.model.transformer, "attention_impl", v),
+            lambda: config.train.attention_impl,
+            lambda v: setattr(config.train, "attention_impl", v),
         )
 
     if cli_overrides:

@@ -486,6 +486,27 @@ class SequentialTokenizer(nn.Module):
             tokens = tokens + self.pos_emb(torch.arange(L, device=tokens.device))
         return tokens
 
+    def forward_packed(
+        self, raw_packed: Tensor, pos_indices: Tensor | None = None,
+    ) -> Tensor:
+        """Packed-input variant — same weights, bit-equivalent to ``forward``.
+
+        Lets the jagged backbone apply the tokenizer Linear directly to packed
+        ``[N_real, raw_dim]`` so the dense ``[B, L, d_model]`` tokenizer output
+        is never materialized.
+
+        ``pos_indices`` carries each packed token's position-within-its-pool
+        (the same index the dense path uses via ``torch.arange(L)``); required
+        when ``pos_emb`` is enabled. The same vocabulary slot in
+        ``self.pos_emb`` is read so outputs match the dense path bitwise.
+        """
+        tokens = self.proj(raw_packed)
+        if self.pos_emb is not None:
+            assert pos_indices is not None, \
+                "pos_indices required when pos_emb is enabled"
+            tokens = tokens + self.pos_emb(pos_indices)
+        return tokens
+
 
 class AutoSplitTokenizer(nn.Module):
     """Projects concatenated NS features into n_ns_tokens tokens."""
@@ -578,8 +599,10 @@ class OneTransModel(BaseModel):
             ns_raw_dim, ot.d_model, ot.n_ns_tokens,
         ).to(device)
 
-        # Transformer stack: dense (default) or fully-packed (use_jagged=True)
-        if ot.use_jagged:
+        # Transformer stack: dense (default) or fully-packed
+        # (train.use_jagged_attention=True). The flag lives under TrainConfig
+        # because it's an execution strategy, not a model-arch choice.
+        if self.config.train.use_jagged_attention:
             self.blocks = nn.ModuleList([
                 OneTransPackedBlock(ot.d_model, ot.n_heads, ot.n_ns_tokens, ot.ffn_mult, ot.dropout)
                 for _ in range(ot.n_layers)
@@ -587,7 +610,7 @@ class OneTransModel(BaseModel):
         else:
             self.blocks = nn.ModuleList([
                 OneTransBlock(ot.d_model, ot.n_heads, ot.n_ns_tokens, ot.ffn_mult, ot.dropout,
-                             attention_impl=ot.attention_impl)
+                             attention_impl=self.config.train.attention_impl)
                 for _ in range(ot.n_layers)
             ]).to(device)
         self._compile_blocks = config.train.torch_compile
@@ -709,6 +732,102 @@ class OneTransModel(BaseModel):
 
         return float(flops)
 
+    def estimate_jagged_flops_per_sample(self, batch: dict[str, Tensor]) -> Tensor:
+        """Per-sample fwd+bwd FLOPs for THIS batch's actual sequence lengths.
+
+        Mirrors ``get_num_flops_per_sample`` but substitutes:
+
+        - **S-token projections / FFN** scale by ``mean(s_real_lens) / L_S``
+          (Path B saves these padded compute; non-Path-B jagged still pays
+          the dense tokenizer cost — the formula honors that via
+          ``pack_tokenizer``).
+        - **Attention** scales by ``mean((s_real_i + n_ns)^2) / (L_S + n_ns)^2``
+          per layer (the per-user attention cost is quadratic in sequence
+          length, so longer-tail users dominate).
+        - **Out projection** scales linearly with mean attn length.
+        - Dense feature projections, NS tokenizer, NS FFN, head, and task
+          heads stay constant per sample (always dense).
+
+        Returns a 0-d tensor on the batch's device — caller is expected to
+        ``.item()`` it (typically once per logging interval).
+        """
+        ot = self.config.model.transformer
+        fc = self.config.feature
+        D = ot.d_model
+        H = ot.n_heads
+        d_head = D // H
+        n_ns = ot.n_ns_tokens
+        ffn_dim = D * ot.ffn_mult
+        emb_dim = self.config.model.embedding_dim
+        L_hist = self.config.data.history_length
+        n_groups = len(fc.sequence_groups)
+        L_S = L_hist * n_groups
+
+        n_lp = batch["hist_lp_len"].float()
+        n_like = batch["hist_like_len"].float()
+        n_skip = batch["hist_skip_len"].float()
+        s_real = n_lp + n_like + n_skip                  # [B]
+        attn_real = s_real + n_ns                        # [B]
+        avg_s_real = s_real.mean()                       # scalar tensor
+        avg_attn_real = attn_real.mean()
+        avg_attn_real_sq = (attn_real * attn_real).mean()
+
+        flops = avg_s_real.new_zeros(())
+
+        # Per-pool sequential tokenizer Linear (raw_dim->D->D).
+        # When pack_tokenizer=True, the Linear runs only on real tokens, so
+        # FLOPs scale with ``avg_s_real / n_groups``. Otherwise it runs on
+        # the dense ``L_hist`` tokens per pool.
+        per_pool_tokens = (avg_s_real / n_groups) if self.config.train.pack_tokenizer else float(L_hist)
+        for group_name, feats in fc.sequence_groups.items():
+            raw_dim = len(feats) * emb_dim
+            flops = flops + 6 * per_pool_tokens * (raw_dim * D + D * D)
+
+        # Dense feature projections (always dense, fixed per sample).
+        for df in fc.dense_features:
+            if df.project:
+                flops = flops + 6 * df.dim * emb_dim
+
+        # NS tokenizer (always dense).
+        ns_raw_dim = getattr(self.ns_tokenizer.proj[0], "in_features", 0)
+        ns_out_dim = n_ns * D
+        if ns_raw_dim > 0:
+            flops = flops + 6 * (ns_raw_dim * ns_out_dim + ns_out_dim * ns_out_dim)
+
+        # Transformer blocks. Pyramid is not supported with jagged, so all
+        # layers use the same per-user real attn length.
+        for _ in range(ot.n_layers):
+            # S-token QKV: only real tokens
+            flops = flops + 6 * avg_s_real * D * 3 * D
+            # NS-token QKV: dense (n_ns weight matrices, fixed cost per sample)
+            flops = flops + 6 * n_ns * 3 * D * D
+            # Causal attention is undiscounted in get_num_flops_per_sample()
+            # too; keep the same convention for an apples-to-apples ratio.
+            # Per-user FLOPs ∝ attn_real_i^2; per-sample average uses
+            # mean(attn_real^2), not (mean(attn_real))^2.
+            flops = flops + 12 * H * d_head * avg_attn_real_sq
+            # Output projection: only real attn tokens
+            flops = flops + 6 * avg_attn_real * D * D
+            # FFN S: only real S tokens
+            flops = flops + 6 * avg_s_real * D * ffn_dim * 2
+            # FFN NS: dense
+            flops = flops + 6 * n_ns * D * ffn_dim * 2
+
+        # Head + task heads (constant)
+        flops = flops + 6 * n_ns * D * D
+        flops = flops + 6 * len(self.tasks) * D
+
+        # Contrastive heads (only when enabled)
+        if self.config.train.contrastive_weight > 0:
+            flops = flops + 6 * D * D
+            n_item_scalars = len(self._item_scalar_names)
+            flops = flops + 6 * n_item_scalars * emb_dim * D
+            batch_size = self.config.train.batch_size // (
+                self.config.distributed.num_nodes * self.config.distributed.gpus_per_node)
+            flops = flops + 6 * D * batch_size
+
+        return flops
+
     # ------------------------------------------------------------------
     # Embedding lookup
     # ------------------------------------------------------------------
@@ -786,6 +905,14 @@ class OneTransModel(BaseModel):
         B = batch[first_key].shape[0]
         L_NS = ot.n_ns_tokens
 
+        tc = self.config.train
+        # Path B: pack each pool BEFORE the tokenizer Linear so the dense
+        # [B, L_S, d_model] tokenizer output never exists. Same weights, same
+        # outputs as the dense tokenizer path; saves ~2-6 GB HBM at hist=500/
+        # 1000 with no recomputation.
+        if tc.use_jagged_attention and tc.pack_tokenizer:
+            return self._backbone_jagged_packed(embs, batch, B, L_NS)
+
         # S-token construction: per-group tokenization
         pool_tokens = []
         for group_name in self.config.feature.sequence_groups:
@@ -798,7 +925,7 @@ class OneTransModel(BaseModel):
         ns_raw = self._build_ns_raw(embs, batch)
         ns_tokens = self.ns_tokenizer(ns_raw)
 
-        if ot.use_jagged:
+        if tc.use_jagged_attention:
             return self._backbone_jagged(s_tokens, ns_tokens, batch, B, L_S, L_NS)
 
         # Dense path (default)
@@ -905,7 +1032,7 @@ class OneTransModel(BaseModel):
         # GB at hist=500/1000) for ~25% extra step time.
         s = s_packed
         ns = ns_tokens
-        use_ckpt = ot.grad_checkpoint and self.training
+        use_ckpt = self.config.train.grad_checkpoint and self.training
         for block in self.blocks:
             if use_ckpt:
                 s, ns = _ckpt.checkpoint(
@@ -925,6 +1052,151 @@ class OneTransModel(BaseModel):
 
         # NS head projection (NS already dense [B, L_NS, D])
         h = self.head_proj(ns.reshape(B, -1))
+        # Stash per-step actual jagged FLOPs/sample estimate (detached, on
+        # device — the trainer .item()s once per log interval).
+        self._last_jagged_flops_per_sample = self.estimate_jagged_flops_per_sample(batch).detach()
+        return h, s_repr
+
+    def _backbone_jagged_packed(
+        self,
+        embs: dict[str, Tensor],
+        batch: dict[str, Tensor],
+        B: int,
+        L_NS: int,
+    ) -> tuple[Tensor, Tensor]:
+        """Path B variant of _backbone_jagged.
+
+        Pack each pool's raw embeddings BEFORE the per-pool tokenizer Linear,
+        then run the existing OneTransPackedBlock loop. The dense
+        ``[B, L_S, d_model]`` tokenizer output is never materialized; same
+        weights and bit-equivalent outputs as the dense tokenizer path.
+        No recomputation: pure forward-side restructuring.
+
+        Memory savings vs ``_backbone_jagged``:
+          - per-pool tokenizer dense output ``[B, L, d_model]`` (3 pools)
+          - intermediate FFN hidden state ``[B, L, d_model]`` from GELU
+          - the cat ``[B, 3L, d_model]`` of pool tokens
+          ≈ ~2-6 GB at hist=500/1000.
+        """
+        ot = self.config.model.transformer
+        device = next(self.parameters()).device
+        L = self.config.data.history_length
+        n_groups = len(self.config.feature.sequence_groups)
+
+        # Per-pool real lengths (already populated by the dataset for jagged).
+        n_lp = batch["hist_lp_len"].to(torch.int32)
+        n_like = batch["hist_like_len"].to(torch.int32)
+        n_skip = batch["hist_skip_len"].to(torch.int32)
+        pool_lens = {"hist_lp": n_lp, "hist_like": n_like, "hist_skip": n_skip}
+        s_real_lens = n_lp + n_like + n_skip                         # [B] int32
+        attn_real_lens = s_real_lens + L_NS                          # [B] int32
+
+        # Per-pool: build raw [B, L, raw_dim], pack to [N_real, raw_dim],
+        # apply tokenizer's Linear+GELU+Linear+pos_emb on PACKED input.
+        pool_packed: dict[str, Tensor] = {}
+        pool_user_id: dict[str, Tensor] = {}
+        pool_within: dict[str, Tensor] = {}
+        arange_pool = torch.arange(L, device=device, dtype=torch.int32)
+        for group_name in self.config.feature.sequence_groups:
+            n_real = pool_lens[group_name]
+            raw = self._build_pool_raw(embs, group_name)              # [B, L, raw_dim]
+            # Front-padded: real tokens occupy positions [L - n_real, L) per user.
+            real_mask = arange_pool.unsqueeze(0) >= (L - n_real.unsqueeze(1))  # [B, L]
+            flat_idx = real_mask.flatten().nonzero(as_tuple=False).squeeze(1).to(torch.int64)
+            raw_packed = raw.reshape(B * L, -1).index_select(0, flat_idx)     # [N, raw_dim]
+            # Position-within-pool indices match what the dense path's
+            # `torch.arange(L)` would have indexed pos_emb at.
+            pos_in_pool = (flat_idx % L).to(torch.int64)
+            tokens_packed = self.seq_tokenizers[group_name].forward_packed(raw_packed, pos_in_pool)
+            user_id = (flat_idx // L).to(torch.int64)
+            pool_packed[group_name] = tokens_packed
+            pool_user_id[group_name] = user_id
+            # Within-user offset: 0..n_real_i-1, in pack order.
+            pool_within[group_name] = pos_in_pool - (L - n_real[user_id]).to(torch.int64)
+
+        # Build cu_s_real (prefix-sum of per-user S real lens).
+        cu_s_real = s_real_lens.cumsum(0).to(torch.int32)
+        zero32 = cu_s_real.new_zeros(1)
+        cu_s_real = torch.cat([zero32, cu_s_real])                  # [B+1]
+
+        # Compute target indices in s_packed for each pool's tokens.
+        # User i's S sequence layout: [lp_real_i, like_real_i, skip_real_i].
+        user_lp = pool_user_id["hist_lp"]
+        user_like = pool_user_id["hist_like"]
+        user_skip = pool_user_id["hist_skip"]
+        target_lp = (
+            cu_s_real[user_lp].to(torch.int64) + pool_within["hist_lp"]
+        )
+        target_like = (
+            cu_s_real[user_like].to(torch.int64)
+            + n_lp[user_like].to(torch.int64)
+            + pool_within["hist_like"]
+        )
+        target_skip = (
+            cu_s_real[user_skip].to(torch.int64)
+            + n_lp[user_skip].to(torch.int64)
+            + n_like[user_skip].to(torch.int64)
+            + pool_within["hist_skip"]
+        )
+
+        # Allocate s_packed and scatter pool tokens into user-interleaved order.
+        total_S_real = (
+            pool_packed["hist_lp"].shape[0]
+            + pool_packed["hist_like"].shape[0]
+            + pool_packed["hist_skip"].shape[0]
+        )
+        s_packed = pool_packed["hist_lp"].new_zeros(total_S_real, ot.d_model)
+        s_packed.index_copy_(0, target_lp, pool_packed["hist_lp"])
+        s_packed.index_copy_(0, target_like, pool_packed["hist_like"])
+        s_packed.index_copy_(0, target_skip, pool_packed["hist_skip"])
+
+        # NS tokens (dense, unchanged).
+        ns_raw = self._build_ns_raw(embs, batch)
+        ns_tokens = self.ns_tokenizer(ns_raw)
+
+        # Build cu_seqlens for FA-varlen and the s_to_packed / ns_to_packed
+        # gather indices used inside MixedAttentionPacked.
+        cu_seqlens = attn_real_lens.cumsum(0).to(torch.int32)
+        cu_seqlens = torch.cat([zero32, cu_seqlens])                # [B+1]
+        max_seqlen = n_groups * L + L_NS                            # static upper bound
+
+        # arange over total_S_real, FX-friendly (ones+cumsum on the packed shape).
+        arange_s = torch.ones(s_packed.shape[0], device=device, dtype=torch.int64).cumsum(0) - 1
+        s_user = torch.searchsorted(cu_s_real, arange_s.to(torch.int32), right=True) - 1
+        s_user = s_user.to(torch.int64)
+        s_local = arange_s - cu_s_real[s_user].to(torch.int64)
+        s_to_packed = cu_seqlens[s_user].to(torch.int64) + s_local
+
+        arange_ns = torch.arange(B * L_NS, device=device, dtype=torch.int64)
+        ns_user = arange_ns // L_NS
+        ns_local = arange_ns - ns_user * L_NS
+        ns_to_packed = (
+            cu_seqlens[1:][ns_user].to(torch.int64) - L_NS + ns_local
+        )
+
+        # Run packed transformer (block loop unchanged from _backbone_jagged).
+        s = s_packed
+        ns = ns_tokens
+        use_ckpt = self.config.train.grad_checkpoint and self.training
+        for block in self.blocks:
+            if use_ckpt:
+                s, ns = _ckpt.checkpoint(
+                    block, s, ns, cu_seqlens, max_seqlen,
+                    s_to_packed, ns_to_packed, use_reentrant=False,
+                )
+            else:
+                s, ns = block(s, ns, cu_seqlens, max_seqlen, s_to_packed, ns_to_packed)
+
+        s = self.final_norm(s)
+        ns = self.final_norm(ns)
+
+        # s_repr: per-user mean of S tokens.
+        s_repr_sum = s.new_zeros(B, ot.d_model)
+        s_repr_sum.index_add_(0, s_user, s)
+        s_repr = s_repr_sum / s_real_lens.to(s.dtype).clamp_min(1).unsqueeze(1)
+
+        h = self.head_proj(ns.reshape(B, -1))
+        self._last_jagged_flops_per_sample = self.estimate_jagged_flops_per_sample(batch).detach()
         return h, s_repr
 
     # ------------------------------------------------------------------

@@ -307,7 +307,7 @@ def main():
                         help="Use TorchRec TrainPipelineSparseDist (3-stage, DMP only)")
     parser.add_argument("--attention-impl", default=None,
                         choices=["sdpa", "fav2", "fav4", "turbo"],
-                        help="Override config.model.transformer.attention_impl")
+                        help="Override config.train.attention_impl")
     args = parser.parse_args()
 
     init_distributed()
