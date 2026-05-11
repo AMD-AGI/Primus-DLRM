@@ -89,3 +89,8 @@ distributed:
   dense_strategy: "ddp"
   num_nodes: 1
   gpus_per_node: 8
+
+  embedding_sharding:
+    strategy: auto
+    topology:
+      hbm_cap_gb: 260

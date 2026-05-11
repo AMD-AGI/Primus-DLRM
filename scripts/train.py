@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from primus_dlrm.config import Config
 from primus_dlrm.data.dataset import YambdaTrainDataset, YambdaEvalDataset, collate_to_dict
 from primus_dlrm.evaluation.metrics import evaluate_ranking
-from primus_dlrm.training.runtime import configure_runtime
+from primus_dlrm.training.runtime import configure_runtime, log_resolved_config
 from primus_dlrm.training.trainer import Trainer
 
 logging.basicConfig(
@@ -41,6 +41,7 @@ def main():
 
     config = Config.load(args.config)
     configure_runtime(config.train)
+    log_resolved_config(config, source_path=args.config)
     device = torch.device(args.device)
     processed_dir = Path(args.processed_dir)
 
