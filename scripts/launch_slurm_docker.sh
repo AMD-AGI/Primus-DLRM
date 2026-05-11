@@ -45,7 +45,10 @@ TRACE=""
 TRACE_STEPS=""
 TRACE_WARMUP=5
 TRACE_ACTIVE=10
+TRACE_RANKS=""           # passes through to run_distributed.py --trace-ranks ('all' or '0,3,5')
 PIPELINE=""
+HBM_CAP_GB=""            # PRIMUS_TORCHREC_HBM_CAP_GB: per-rank HBM cap (GB) handed to TorchRec planner
+DDR_CAP_GB=""            # PRIMUS_TORCHREC_DDR_CAP_GB: per-rank DDR cap (GB) handed to TorchRec planner
 USE_AINIC=""               # 1 = legacy AINIC custom-RCCL path; default uses auto-detected librccl-anp.so
 NO_RDMA=""                 # 1 = force NET/Socket fallback (debug only; ~5% of RDMA bandwidth)
 NODELIST=""
@@ -85,7 +88,10 @@ while [[ $# -gt 0 ]]; do
         --trace-steps)    TRACE_STEPS="$2"; shift 2;;
         --trace-warmup)   TRACE_WARMUP="$2"; shift 2;;
         --trace-active)   TRACE_ACTIVE="$2"; shift 2;;
+        --trace-ranks)    TRACE_RANKS="$2"; shift 2;;
         --pipeline)       PIPELINE="--pipeline"; shift;;
+        --hbm-cap-gb)     HBM_CAP_GB="$2"; shift 2;;
+        --ddr-cap-gb)     DDR_CAP_GB="$2"; shift 2;;
         --ainic|--legacy-ainic) USE_AINIC=1; shift;;
         --no-rdma)        NO_RDMA=1; shift;;
         --nodelist)       NODELIST="$2"; shift 2;;
@@ -125,7 +131,7 @@ fi
 # moving to a new cluster (and update these defaults if the new cluster becomes the norm).
 #   AMD default:    a ROCm image that bundles librccl-anp.so under /opt/rocm*/lib
 #                   plus polars / torchrec / fbgemm-gpu (auto-detected at runtime)
-#   NVIDIA default: a CUDA PyTorch base image; matches scripts/launch_srun_nvidia.sh
+#   NVIDIA default: a CUDA PyTorch base image (nvcr.io/nvidia/pytorch)
 [[ -z "$DOCKER_IMAGE" ]] && {
     [[ "$PLATFORM" == "amd" ]] && DOCKER_IMAGE="rocm/pyt-megatron-lm-jax-nightly-private:primus_rocm7.2_20260424" || DOCKER_IMAGE="nvcr.io/nvidia/pytorch:26.01-py3"
 }
@@ -210,12 +216,15 @@ RESULTS_DIR="$RESULTS_DIR"
 TRACE_STEPS="$TRACE_STEPS"
 TRACE_WARMUP=$TRACE_WARMUP
 TRACE_ACTIVE=$TRACE_ACTIVE
+TRACE_RANKS="$TRACE_RANKS"
 SKIP_EVAL="$SKIP_EVAL"
 TRACE="$TRACE"
 PIPELINE="$PIPELINE"
 ATTN_IMPL="$ATTN_IMPL"
 FA_WHEEL="$FA_WHEEL"
 HIPBLASLT_TUNE_FILE="$HIPBLASLT_TUNE_FILE"
+HBM_CAP_GB="$HBM_CAP_GB"
+DDR_CAP_GB="$DDR_CAP_GB"
 EOF_VARS
 
 cat >> "$SRUN_PAYLOAD" << 'EOF_BODY'
@@ -295,6 +304,11 @@ DOCKER_CMD+=(
 
 # Optional perf knobs
 [[ -n "$HIPBLASLT_TUNE_FILE" ]] && DOCKER_CMD+=(-e "HIPBLASLT_TUNING_OVERRIDE_FILE=$HIPBLASLT_TUNE_FILE")
+# TorchRec planner overrides (consumed by primus_dlrm.distributed.wrapper._wrap_dmp).
+# Set --hbm-cap-gb high enough that all embedding tables get compute_kernel=fused
+# instead of falling back to fused_uvm_caching when the planner's default 32 GB is too tight.
+[[ -n "$HBM_CAP_GB" ]] && DOCKER_CMD+=(-e "PRIMUS_TORCHREC_HBM_CAP_GB=$HBM_CAP_GB")
+[[ -n "$DDR_CAP_GB" ]] && DOCKER_CMD+=(-e "PRIMUS_TORCHREC_DDR_CAP_GB=$DDR_CAP_GB")
 # Mount the tune file's containing dir read-only so it's visible inside the container
 if [[ -n "$HIPBLASLT_TUNE_FILE" && -e "$HIPBLASLT_TUNE_FILE" ]]; then
     DOCKER_CMD+=(-v "$(dirname "$HIPBLASLT_TUNE_FILE"):$(dirname "$HIPBLASLT_TUNE_FILE"):ro")
@@ -384,14 +398,16 @@ if [ "'"$PLATFORM"'" = "amd" ]; then
     # xxhash is required for cross-feature hashing (data.cross_features in YAML).
     # Cheap dep, harmless when no crosses are configured.
     pip install --no-cache-dir polars-u64-idx pyarrow pyyaml tqdm datasets pytest psutil numba xxhash 2>&1 | tail -3
-    grep -q shampoo /workspace/dlrm/'"$CONFIG"' 2>/dev/null && \
-        pip install --no-cache-dir git+https://github.com/facebookresearch/optimizers.git 2>&1 | tail -3
 else
     pip install /workspace/dlrm/pip_cache/fbgemm_gpu_nightly-2026.4.29-cp312-cp312-linux_x86_64.whl 2>&1 | tail -3
     pip install --no-deps torchrec==1.4.0 2>&1 | tail -3
     pip install polars-u64-idx pyarrow pyyaml tqdm datasets psutil torchmetrics tensordict pyre-extensions iopath typing-inspect xxhash 2>&1 | tail -3
     pip install "flash-attn-4==4.0.0b10" "flash-attn-4[cu13]" 2>&1 | tail -3
 fi
+# Shampoo dense optimizer (cross-platform): only installed when the config uses it.
+# Imported lazily by primus_dlrm.training.dist_trainer._create_dense_optimizer.
+grep -q shampoo /workspace/dlrm/'"$CONFIG"' 2>/dev/null && \
+    pip install --no-cache-dir git+https://github.com/facebookresearch/optimizers.git 2>&1 | tail -3
 # Optional CK FlashAttention wheel (yiding12 / fav2 path).
 if [ -n "'"$FA_WHEEL"'" ] && [ -e "'"$FA_WHEEL"'" ]; then
     pip install --force-reinstall --no-deps "'"$FA_WHEEL"'" 2>&1 | tail -3
@@ -404,6 +420,8 @@ fi
 export PYTHONPATH=/workspace/dlrm:${PYTHONPATH:-}
 ATTN_FLAG=""
 [ -n "'"$ATTN_IMPL"'" ] && ATTN_FLAG="--attention-impl '"$ATTN_IMPL"'"
+TRACE_RANKS_FLAG=""
+[ -n "'"$TRACE_RANKS"'" ] && TRACE_RANKS_FLAG="--trace-ranks '"$TRACE_RANKS"'"
 echo "[node $NODE_RANK] Starting torchrun (nnodes='"$NNODES"', rdzv=$MASTER_ADDR:'"$RDZV_PORT"')..."
 torchrun \
     --nproc_per_node='"$GPUS"' \
@@ -422,7 +440,7 @@ torchrun \
     --trace-steps "'"$TRACE_STEPS"'" \
     --trace-warmup '"$TRACE_WARMUP"' \
     --trace-active '"$TRACE_ACTIVE"' \
-    $ATTN_FLAG \
+    $ATTN_FLAG $TRACE_RANKS_FLAG \
     '"$SKIP_EVAL"' '"$TRACE"' '"$PIPELINE"'
 '
 
