@@ -95,7 +95,9 @@ from primus_dlrm.distributed.wrapper import wrap_model
 from primus_dlrm.evaluation.metrics import evaluate_ranking, evaluate_ranking_peruser
 from primus_dlrm.models.dlrm import DLRMBaseline
 from primus_dlrm.training.dist_trainer import DistributedTrainer
-from primus_dlrm.training.runtime import apply_cli_overrides, configure_runtime
+from primus_dlrm.training.runtime import (
+    apply_cli_overrides, configure_runtime, log_resolved_config,
+)
 from primus_dlrm.training.tracer import parse_trace_ranks
 from primus_dlrm.models.onetrans import OneTransModel
 
@@ -317,6 +319,7 @@ def main():
     config = Config.load(args.config)
     apply_cli_overrides(config, args)
     configure_runtime(config.train)
+    log_resolved_config(config, source_path=args.config)
     torch.manual_seed(config.train.seed + rank)
 
     paths = DataPaths.from_config(config.data, data_root=args.data_root)

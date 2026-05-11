@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -46,7 +47,6 @@ def wrap_model(
         Wrapped model ready for distributed training.
     """
     dense_strategy = config.distributed.dense_strategy
-    embedding_sharding = config.distributed.embedding_sharding.strategy
     tc = config.train
     embedding_lr = tc.embedding_lr
     embedding_weight_decay = tc.weight_decay
@@ -69,7 +69,7 @@ def wrap_model(
         logger.info(f"Wrapped with FSDP for {world_size} GPUs.")
 
     elif dense_strategy == "dmp":
-        model = _wrap_dmp(model, device, embedding_sharding,
+        model = _wrap_dmp(model, device, config,
                           embedding_lr, embedding_weight_decay,
                           embedding_optimizer, embedding_eps)
 
@@ -87,11 +87,30 @@ _SHARDING_MAP = {
     "column_wise": "column_wise",
 }
 
+# Map our string compute_kernel values to TorchRec's enum strings. Keep the
+# YAML user-facing names short and self-documenting; widen this dict if a new
+# FBGEMM kernel becomes useful.
+_COMPUTE_KERNEL_MAP = {
+    "fused": "fused",
+    "fused_uvm": "fused_uvm",
+    "fused_uvm_caching": "fused_uvm_caching",
+    "dense": "dense",
+}
+
+# Map output_dtype YAML strings to TorchRec DataType enum members. Lazily
+# resolved inside ``_build_constraints`` so importing this module does not
+# require torchrec at top level.
+_OUTPUT_DTYPE_MAP = {
+    "fp32": "FP32",
+    "fp16": "FP16",
+    "bf16": "BF16",
+}
+
 
 def _wrap_dmp(
     model: nn.Module,
     device: torch.device,
-    embedding_sharding: str,
+    config,
     embedding_lr: float = 1e-2,
     embedding_weight_decay: float = 1e-5,
     embedding_optimizer: str = "adam",
@@ -111,6 +130,8 @@ def _wrap_dmp(
     from torchrec.distributed.planner.types import ParameterConstraints
     from torchrec.distributed.types import ShardingType
     from torchrec import EmbeddingBagCollection, EmbeddingCollection
+
+    embedding_sharding = config.distributed.embedding_sharding.strategy
 
     world_size = get_world_size()
 
@@ -152,7 +173,7 @@ def _wrap_dmp(
     logger.info(f"Applied fused {embedding_optimizer} to {n_emb_params} embedding params "
                 f"(lr={embedding_lr}, eps={embedding_eps}, wd={embedding_weight_decay})")
 
-    constraints = _build_constraints(model, embedding_sharding)
+    constraints = _build_constraints(config)
 
     if world_size <= 1:
         logger.info("Single-GPU DMP: placing all tables on GPU 0")
@@ -160,16 +181,7 @@ def _wrap_dmp(
         logger.info(f"Wrapped with TorchRec DMP for 1 GPU.")
         return dmp
 
-    topology_kwargs = {"world_size": world_size, "compute_device": "cuda"}
-    hbm_cap_gb = os.environ.get("PRIMUS_TORCHREC_HBM_CAP_GB")
-    ddr_cap_gb = os.environ.get("PRIMUS_TORCHREC_DDR_CAP_GB")
-    local_world_size = os.environ.get("PRIMUS_TORCHREC_LOCAL_WORLD_SIZE")
-    if hbm_cap_gb is not None:
-        topology_kwargs["hbm_cap"] = int(float(hbm_cap_gb) * (1024 ** 3))
-    if ddr_cap_gb is not None:
-        topology_kwargs["ddr_cap"] = int(float(ddr_cap_gb) * (1024 ** 3))
-    if local_world_size is not None:
-        topology_kwargs["local_world_size"] = int(local_world_size)
+    topology_kwargs = _build_topology_kwargs(config, world_size)
     logger.info(f"TorchRec topology overrides: {topology_kwargs}")
     topology = Topology(**topology_kwargs)
     planner = EmbeddingShardingPlanner(
@@ -245,43 +257,216 @@ def _wrap_dmp(
     return dmp
 
 
+_STYPE_MAP_FACTORY = None  # populated lazily once torchrec is importable
+
+
+def _stype_map():
+    """Cache the YAML-name -> ``ShardingType.value`` map (lazy torchrec import)."""
+    global _STYPE_MAP_FACTORY
+    if _STYPE_MAP_FACTORY is None:
+        from torchrec.distributed.types import ShardingType
+        _STYPE_MAP_FACTORY = {
+            "table_wise":    ShardingType.TABLE_WISE.value,
+            "row_wise":      ShardingType.ROW_WISE.value,
+            "data_parallel": ShardingType.DATA_PARALLEL.value,
+            "column_wise":   ShardingType.COLUMN_WISE.value,
+        }
+    return _STYPE_MAP_FACTORY
+
+
 def _build_constraints(
-    model: nn.Module,
-    embedding_sharding: str,
-) -> dict[str, ParameterConstraints] | None:
-    """Build per-table sharding constraints from user config."""
+    config,
+) -> dict[str, "ParameterConstraints"] | None:
+    """Build per-table TorchRec ``ParameterConstraints`` from the config.
+
+    Per-field precedence (first set wins):
+
+    1. ``EmbeddingTableConfig.sharding`` (inline per-table block)
+    2. ``EmbeddingShardingConfig.default_table_sharding`` (cross-table default)
+    3. ``EmbeddingShardingConfig.strategy`` (legacy global string; only
+       contributes ``sharding_type``)
+
+    Returns ``None`` when nothing ends up constrained, so the planner runs
+    in fully-automatic mode (matches legacy behavior).
+    """
     from torchrec.distributed.planner.types import ParameterConstraints
-    from torchrec.distributed.types import ShardingType
-    from torchrec import EmbeddingBagCollection, EmbeddingCollection
 
-    if embedding_sharding == "auto":
-        return None
+    es_cfg = config.distributed.embedding_sharding
+    global_strategy = es_cfg.strategy
+    default_spec = es_cfg.default_table_sharding
+    stype_map = _stype_map()
 
-    stype_map = {
-        "table_wise": ShardingType.TABLE_WISE,
-        "row_wise": ShardingType.ROW_WISE,
-        "data_parallel": ShardingType.DATA_PARALLEL,
-        "column_wise": ShardingType.COLUMN_WISE,
-    }
-    stype = stype_map.get(embedding_sharding)
-    if stype is None:
-        logger.warning(f"Unknown sharding strategy {embedding_sharding!r}, using auto.")
-        return None
+    # Validate global_strategy upfront so we warn once, not per-table.
+    if global_strategy != "auto" and stype_map.get(global_strategy) is None:
+        logger.warning(
+            f"Unknown global sharding strategy {global_strategy!r}; "
+            f"falling back to auto."
+        )
+        global_strategy = "auto"
 
-    constraints = {}
-    for mod in model.modules():
-        if isinstance(mod, EmbeddingBagCollection):
-            for cfg in mod.embedding_bag_configs():
-                constraints[cfg.name] = ParameterConstraints(
-                    sharding_types=[stype.value],
-                )
-        elif isinstance(mod, EmbeddingCollection):
-            for cfg in mod.embedding_configs():
-                constraints[cfg.name] = ParameterConstraints(
-                    sharding_types=[stype.value],
-                )
+    constraints: dict[str, ParameterConstraints] = {}
+    tables = config.model.resolved_embedding_tables()
+    for t in tables:
+        merged = _merge_sharding_specs(
+            inline=t.sharding,
+            default=default_spec,
+            global_strategy=global_strategy,
+        )
+        if merged is None:
+            continue  # fully auto for this table
+        kwargs = _table_spec_to_constraint_kwargs(merged.spec, merged.sharding_type, stype_map)
+        if not kwargs:
+            continue
+        constraints[t.name] = ParameterConstraints(**kwargs)
 
     return constraints if constraints else None
+
+
+@dataclass
+class _MergedShardingChoice:
+    """Result of merging inline + default + global into one effective spec."""
+    sharding_type: str | None
+    spec: "object | None"   # TableShardingSpec or None when no other fields set
+
+
+def _merge_sharding_specs(inline, default, global_strategy: str):
+    """Field-by-field merge: inline overrides default; global supplies sharding_type only.
+
+    Returns ``None`` when there is nothing to constrain (auto for this table).
+    """
+    # Resolve sharding_type via inline > default > global
+    sharding_type = None
+    if inline is not None and inline.sharding_type is not None:
+        sharding_type = inline.sharding_type
+    elif default is not None and default.sharding_type is not None:
+        sharding_type = default.sharding_type
+    elif global_strategy != "auto":
+        sharding_type = global_strategy
+
+    # If neither inline nor default has any non-sharding-type fields set, we
+    # only need a sharding_type constraint (or nothing if even that is None).
+    fielded_specs = [s for s in (inline, default) if s is not None]
+    has_extra_fields = any(
+        any(getattr(s, n) is not None for n in (
+            "compute_kernel", "cache_load_factor", "min_partition",
+            "enforce_hbm", "output_dtype", "ranks",
+        ))
+        for s in fielded_specs
+    )
+    if sharding_type is None and not has_extra_fields:
+        return None
+
+    # Merge non-sharding-type fields (inline wins per-field).
+    if not has_extra_fields:
+        merged_spec = None
+    else:
+        from primus_dlrm.config import TableShardingSpec
+        def pick(name: str):
+            if inline is not None and getattr(inline, name) is not None:
+                return getattr(inline, name)
+            if default is not None and getattr(default, name) is not None:
+                return getattr(default, name)
+            return None
+        merged_spec = TableShardingSpec(
+            sharding_type=sharding_type,
+            compute_kernel=pick("compute_kernel"),
+            cache_load_factor=pick("cache_load_factor"),
+            min_partition=pick("min_partition"),
+            enforce_hbm=pick("enforce_hbm"),
+            output_dtype=pick("output_dtype"),
+            ranks=pick("ranks"),
+        )
+    return _MergedShardingChoice(sharding_type=sharding_type, spec=merged_spec)
+
+
+def _table_spec_to_constraint_kwargs(
+    spec,
+    sharding_type: str | None,
+    stype_map: dict,
+) -> dict:
+    """Translate one ``TableShardingSpec`` (+ effective sharding_type) into
+    the kwargs accepted by ``ParameterConstraints``."""
+    from torchrec.distributed.planner.types import CacheParams
+    try:
+        from torchrec.distributed.embedding_types import DataType
+    except ImportError:
+        DataType = None
+
+    kwargs: dict = {}
+    if sharding_type is not None:
+        stype_val = stype_map.get(sharding_type)
+        if stype_val is None:
+            logger.warning(f"Unknown sharding_type {sharding_type!r}; skipping.")
+            return {}
+        kwargs["sharding_types"] = [stype_val]
+
+    if spec is None:
+        return kwargs
+
+    if spec.compute_kernel is not None:
+        kernel = _COMPUTE_KERNEL_MAP.get(spec.compute_kernel, spec.compute_kernel)
+        kwargs["compute_kernels"] = [kernel]
+
+    if spec.cache_load_factor is not None:
+        kwargs["cache_params"] = CacheParams(load_factor=spec.cache_load_factor)
+
+    if spec.min_partition is not None:
+        kwargs["min_partition"] = int(spec.min_partition)
+
+    if spec.enforce_hbm is not None:
+        kwargs["enforce_hbm"] = bool(spec.enforce_hbm)
+
+    if spec.output_dtype is not None and DataType is not None:
+        dtype_attr = _OUTPUT_DTYPE_MAP.get(spec.output_dtype.lower(), spec.output_dtype.upper())
+        dtype_val = getattr(DataType, dtype_attr, None)
+        if dtype_val is None:
+            logger.warning(f"Unknown output_dtype {spec.output_dtype!r}; ignoring.")
+        else:
+            kwargs["output_dtype"] = dtype_val
+
+    if spec.ranks:
+        # TorchRec expects a single device_group string per table; pin via a
+        # rank-derived group name. The planner consults this only for TW;
+        # for other sharding types it is advisory.
+        kwargs["device_group"] = f"rank{spec.ranks[0]}" if len(spec.ranks) == 1 \
+            else "rank_" + "_".join(str(r) for r in spec.ranks)
+
+    return kwargs
+
+
+def _build_topology_kwargs(config, world_size: int) -> dict:
+    """Resolve Topology kwargs with precedence env > YAML topology > torchrec default."""
+    topo_cfg = getattr(config.distributed.embedding_sharding, "topology", None)
+    yaml_hbm = topo_cfg.hbm_cap_gb if topo_cfg is not None else None
+    yaml_ddr = topo_cfg.ddr_cap_gb if topo_cfg is not None else None
+    yaml_lws = topo_cfg.local_world_size if topo_cfg is not None else None
+
+    # Treat empty/whitespace env vars as unset — bash exporters frequently
+    # forward ``FOO=""`` instead of unsetting the variable, and we want the
+    # YAML topology to win in that case.
+    def _env(name: str) -> str | None:
+        v = os.environ.get(name)
+        if v is None:
+            return None
+        v = v.strip()
+        return v if v else None
+
+    env_hbm = _env("PRIMUS_TORCHREC_HBM_CAP_GB")
+    env_ddr = _env("PRIMUS_TORCHREC_DDR_CAP_GB")
+    env_lws = _env("PRIMUS_TORCHREC_LOCAL_WORLD_SIZE")
+
+    hbm = float(env_hbm) if env_hbm is not None else yaml_hbm
+    ddr = float(env_ddr) if env_ddr is not None else yaml_ddr
+    lws = int(env_lws) if env_lws is not None else yaml_lws
+
+    kwargs: dict = {"world_size": world_size, "compute_device": "cuda"}
+    if hbm is not None:
+        kwargs["hbm_cap"] = int(float(hbm) * (1024 ** 3))
+    if ddr is not None:
+        kwargs["ddr_cap"] = int(float(ddr) * (1024 ** 3))
+    if lws is not None:
+        kwargs["local_world_size"] = int(lws)
+    return kwargs
 
 
 def _log_sharding_plan(plan) -> None:

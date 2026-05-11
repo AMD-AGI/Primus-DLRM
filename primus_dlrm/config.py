@@ -66,6 +66,39 @@ class DataConfig:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class TableShardingSpec:
+    """Per-table TorchRec planner constraints.
+
+    All fields are optional; any unset field falls back to the global
+    ``distributed.embedding_sharding.strategy`` and the planner's auto choice.
+    Maps directly onto ``torchrec.distributed.planner.types.ParameterConstraints``:
+
+    - ``sharding_type``: one of ``"row_wise" | "table_wise" | "column_wise" |
+      "data_parallel"`` (passed as a singleton ``sharding_types`` list).
+    - ``compute_kernel``: one of ``"fused" | "fused_uvm" | "fused_uvm_caching"
+      | "dense"`` (singleton ``compute_kernels`` list). ``fused_uvm_caching``
+      requires ``cache_load_factor``.
+    - ``cache_load_factor``: forwarded into ``CacheParams.load_factor`` when
+      the compute kernel uses caching; ignored otherwise.
+    - ``min_partition``: minimum row count per shard (RW/CW); useful to keep
+      small tables from being split below GPU-efficient grain.
+    - ``enforce_hbm``: when True, planner refuses to spill this table to UVM
+      even under HBM pressure.
+    - ``output_dtype``: ``"fp32" | "fp16" | "bf16"`` for the embedding output
+      tensor (the table itself stays in its weight precision).
+    - ``ranks``: pin a TABLE_WISE table to specific rank(s) via TorchRec's
+      ``device_group``. Honored by TW; advisory for other sharding types.
+    """
+    sharding_type: str | None = None
+    compute_kernel: str | None = None
+    cache_load_factor: float | None = None
+    min_partition: int | None = None
+    enforce_hbm: bool | None = None
+    output_dtype: str | None = None
+    ranks: list[int] | None = None
+
+
+@dataclass
 class EmbeddingTableConfig:
     """One embedding table: name, features, and optional size/dim/pooling."""
     name: str = ""
@@ -73,6 +106,11 @@ class EmbeddingTableConfig:
     num_embeddings: int = 0
     embedding_dim: int = 0
     pooling: str = "none"
+
+    # Optional per-table TorchRec planner constraints. Inline here so authors
+    # see the table size and its sharding choice in one place. ``None`` means
+    # "fall back to the global default" (see ``EmbeddingShardingConfig``).
+    sharding: TableShardingSpec | None = None
 
 
 # Recognized cross-feature key sources resolvable from a single training event.
@@ -122,6 +160,10 @@ class CrossFeatureSpec:
     num_embeddings: int = 0
     salt: int = 0
     enabled: bool = True
+
+    # Optional per-table TorchRec planner constraints. Propagated into the
+    # auto-registered ``EmbeddingTableConfig`` by ``Config.expand_cross_features``.
+    sharding: TableShardingSpec | None = None
 
 # Tower routing constants (DLRM only; OneTrans ignores tower)
 TOWER_USER = "user"
@@ -349,6 +391,7 @@ class ModelConfig:
                 num_embeddings=t.num_embeddings,
                 embedding_dim=t.embedding_dim if t.embedding_dim > 0 else D,
                 pooling=t.pooling,
+                sharding=t.sharding,
             )
             for t in self.embedding_tables
         ]
@@ -494,18 +537,54 @@ class TrainConfig:
 
 
 @dataclass
+class TopologyConfig:
+    """Per-rank resource hints fed to the TorchRec planner's ``Topology``.
+
+    All fields are optional; unset means "use TorchRec's default". The
+    environment variables ``PRIMUS_TORCHREC_HBM_CAP_GB``,
+    ``PRIMUS_TORCHREC_DDR_CAP_GB`` and ``PRIMUS_TORCHREC_LOCAL_WORLD_SIZE``
+    take precedence over these YAML values, so operators can do one-off
+    overrides without editing the config.
+
+    Recommended starting values per platform (~90% of physical HBM, leaving
+    headroom for activations + optimizer state):
+
+    - MI355X (288 GB physical):  ``hbm_cap_gb: 260``
+    - B200   (178 GB physical):  ``hbm_cap_gb: 161``
+    - H100   ( 80 GB physical):  ``hbm_cap_gb:  72``
+    """
+    # Per-rank HBM cap in GB exposed to the planner.
+    hbm_cap_gb: float | None = None
+
+    # Per-rank DDR cap in GB; controls how much can be spilled to UVM.
+    ddr_cap_gb: float | None = None
+
+    # GPUs per host (TorchRec uses this for local-vs-remote bandwidth modelling).
+    local_world_size: int | None = None
+
+
+@dataclass
 class EmbeddingShardingConfig:
     """TorchRec DMP embedding sharding configuration."""
 
     # Enable embedding sharding across GPUs via DistributedModelParallel
     enabled: bool = False
 
-    # Sharding strategy per table:
+    # Global default sharding strategy per table when the table itself does
+    # not provide an inline ``sharding.sharding_type`` override:
     #   "auto" — TorchRec EmbeddingShardingPlanner decides per-table
     #   "table_wise" — whole tables on individual GPUs
     #   "row_wise" — table rows split across GPUs
     #   "data_parallel" — replicate all tables (equivalent to DDP)
     strategy: str = "auto"
+
+    # Default per-table sharding spec applied to tables without an inline
+    # ``sharding`` block. Per-table inline ``sharding`` wins field-by-field.
+    default_table_sharding: TableShardingSpec | None = None
+
+    # Resource hints fed to the planner's Topology (per-rank HBM/DDR caps,
+    # local_world_size). Env vars override the YAML values.
+    topology: TopologyConfig = field(default_factory=TopologyConfig)
 
 
 @dataclass
@@ -630,6 +709,7 @@ class Config:
                     num_embeddings=spec.num_embeddings,
                     embedding_dim=0,
                     pooling="none",
+                    sharding=spec.sharding,
                 )
             )
             self.feature.scalar_features.append(ScalarFeatureSpec(name=spec.name))
@@ -700,8 +780,9 @@ def _from_dict(dc_cls: type, raw: dict[str, Any]) -> Any:
     if not _DC_REGISTRY:
         for cls in (
             DataConfig, ModelConfig, TrainConfig, TransformerConfig,
-            DistributedConfig, EmbeddingShardingConfig,
+            DistributedConfig, EmbeddingShardingConfig, TopologyConfig,
             FeatureConfig, SchemaConfig, EmbeddingTableConfig,
+            TableShardingSpec,
             SyntheticDataConfig,
             DenseFeatureSpec, ScalarFeatureSpec,
             CrossFeatureSpec,
@@ -713,6 +794,9 @@ def _from_dict(dc_cls: type, raw: dict[str, Any]) -> Any:
             continue
         val = raw[f.name]
         type_name = f.type if isinstance(f.type, str) else getattr(f.type, "__name__", "")
+        # Strip ``| None`` / ``Optional[...]`` wrappers so Optional dataclass
+        # fields still hit the registry-based recursive instantiation below.
+        type_name = _strip_optional(type_name)
         if hasattr(f.type, "__dataclass_fields__") or type_name in _DC_REGISTRY:
             sub_cls = _DC_REGISTRY.get(type_name)
             if sub_cls and isinstance(val, dict):
@@ -724,6 +808,18 @@ def _from_dict(dc_cls: type, raw: dict[str, Any]) -> Any:
                 val = [_from_dict(inner_cls, v) if isinstance(v, dict) else v for v in val]
         kwargs[f.name] = val
     return dc_cls(**kwargs)
+
+
+def _strip_optional(type_name: str) -> str:
+    """Reduce ``"Foo | None"`` / ``"None | Foo"`` / ``"Optional[Foo]"`` to ``"Foo"``."""
+    import re
+    s = type_name.strip()
+    m = re.fullmatch(r"Optional\[(.+)\]", s)
+    if m:
+        return m.group(1).strip()
+    parts = [p.strip() for p in s.split("|")]
+    non_none = [p for p in parts if p and p != "None"]
+    return non_none[0] if len(non_none) == 1 else s
 
 
 def _guess_list_inner_dc(type_hint: str) -> type | None:
