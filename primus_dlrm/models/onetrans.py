@@ -355,41 +355,79 @@ class MixedAttentionPacked(nn.Module):
         max_seqlen: int,
         s_to_packed: Tensor,
         ns_to_packed: Tensor,
+        # Optional pyramid args. When provided, runs asymmetric Q (smaller,
+        # drop-front gather of s_packed) vs K/V (full s_packed). When
+        # absent, falls back to the symmetric self-attention path.
+        cu_seqlens_q: Tensor | None = None,
+        max_seqlen_q: int | None = None,
+        s_q_to_packed: Tensor | None = None,
+        ns_q_to_packed: Tensor | None = None,
+        s_q_gather: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         B = ns_dense.shape[0]
         H, D_head = self.n_heads, self.d_head
         drop_p = self.attn_drop if self.training else 0.0
+        pyramid = cu_seqlens_q is not None
 
         # Project (S packed, NS per-position dense)
-        s_qkv = self.s_qkv(s_packed)                                        # [N_S, 3D]
+        s_qkv = self.s_qkv(s_packed)                                        # [N_S_in, 3D]
         ns_qkv = torch.einsum("btn,tmn->btm", ns_dense, self.ns_qkv_weight)  # [B, n_ns, 3D]
 
-        # Interleave into a single attn buffer with FA-friendly per-user contiguity
-        total_attn = s_qkv.shape[0] + B * self.n_ns
-        attn_qkv = s_qkv.new_zeros(total_attn, 3 * self.d_model)
-        attn_qkv.index_copy_(0, s_to_packed, s_qkv)
-        attn_qkv.index_copy_(0, ns_to_packed, ns_qkv.reshape(B * self.n_ns, 3 * self.d_model))
+        if not pyramid:
+            # ---- symmetric path (current behavior) ----
+            total_attn = s_qkv.shape[0] + B * self.n_ns
+            attn_qkv = s_qkv.new_zeros(total_attn, 3 * self.d_model)
+            attn_qkv.index_copy_(0, s_to_packed, s_qkv)
+            attn_qkv.index_copy_(0, ns_to_packed, ns_qkv.reshape(B * self.n_ns, 3 * self.d_model))
+            attn_qkv = attn_qkv.view(total_attn, 3, H, D_head)
+            q, k, v = attn_qkv.unbind(1)
+            out_attn = _flash_attn_varlen(
+                q, k, v, cu_seqlens, cu_seqlens,
+                max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+                causal=True, dropout_p=drop_p,
+            )
+            out_flat = out_attn.reshape(total_attn, self.d_model)
+            s_out_flat = out_flat.index_select(0, s_to_packed)
+            ns_out_flat = out_flat.index_select(0, ns_to_packed)
+            ns_out = ns_out_flat.view(B, self.n_ns, self.d_model)
+            return self.out_proj(s_out_flat), self.out_proj(ns_out)
 
-        # Reshape to [N_attn, 3, H, D_head] then unbind
-        attn_qkv = attn_qkv.view(total_attn, 3, H, D_head)
-        q, k, v = attn_qkv.unbind(1)
+        # ---- pyramid path: asymmetric Q (smaller) vs K/V (full) ----
+        # ``s_qkv`` last-dim layout is [Q | K | V] each of width D — slice as
+        # views (no copy). NS analogously.
+        D = self.d_model
+        s_q_full = s_qkv[:, :D]                                          # [N_S_in, D] view
+        s_kv     = s_qkv[:, D:]                                          # [N_S_in, 2D] view
+        ns_q_full = ns_qkv[..., :D]                                      # [B, n_ns, D] view
+        ns_kv     = ns_qkv[..., D:]                                      # [B, n_ns, 2D] view
+
+        # Q side (smaller): drop-front gather then interleave with NS-Q.
+        s_q = s_q_full.index_select(0, s_q_gather)                       # [N_S_q, D]
+        n_attn_q = s_q.shape[0] + B * self.n_ns
+        q_buf = s_q.new_zeros(n_attn_q, D)
+        q_buf.index_copy_(0, s_q_to_packed, s_q)
+        q_buf.index_copy_(0, ns_q_to_packed, ns_q_full.reshape(B * self.n_ns, D))
+        q = q_buf.view(n_attn_q, H, D_head)
+
+        # KV side (full): single combined buffer [N_attn_k, 2D] -> .view -> .unbind.
+        # Autograd saves one tensor instead of two.
+        n_attn_k = s_kv.shape[0] + B * self.n_ns
+        kv_buf = s_kv.new_zeros(n_attn_k, 2 * D)
+        kv_buf.index_copy_(0, s_to_packed, s_kv)
+        kv_buf.index_copy_(0, ns_to_packed, ns_kv.reshape(B * self.n_ns, 2 * D))
+        k, v = kv_buf.view(n_attn_k, 2, H, D_head).unbind(1)
 
         out_attn = _flash_attn_varlen(
-            q, k, v, cu_seqlens, cu_seqlens,
-            max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+            q, k, v, cu_seqlens_q, cu_seqlens,
+            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen,
             causal=True, dropout_p=drop_p,
-        )  # [N_attn, H, D_head]
+        )                                                                # [n_attn_q, H, D_head]
 
-        # De-interleave back to packed S + dense NS
-        out_attn_flat = out_attn.reshape(total_attn, self.d_model)
-        s_out_flat = out_attn_flat.index_select(0, s_to_packed)        # [N_S, D]
-        ns_out_flat = out_attn_flat.index_select(0, ns_to_packed)      # [B*n_ns, D]
-        ns_out = ns_out_flat.view(B, self.n_ns, self.d_model)
-
-        # Out projection (shared Linear works on either shape)
-        s_out = self.out_proj(s_out_flat)
-        ns_out = self.out_proj(ns_out)
-        return s_out, ns_out
+        out_flat = out_attn.reshape(n_attn_q, D)
+        s_out_flat = out_flat.index_select(0, s_q_to_packed)             # [N_S_q, D]
+        ns_out_flat = out_flat.index_select(0, ns_q_to_packed)
+        ns_out = ns_out_flat.view(B, self.n_ns, D)
+        return self.out_proj(s_out_flat), self.out_proj(ns_out)
 
 
 class MixedFFNPacked(nn.Module):
@@ -445,14 +483,33 @@ class OneTransPackedBlock(nn.Module):
         max_seqlen: int,
         s_to_packed: Tensor,
         ns_to_packed: Tensor,
+        # Pyramid (optional); when present S queries are a strict subset of
+        # the input and the S residual stream shrinks accordingly.
+        cu_seqlens_q: Tensor | None = None,
+        max_seqlen_q: int | None = None,
+        s_q_to_packed: Tensor | None = None,
+        ns_q_to_packed: Tensor | None = None,
+        s_q_gather: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
+        pyramid = cu_seqlens_q is not None
         # Attention
         s_n = self.norm1(s)
         ns_n = self.norm1(ns)
-        s_a, ns_a = self.attn(s_n, ns_n, cu_seqlens, max_seqlen, s_to_packed, ns_to_packed)
-        s = s + s_a
+        s_a, ns_a = self.attn(
+            s_n, ns_n, cu_seqlens, max_seqlen, s_to_packed, ns_to_packed,
+            cu_seqlens_q=cu_seqlens_q, max_seqlen_q=max_seqlen_q,
+            s_q_to_packed=s_q_to_packed, ns_q_to_packed=ns_q_to_packed,
+            s_q_gather=s_q_gather,
+        )
+        # Residual: in pyramid mode the S-stream shrinks (drop-front gather of
+        # the input), so the skip connection is the gathered slice. NS keeps
+        # full shape every layer.
+        if pyramid:
+            s = s.index_select(0, s_q_gather) + s_a
+        else:
+            s = s + s_a
         ns = ns + ns_a
-        # FFN
+        # FFN (element-wise, runs on whatever size s is now)
         s_n = self.norm2(s)
         ns_n = self.norm2(ns)
         s_f, ns_f = self.ffn(s_n, ns_n)
@@ -794,24 +851,39 @@ class OneTransModel(BaseModel):
         if ns_raw_dim > 0:
             flops = flops + 6 * (ns_raw_dim * ns_out_dim + ns_out_dim * ns_out_dim)
 
-        # Transformer blocks. Pyramid is not supported with jagged, so all
-        # layers use the same per-user real attn length.
-        for _ in range(ot.n_layers):
-            # S-token QKV: only real tokens
-            flops = flops + 6 * avg_s_real * D * 3 * D
-            # NS-token QKV: dense (n_ns weight matrices, fixed cost per sample)
+        # Transformer blocks. With pyramid, per-layer Q-side per-user count
+        # = min(schedule[l], real_len). Attention compute is Q×K → uses
+        # cur_q_per_user × prev_attn_real per user; FFN uses cur_q_per_user.
+        if ot.use_pyramid:
+            schedule = pyramid_schedule(L_S, n_ns, ot.n_layers)
+        else:
+            schedule = [L_S] * ot.n_layers
+        prev_attn_real = attn_real                            # [B] = layer 0 K-side
+        for l in range(ot.n_layers):
+            cur_s_q_per_user = torch.minimum(
+                s_real, s_real.new_tensor(float(schedule[l])),
+            )                                                  # [B]
+            cur_attn_q_per_user = cur_s_q_per_user + n_ns      # [B]
+            avg_cur_s_q = cur_s_q_per_user.mean()
+            avg_cur_attn_q = cur_attn_q_per_user.mean()
+            # mean over batch of (cur_q_i * prev_kv_i), the per-user attention work
+            avg_attn_qxk = (cur_attn_q_per_user * prev_attn_real).mean()
+
+            # S-token QKV: projects only real-K tokens (full input to layer)
+            flops = flops + 6 * prev_attn_real.mean() * D * 3 * D
+            # NS-token QKV: dense per sample
             flops = flops + 6 * n_ns * 3 * D * D
-            # Causal attention is undiscounted in get_num_flops_per_sample()
-            # too; keep the same convention for an apples-to-apples ratio.
-            # Per-user FLOPs ∝ attn_real_i^2; per-sample average uses
-            # mean(attn_real^2), not (mean(attn_real))^2.
-            flops = flops + 12 * H * d_head * avg_attn_real_sq
-            # Output projection: only real attn tokens
-            flops = flops + 6 * avg_attn_real * D * D
-            # FFN S: only real S tokens
-            flops = flops + 6 * avg_s_real * D * ffn_dim * 2
-            # FFN NS: dense
+            # Causal attention (undiscounted, matches dense formula convention):
+            # per-user cur_q × prev_kv × 12 H d_head
+            flops = flops + 12 * H * d_head * avg_attn_qxk
+            # Output projection on Q-side outputs only
+            flops = flops + 6 * avg_cur_attn_q * D * D
+            # FFN S: runs on Q-side S only
+            flops = flops + 6 * avg_cur_s_q * D * ffn_dim * 2
+            # FFN NS: dense (always n_ns)
             flops = flops + 6 * n_ns * D * ffn_dim * 2
+
+            prev_attn_real = cur_attn_q_per_user               # next layer's K side
 
         # Head + task heads (constant)
         flops = flops + 6 * n_ns * D * D
@@ -1026,6 +1098,29 @@ class OneTransModel(BaseModel):
             cu_seqlens[1:][ns_user].to(torch.int64) - L_NS + ns_local
         )                                                                                   # [B*L_NS]
 
+        # Pre-compute per-layer pyramid indices when pyramid is enabled
+        # (parallel to _backbone_jagged_packed).
+        use_pyramid = ot.use_pyramid
+        pyramid_layers: list[dict] | None = None
+        if use_pyramid:
+            pyramid_layers = self._build_pyramid_jagged_indices(
+                s_real_lens=s_real_lens,
+                cu_s_real=cu_s_real,
+                cu_seqlens=cu_seqlens,
+                s_to_packed=s_to_packed,
+                ns_to_packed=ns_to_packed,
+                B=B, L_NS=L_NS, L_S=L_S,
+                n_layers=ot.n_layers,
+                zero32=zero32,
+                device=device,
+            )
+            last = pyramid_layers[-1]
+            final_s_user = last["s_q_user"]
+            final_s_real_lens = last["q_per_user"]
+        else:
+            final_s_user = s_user
+            final_s_real_lens = s_real_lens
+
         # Run packed transformer (optionally with gradient checkpointing).
         # Checkpointing recomputes each block's interleave + attention in
         # backward, freeing the per-layer attn_qkv / out_attn buffers (~25-35
@@ -1033,22 +1128,47 @@ class OneTransModel(BaseModel):
         s = s_packed
         ns = ns_tokens
         use_ckpt = self.config.train.grad_checkpoint and self.training
-        for block in self.blocks:
-            if use_ckpt:
-                s, ns = _ckpt.checkpoint(
-                    block, s, ns, cu_seqlens, max_seqlen,
-                    s_to_packed, ns_to_packed, use_reentrant=False,
-                )
+        for layer_idx, block in enumerate(self.blocks):
+            if pyramid_layers is not None:
+                p = pyramid_layers[layer_idx]
+                if use_ckpt:
+                    s, ns = _ckpt.checkpoint(
+                        block, s, ns,
+                        p["cu_seqlens_k"], p["max_seqlen_k"],
+                        p["s_k_to_packed"], p["ns_k_to_packed"],
+                        p["cu_seqlens_q"], p["max_seqlen_q"],
+                        p["s_q_to_packed"], p["ns_q_to_packed"],
+                        p["s_q_gather"],
+                        use_reentrant=False,
+                    )
+                else:
+                    s, ns = block(
+                        s, ns,
+                        p["cu_seqlens_k"], p["max_seqlen_k"],
+                        p["s_k_to_packed"], p["ns_k_to_packed"],
+                        cu_seqlens_q=p["cu_seqlens_q"],
+                        max_seqlen_q=p["max_seqlen_q"],
+                        s_q_to_packed=p["s_q_to_packed"],
+                        ns_q_to_packed=p["ns_q_to_packed"],
+                        s_q_gather=p["s_q_gather"],
+                    )
             else:
-                s, ns = block(s, ns, cu_seqlens, max_seqlen, s_to_packed, ns_to_packed)
+                if use_ckpt:
+                    s, ns = _ckpt.checkpoint(
+                        block, s, ns, cu_seqlens, max_seqlen,
+                        s_to_packed, ns_to_packed, use_reentrant=False,
+                    )
+                else:
+                    s, ns = block(s, ns, cu_seqlens, max_seqlen, s_to_packed, ns_to_packed)
 
         s = self.final_norm(s)
         ns = self.final_norm(ns)
 
-        # s_repr: per-user mean of S tokens. scatter_add then divide by lens.
+        # s_repr: per-user mean of (final-layer) S tokens. Pyramid reduces
+        # the count; use the matching ``final_*`` indices.
         s_repr_sum = s.new_zeros(B, ot.d_model)
-        s_repr_sum.index_add_(0, s_user, s)
-        s_repr = s_repr_sum / s_real_lens.to(s.dtype).clamp_min(1).unsqueeze(1)
+        s_repr_sum.index_add_(0, final_s_user, s)
+        s_repr = s_repr_sum / final_s_real_lens.to(s.dtype).clamp_min(1).unsqueeze(1)
 
         # NS head projection (NS already dense [B, L_NS, D])
         h = self.head_proj(ns.reshape(B, -1))
@@ -1174,30 +1294,180 @@ class OneTransModel(BaseModel):
             cu_seqlens[1:][ns_user].to(torch.int64) - L_NS + ns_local
         )
 
-        # Run packed transformer (block loop unchanged from _backbone_jagged).
+        # Pre-compute per-layer pyramid indices when pyramid is enabled
+        # alongside jagged. Layer 0 is full-attention (q == k); layers 1..N-1
+        # progressively drop the front of the S-stream per user.
+        use_pyramid = ot.use_pyramid
+        pyramid_layers: list[dict] | None = None
+        if use_pyramid:
+            pyramid_layers = self._build_pyramid_jagged_indices(
+                s_real_lens=s_real_lens,
+                cu_s_real=cu_s_real,
+                cu_seqlens=cu_seqlens,
+                s_to_packed=s_to_packed,
+                ns_to_packed=ns_to_packed,
+                B=B, L_NS=L_NS, L_S=n_groups * L,
+                n_layers=ot.n_layers,
+                zero32=zero32,
+                device=device,
+            )
+            # The last layer's Q-side per-user lengths; used for s_repr below.
+            last = pyramid_layers[-1]
+            final_s_user = last["s_q_user"]
+            final_s_real_lens = last["q_per_user"]
+        else:
+            final_s_user = s_user
+            final_s_real_lens = s_real_lens
+
+        # Run packed transformer.
         s = s_packed
         ns = ns_tokens
         use_ckpt = self.config.train.grad_checkpoint and self.training
-        for block in self.blocks:
-            if use_ckpt:
-                s, ns = _ckpt.checkpoint(
-                    block, s, ns, cu_seqlens, max_seqlen,
-                    s_to_packed, ns_to_packed, use_reentrant=False,
-                )
+        for layer_idx, block in enumerate(self.blocks):
+            if pyramid_layers is not None:
+                p = pyramid_layers[layer_idx]
+                if use_ckpt:
+                    s, ns = _ckpt.checkpoint(
+                        block, s, ns,
+                        p["cu_seqlens_k"], p["max_seqlen_k"],
+                        p["s_k_to_packed"], p["ns_k_to_packed"],
+                        p["cu_seqlens_q"], p["max_seqlen_q"],
+                        p["s_q_to_packed"], p["ns_q_to_packed"],
+                        p["s_q_gather"],
+                        use_reentrant=False,
+                    )
+                else:
+                    s, ns = block(
+                        s, ns,
+                        p["cu_seqlens_k"], p["max_seqlen_k"],
+                        p["s_k_to_packed"], p["ns_k_to_packed"],
+                        cu_seqlens_q=p["cu_seqlens_q"],
+                        max_seqlen_q=p["max_seqlen_q"],
+                        s_q_to_packed=p["s_q_to_packed"],
+                        ns_q_to_packed=p["ns_q_to_packed"],
+                        s_q_gather=p["s_q_gather"],
+                    )
             else:
-                s, ns = block(s, ns, cu_seqlens, max_seqlen, s_to_packed, ns_to_packed)
+                if use_ckpt:
+                    s, ns = _ckpt.checkpoint(
+                        block, s, ns, cu_seqlens, max_seqlen,
+                        s_to_packed, ns_to_packed, use_reentrant=False,
+                    )
+                else:
+                    s, ns = block(s, ns, cu_seqlens, max_seqlen, s_to_packed, ns_to_packed)
 
         s = self.final_norm(s)
         ns = self.final_norm(ns)
 
-        # s_repr: per-user mean of S tokens.
+        # s_repr: per-user mean of (final-layer) S tokens. Pyramid reduces the
+        # number of S tokens per user; use the matching ``final_*`` indices.
         s_repr_sum = s.new_zeros(B, ot.d_model)
-        s_repr_sum.index_add_(0, s_user, s)
-        s_repr = s_repr_sum / s_real_lens.to(s.dtype).clamp_min(1).unsqueeze(1)
+        s_repr_sum.index_add_(0, final_s_user, s)
+        s_repr = s_repr_sum / final_s_real_lens.to(s.dtype).clamp_min(1).unsqueeze(1)
 
         h = self.head_proj(ns.reshape(B, -1))
         self._last_jagged_flops_per_sample = self.estimate_jagged_flops_per_sample(batch).detach()
         return h, s_repr
+
+    def _build_pyramid_jagged_indices(
+        self,
+        s_real_lens: Tensor,
+        cu_s_real: Tensor,
+        cu_seqlens: Tensor,
+        s_to_packed: Tensor,
+        ns_to_packed: Tensor,
+        B: int,
+        L_NS: int,
+        L_S: int,
+        n_layers: int,
+        zero32: Tensor,
+        device,
+    ) -> list[dict]:
+        """Build per-layer Q/K/V index sets for pyramid + jagged.
+
+        Returns a list of dicts (one per layer) with the args MixedAttention
+        Packed needs to do drop-front Q gather + asymmetric varlen attention.
+
+        Layer 0 is full attention (q == k, identity gather). Subsequent
+        layers each drop the front of every user's S-stream by
+        ``q_per_user[l-1] - q_per_user[l]`` tokens.
+        """
+        # Schedule of S-query counts per layer (e.g. [1500, 1288, ..., 16]).
+        schedule = pyramid_schedule(L_S, L_NS, n_layers)
+        # Per-user query count per layer: q_per_user[l, i] = min(schedule[l], real_len[i]).
+        sched_t = torch.tensor(schedule, device=device, dtype=torch.int32)  # [n_layers]
+        q_per_user_all = torch.minimum(
+            sched_t.unsqueeze(1), s_real_lens.unsqueeze(0)
+        )                                                                    # [n_layers, B]
+
+        layers: list[dict] = []
+        # Initial K-side comes from the FULL packed S (= layer-0 input).
+        prev_cu_s = cu_s_real
+        prev_cu_seqlens = cu_seqlens
+        prev_s_to_packed = s_to_packed
+        prev_ns_to_packed = ns_to_packed
+        prev_max_seqlen = L_S + L_NS
+
+        for l in range(n_layers):
+            q_per_user = q_per_user_all[l]                                   # [B] int32
+            attn_q = q_per_user + L_NS                                       # [B] int32
+
+            # Q-side cu_seqlens (S-real per user + n_ns).
+            cu_s_q = q_per_user.cumsum(0).to(torch.int32)
+            cu_s_q = torch.cat([zero32, cu_s_q])                             # [B+1]
+            cu_seqlens_q = attn_q.cumsum(0).to(torch.int32)
+            cu_seqlens_q = torch.cat([zero32, cu_seqlens_q])                 # [B+1]
+            max_seqlen_q = schedule[l] + L_NS                                # static
+
+            # arange_s_q over total Q-side S tokens; user_id and within-user offset.
+            n_s_q = cu_s_q[-1]                                               # SymInt
+            arange_s_q = torch.ones(n_s_q.to(torch.int64), device=device, dtype=torch.int64).cumsum(0) - 1
+            s_q_user = torch.searchsorted(cu_s_q, arange_s_q.to(torch.int32), right=True) - 1
+            s_q_user = s_q_user.to(torch.int64)
+            s_q_local = arange_s_q - cu_s_q[s_q_user].to(torch.int64)
+            s_q_to_packed = cu_seqlens_q[s_q_user].to(torch.int64) + s_q_local
+
+            arange_ns_q = torch.arange(B * L_NS, device=device, dtype=torch.int64)
+            ns_q_user = arange_ns_q // L_NS
+            ns_q_local = arange_ns_q - ns_q_user * L_NS
+            ns_q_to_packed = cu_seqlens_q[1:][ns_q_user].to(torch.int64) - L_NS + ns_q_local
+
+            # s_q_gather: which positions in the previous layer's packed S
+            # become the current layer's Q. For layer 0 it's identity (no
+            # drop). For layer l>0, drop = q_per_user[l-1] - q_per_user[l]
+            # tokens from the front of each user's segment in prev_cu_s.
+            if l == 0:
+                s_q_gather = arange_s_q
+            else:
+                prev_q_per_user = q_per_user_all[l - 1]
+                drop = (prev_q_per_user - q_per_user).to(torch.int64)        # [B]
+                s_q_gather = (
+                    prev_cu_s[s_q_user].to(torch.int64) + drop[s_q_user] + s_q_local
+                )
+
+            layers.append({
+                "cu_seqlens_q": cu_seqlens_q,
+                "max_seqlen_q": max_seqlen_q,
+                "s_q_to_packed": s_q_to_packed,
+                "ns_q_to_packed": ns_q_to_packed,
+                "s_q_gather": s_q_gather,
+                "cu_seqlens_k": prev_cu_seqlens,
+                "max_seqlen_k": prev_max_seqlen,
+                "s_k_to_packed": prev_s_to_packed,
+                "ns_k_to_packed": prev_ns_to_packed,
+                # Cached for the next layer / s_repr.
+                "s_q_user": s_q_user,
+                "q_per_user": q_per_user,
+            })
+
+            # Roll forward: this layer's Q becomes next layer's K.
+            prev_cu_s = cu_s_q
+            prev_cu_seqlens = cu_seqlens_q
+            prev_s_to_packed = s_q_to_packed
+            prev_ns_to_packed = ns_q_to_packed
+            prev_max_seqlen = max_seqlen_q
+
+        return layers
 
     # ------------------------------------------------------------------
     # Forward
