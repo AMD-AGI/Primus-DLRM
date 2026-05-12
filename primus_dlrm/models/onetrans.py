@@ -528,6 +528,8 @@ class SequentialTokenizer(nn.Module):
     def __init__(self, raw_dim: int, d_model: int, max_len: int = 1024,
                  use_pos_embed: bool = True):
         super().__init__()
+        # In production this can be a single ``nn.Linear(raw_dim, d_model)``;
+        # the 2-layer Linear+GELU+Linear MLP here is a benchmark-heavier variant.
         self.proj = nn.Sequential(
             nn.Linear(raw_dim, d_model),
             nn.GELU(),
